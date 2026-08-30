@@ -14,8 +14,10 @@ class RecordingOverlay:
     def __init__(self) -> None:
         self.events = []
 
-    def show(self, event) -> None:
+    def show(self, event, **_kwargs) -> bool:
         self.events.append(event)
+        event.delivered.set()
+        return True
 
     def close(self) -> None:
         pass
@@ -56,6 +58,21 @@ def test_native_voice_feedback_can_force_overlay_without_speaking() -> None:
     assert controller.speaker.messages == []
 
 
+def test_deferred_voice_does_not_force_an_overlay_in_voice_mode() -> None:
+    controller = FeedbackController(FeedbackMode.VOICE)
+    controller.overlay = RecordingOverlay()
+    controller.speaker = RecordingSpeaker()
+
+    controller.emit(
+        "queued for the microphone boundary",
+        allow_voice=False,
+        force_visible_when_voice_blocked=False,
+    )
+
+    assert controller.overlay.events == []
+    assert controller.speaker.messages == []
+
+
 def test_mode_switch_can_be_forced_to_overlay_only() -> None:
     controller = FeedbackController(FeedbackMode.VOICE)
     controller.overlay = RecordingOverlay()
@@ -66,6 +83,21 @@ def test_mode_switch_can_be_forced_to_overlay_only() -> None:
     assert controller.mode == FeedbackMode.BOTH
     assert [event.text for event in controller.overlay.events] == ["已切换到 both 反馈"]
     assert controller.speaker.messages == []
+
+
+def test_confirmation_delivery_failure_is_reported() -> None:
+    class FailedOverlay(RecordingOverlay):
+        def show(self, event, **_kwargs) -> bool:
+            self.events.append(event)
+            return False
+
+    controller = FeedbackController(FeedbackMode.OVERLAY)
+    controller.overlay = FailedOverlay()
+    controller.speaker = RecordingSpeaker()
+
+    delivered = controller.emit("confirm", kind="confirm", duration=0)
+
+    assert delivered is False
 
 
 def wait_until(predicate, *, timeout: float = 1.0) -> None:
@@ -153,6 +185,7 @@ def test_sapi_speaking_stays_set_across_all_queued_messages(monkeypatch) -> None
     assert tracking.is_set()
     assert voice.started[0].wait(timeout=1)
     speaker.speak("second")
+    assert speaker.generation == 2
     voice.release[0].set()
     assert voice.started[1].wait(timeout=1)
 

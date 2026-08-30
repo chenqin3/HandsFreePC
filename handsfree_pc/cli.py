@@ -176,6 +176,17 @@ def command_doctor(args: argparse.Namespace) -> int:
         "win32api",
         "pywinauto",
     ]
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    computer_use_skill_discovered = any(
+        codex_home.glob("plugins/**/computer-use/**/skills/computer-use/SKILL.md")
+    )
+    codex_config = codex_home / "config.toml"
+    try:
+        node_repl_config_mentioned = "node_repl" in codex_config.read_text(
+            encoding="utf-8", errors="ignore"
+        )
+    except OSError:
+        node_repl_config_mentioned = False
     report: dict[str, Any] = {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
@@ -184,11 +195,35 @@ def command_doctor(args: argparse.Namespace) -> int:
         "privacy": {
             "save_audio": settings.privacy.save_audio,
             "save_transcripts": settings.privacy.save_transcripts,
-            "cloud_planner": settings.privacy.allow_cloud_planner and settings.planner.enabled,
+            "cloud_transcript_permission": settings.privacy.allow_cloud_planner,
+            "planner_transcripts_to_cloud": (
+                settings.privacy.allow_cloud_planner and settings.planner.enabled
+            ),
+            "computer_control_transcripts_to_cloud": (
+                settings.privacy.allow_cloud_planner and settings.computer_control.enabled
+            ),
+        },
+        "effective_mode": "live" if not settings.execution.dry_run else "dry-run",
+        "computer_control": {
+            "enabled": settings.computer_control.enabled,
+            "backend": settings.computer_control.backend,
+            "screen_context_to_cloud": (
+                settings.computer_control.enabled
+                and settings.computer_control.allow_screen_context_to_cloud
+            ),
+            "max_queue_size": settings.computer_control.max_queue_size,
+            "computer_use_skill_discovered": computer_use_skill_discovered,
+            "node_repl_config_mentioned": node_repl_config_mentioned,
+            "preflight_is_static_only": True,
         },
         "modules": {name: importlib.util.find_spec(name) is not None for name in modules},
         "commands": {
-            "codex": _check_command(
+            "codex_computer_control": _check_command(
+                settings.computer_control.codex_executable,
+                ["login", "status"] if args.check_planner_auth else None,
+                env=_sanitized_env(),
+            ),
+            "codex_planner": _check_command(
                 settings.planner.codex_executable,
                 ["login", "status"] if args.check_planner_auth else None,
                 env=_sanitized_env(),
@@ -237,9 +272,24 @@ def command_doctor(args: argparse.Namespace) -> int:
         and bool(report["audio_inputs"])
     )
     report["ready_for_run"] = ready_for_run
+    codex_ready = bool(report["commands"]["codex_computer_control"]["found"])
+    ready_for_live_control = (
+        ready_for_run
+        and not settings.execution.dry_run
+        and settings.computer_control.enabled
+        and settings.privacy.allow_cloud_planner
+        and settings.computer_control.allow_screen_context_to_cloud
+        and codex_ready
+        and computer_use_skill_discovered
+        and node_repl_config_mentioned
+    )
+    report["ready_for_live_control"] = ready_for_live_control
     _json(report)
     if getattr(args, "strict", False):
-        return 0 if ready_for_run else 1
+        strict_ready = (
+            ready_for_live_control if settings.computer_control.enabled else ready_for_run
+        )
+        return 0 if strict_ready else 1
     return 0 if core_ok else 1
 
 

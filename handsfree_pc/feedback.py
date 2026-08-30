@@ -5,7 +5,7 @@ import os
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .models import FeedbackMode
@@ -26,6 +26,7 @@ class FeedbackEvent:
     text: str
     kind: str = "recognized"
     duration: float = 3.5
+    delivered: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 class Overlay:
@@ -33,21 +34,68 @@ class Overlay:
         self._queue: queue.Queue[FeedbackEvent | None] = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="HandsFreePC-overlay", daemon=True)
         self._started = False
+        self._closed = False
+        self._last_error: Exception | None = None
+        self._state_lock = threading.Lock()
 
     def start(self) -> None:
-        if not self._started:
-            self._started = True
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Overlay is closed")
+            if self._started:
+                return
             self._thread.start()
+            self._started = True
 
-    def show(self, event: FeedbackEvent) -> None:
-        self.start()
+    def show(
+        self,
+        event: FeedbackEvent,
+        *,
+        wait_for_delivery: bool = False,
+        timeout: float = 2.0,
+    ) -> bool:
+        with self._state_lock:
+            if self._closed or self._last_error is not None:
+                return False
+        try:
+            self.start()
+        except Exception as exc:
+            with self._state_lock:
+                self._last_error = exc
+            return False
         self._queue.put(event)
+        if not wait_for_delivery:
+            return True
+        if not event.delivered.wait(timeout):
+            return False
+        with self._state_lock:
+            return self._last_error is None
 
     def close(self) -> None:
-        if self._started:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            started = self._started
+        if started:
             self._queue.put(None)
 
     def _run(self) -> None:  # pragma: no cover - visually smoke-tested
+        try:
+            self._run_overlay()
+        except Exception as exc:
+            with self._state_lock:
+                self._last_error = exc
+        finally:
+            while True:
+                try:
+                    pending = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if pending is not None:
+                    pending.delivered.set()
+
+    def _run_overlay(self) -> None:  # pragma: no cover - visually smoke-tested
         import tkinter as tk
 
         root = tk.Tk()
@@ -90,6 +138,8 @@ class Overlay:
                     root.configure(bg=background)
                     root.deiconify()
                     root.lift()
+                    root.update_idletasks()
+                    event.delivered.set()
                     hide_at = time.monotonic() + event.duration if event.duration > 0 else 0.0
             except queue.Empty:
                 pass
@@ -132,12 +182,24 @@ class SapiSpeaker:
         self._pending = 0
         self._state_lock = threading.Lock()
         self._last_error: Exception | None = None
+        self._generation = 0
         self.speaking = threading.Event()
 
-    def speak(self, text: str) -> None:
+    @property
+    def generation(self) -> int:
+        with self._state_lock:
+            return self._generation
+
+    @property
+    def last_error(self) -> Exception | None:
+        with self._state_lock:
+            return self._last_error
+
+    def speak(self, text: str) -> bool:
         with self._state_lock:
             if self._closed:
-                return
+                return False
+            self._generation += 1
             if self._pending == 0:
                 self.speaking.set()
             self._pending += 1
@@ -150,6 +212,8 @@ class SapiSpeaker:
                     self._last_error = exc
                     self._closed = True
                     self._discard_pending_locked()
+                    return False
+            return True
 
     def close(self) -> None:
         with self._state_lock:
@@ -197,6 +261,12 @@ class SapiSpeaker:
                     return
                 try:
                     voice.Speak(text)
+                except Exception as exc:
+                    # Publish the failure before clearing ``speaking`` so the microphone owner
+                    # cannot mistake a failed SAPI call for delivered confirmation feedback.
+                    with self._state_lock:
+                        self._last_error = exc
+                    raise
                 finally:
                     self._complete_one()
         except Exception as exc:
@@ -234,14 +304,20 @@ class FeedbackController:
         kind: str = "recognized",
         duration: float = 3.5,
         allow_voice: bool = True,
-    ) -> None:
+        force_visible_when_voice_blocked: bool = True,
+    ) -> bool:
         force_visible = (self.mode == FeedbackMode.SILENT and kind in {"confirm", "error"}) or (
-            not allow_voice
+            not allow_voice and force_visible_when_voice_blocked
         )
+        delivered = True
         if self.mode in {FeedbackMode.OVERLAY, FeedbackMode.BOTH} or force_visible:
-            self.overlay.show(FeedbackEvent(text=text, kind=kind, duration=duration))
+            delivered = self.overlay.show(
+                FeedbackEvent(text=text, kind=kind, duration=duration),
+                wait_for_delivery=kind == "confirm",
+            )
         if allow_voice and self.mode in {FeedbackMode.VOICE, FeedbackMode.BOTH}:
-            self.speaker.speak(text)
+            delivered = self.speaker.speak(text) is not False and delivered
+        return delivered
 
     def close(self) -> None:
         self.overlay.close()

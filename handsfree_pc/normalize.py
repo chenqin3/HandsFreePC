@@ -50,12 +50,23 @@ def phrase_equals(text: str, phrases: list[str]) -> str | None:
 
 
 def wake_suffix(text: str, wake_phrases: list[str]) -> tuple[str | None, str]:
-    compact = compact_text(text)
+    compact_parts: list[str] = []
+    source_end_by_compact_character: list[int] = []
+    for source_index, character in enumerate(text):
+        normalized_character = compact_text(character)
+        compact_parts.append(normalized_character)
+        source_end_by_compact_character.extend([source_index + 1] * len(normalized_character))
+    compact = "".join(compact_parts)
     for phrase in sorted(wake_phrases, key=lambda item: len(compact_text(item)), reverse=True):
         needle = compact_text(phrase)
+        if not needle:
+            continue
         index = compact.find(needle)
         if index >= 0:
-            return phrase, compact[index + len(needle) :]
+            last_compact_index = index + len(needle) - 1
+            source_end = source_end_by_compact_character[last_compact_index]
+            suffix = text[source_end:].lstrip(" \t\r\n,，.。;；!！?？:：、")
+            return phrase, suffix
     return None, ""
 
 

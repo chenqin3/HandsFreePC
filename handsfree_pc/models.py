@@ -99,7 +99,7 @@ class Action:
         if self.feedback_mode is not None and not isinstance(self.feedback_mode, FeedbackMode):
             raise ValueError("feedback_mode must be a FeedbackMode or null")
         if self.seconds is not None and (
-            isinstance(self.seconds, bool) or not isinstance(self.seconds, (int, float))
+            isinstance(self.seconds, bool) or not isinstance(self.seconds, int | float)
         ):
             raise ValueError("seconds must be a number or null")
         requirements: dict[ActionType, tuple[str, ...]] = {

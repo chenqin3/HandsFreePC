@@ -34,6 +34,10 @@ class ControlPhraseDetected(AudioError):
         self.phrase = phrase
 
 
+class FeedbackPending(AudioError):
+    """Wake the microphone loop so queued spoken feedback can play at a safe boundary."""
+
+
 def rms(samples: Any) -> float:
     try:
         import numpy as np
@@ -134,6 +138,8 @@ class VoskWakeDetector:
         sample_rate: int,
         phrases: list[str],
         grammar: list[str] | None = None,
+        phrase_window_seconds: float = 5.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not model_path.exists():
             raise ModelMissingError(f"Vosk wake model not found: {model_path}")
@@ -144,6 +150,9 @@ class VoskWakeDetector:
         vosk.SetLogLevel(-1)
         self.sample_rate = sample_rate
         self.phrases = phrases
+        self.phrase_window_seconds = phrase_window_seconds
+        self._monotonic = monotonic
+        self._rolling_finals: list[tuple[float, str]] = []
         self._np: Any = None
         grammar_json = json.dumps([*(grammar or phrases), "[unk]"], ensure_ascii=False)
         self._recognizer = vosk.KaldiRecognizer(
@@ -163,10 +172,25 @@ class VoskWakeDetector:
         except json.JSONDecodeError:
             return None
         text = payload.get("text") or payload.get("partial") or ""
-        matched = phrase_in_text(text, self.phrases)
+        now = self._monotonic()
+        cutoff = now - self.phrase_window_seconds
+        self._rolling_finals = [
+            (seen_at, value) for seen_at, value in self._rolling_finals if seen_at >= cutoff
+        ]
+        if is_final and text:
+            self._rolling_finals.append((now, text))
+            partial = ""
+        else:
+            partial = text
+        rolling_text = " ".join([*(value for _, value in self._rolling_finals), partial]).strip()
+        matched = phrase_in_text(rolling_text, self.phrases)
         if matched:
-            self._recognizer.Reset()
+            self.reset()
         return matched
+
+    def reset(self) -> None:
+        self._recognizer.Reset()
+        self._rolling_finals.clear()
 
 
 @dataclass(slots=True)
@@ -476,6 +500,7 @@ class LocalSpeechSession:
             sample_rate=settings.sample_rate,
             phrases=phrases,
             grammar=[str(item) for item in settings.wake.get("grammar", phrases)],
+            phrase_window_seconds=float(settings.wake.get("phrase_window_seconds", 5.0)),
         )
         vad = settings.vad
         if str(vad.get("backend", "silero")).lower() == "silero":
@@ -510,10 +535,19 @@ class LocalSpeechSession:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.source.__exit__(exc_type, exc, traceback)
 
-    def wait_for_phrase(self, *, stop_event: threading.Event | None = None) -> tuple[str, Any]:
+    def wait_for_phrase(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        feedback_event: threading.Event | None = None,
+    ) -> tuple[str, Any]:
         try:
             while stop_event is None or not stop_event.is_set():
+                if feedback_event is not None and feedback_event.is_set():
+                    raise FeedbackPending("Spoken feedback is pending")
                 block = self.source.read()
+                if feedback_event is not None and feedback_event.is_set():
+                    raise FeedbackPending("Spoken feedback is pending")
                 self.endpoint.observe_noise(block)
                 if matched := self.wake.accept(block):
                     audio = self.endpoint.record(self.source.pre_roll())
@@ -557,6 +591,9 @@ class LocalSpeechSession:
             raise
         except Exception as exc:
             raise TranscriptionError("Local command transcription failed") from exc
+
+    def reset_control_detector(self) -> None:
+        self.wake.reset()
 
 
 def list_audio_devices() -> list[dict[str, Any]]:

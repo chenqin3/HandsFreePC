@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import sys
+import types
+
 import numpy as np
 import pytest
 
@@ -8,8 +12,10 @@ from handsfree_pc.audio import (
     ControlPhraseDetected,
     EndpointConfig,
     EnergyEndpointRecorder,
+    FeedbackPending,
     LocalSpeechSession,
     MicrophoneSource,
+    VoskWakeDetector,
     rms,
 )
 
@@ -117,3 +123,103 @@ def test_local_session_wraps_native_endpoint_failure() -> None:
 
     with pytest.raises(AudioError, match="Endpoint processing failed"):
         session.listen_utterance(timeout_seconds=1)
+
+
+def test_wait_for_phrase_yields_to_pending_spoken_feedback() -> None:
+    class Source:
+        def read(self):
+            raise AssertionError("microphone must not be read while feedback is pending")
+
+    session = object.__new__(LocalSpeechSession)
+    session.source = Source()
+    pending = __import__("threading").Event()
+    pending.set()
+
+    with pytest.raises(FeedbackPending):
+        session.wait_for_phrase(feedback_event=pending)
+
+
+class _FakeVoskRecognizer:
+    def __init__(self, events):
+        self.events = iter(events)
+        self.current = None
+        self.reset_count = 0
+
+    def AcceptWaveform(self, _pcm):  # noqa: N802 - mirrors the Vosk API
+        self.current = next(self.events)
+        return self.current[0]
+
+    def Result(self):  # noqa: N802 - mirrors the Vosk API
+        return json.dumps({"text": self.current[1]}, ensure_ascii=False)
+
+    def PartialResult(self):  # noqa: N802 - mirrors the Vosk API
+        return json.dumps({"partial": self.current[1]}, ensure_ascii=False)
+
+    def Reset(self):  # noqa: N802 - mirrors the Vosk API
+        self.reset_count += 1
+
+
+def _wake_detector(monkeypatch, events, times):
+    recognizer = _FakeVoskRecognizer(events)
+    fake_vosk = types.SimpleNamespace(
+        SetLogLevel=lambda _level: None,
+        Model=lambda _path: object(),
+        KaldiRecognizer=lambda *_args: recognizer,
+    )
+    monkeypatch.setitem(sys.modules, "vosk", fake_vosk)
+    clock = iter(times)
+    detector = VoskWakeDetector(
+        model_path=__file_path(),
+        sample_rate=16000,
+        phrases=["开始语音操作"],
+        phrase_window_seconds=5.0,
+        monotonic=lambda: next(clock),
+    )
+    return detector, recognizer
+
+
+def __file_path():
+    from pathlib import Path
+
+    return Path(__file__)
+
+
+def test_vosk_wake_accumulates_slow_final_chunks(monkeypatch) -> None:
+    detector, recognizer = _wake_detector(
+        monkeypatch,
+        [(True, "开始"), (True, "语音"), (True, "操作")],
+        [0.0, 1.5, 3.0],
+    )
+    block = np.zeros(160, dtype=np.float32)
+
+    assert detector.accept(block) is None
+    assert detector.accept(block) is None
+    assert detector.accept(block) == "开始语音操作"
+    assert recognizer.reset_count == 1
+
+
+def test_vosk_wake_does_not_join_chunks_outside_window(monkeypatch) -> None:
+    detector, _ = _wake_detector(
+        monkeypatch,
+        [(True, "开始"), (True, "语音"), (True, "操作")],
+        [0.0, 6.0, 12.0],
+    )
+    block = np.zeros(160, dtype=np.float32)
+
+    assert detector.accept(block) is None
+    assert detector.accept(block) is None
+    assert detector.accept(block) is None
+
+
+def test_vosk_reset_clears_rolling_slow_phrase_state(monkeypatch) -> None:
+    detector, recognizer = _wake_detector(
+        monkeypatch,
+        [(True, "开始"), (True, "语音操作")],
+        [0.0, 1.0],
+    )
+    block = np.zeros(160, dtype=np.float32)
+
+    assert detector.accept(block) is None
+    detector.reset()
+    assert detector.accept(block) is None
+    assert recognizer.reset_count == 1

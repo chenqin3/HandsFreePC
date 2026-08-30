@@ -1,14 +1,19 @@
 app:
   language: zh-CN
   wake_phrases:
-    - "现在开始语音操作"
-    - "电脑开始操作"
+    - "开始语音操作"
+  end_session_phrases:
+    - "结束语音操作"
   stop_phrases:
+    - "立即停止所有操作"
+    - "取消所有操作"
     - "停止所有操作"
     - "电脑停止"
+  prompt_delimiters:
+    - over
   control_prefixes:
     - "电脑"
-  awake_timeout_seconds: 20
+  awake_timeout_seconds: 0
   feedback_mode: overlay
 
 privacy:
@@ -38,16 +43,24 @@ speech:
     backend: vosk
     model_path: models/vosk-model-small-cn-0.22
     grammar:
-      - "现在 开始 语音 操作"
-      - "电脑 开始 操作"
+      - "开始 语音 操作"
+      - "结束 语音 操作"
+      - "立即 停止 所有 操作"
+      - "取消 所有 操作"
       - "停止 所有 操作"
       - "电脑 停止"
       - "恢复 语音 操作"
       - "恢复 监听"
+      - "确认 执行"
+      - "取消 操作"
+      - "不要 执行"
+      - "继续 队列"
+      - "恢复 队列"
+    phrase_window_seconds: 5.0
   command:
     backend: sensevoice
     model_path: models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17
-    language: zh
+    language: auto
     use_itn: true
     num_threads: 4
     provider: cpu
@@ -64,6 +77,19 @@ planner:
   model: null
   codex_executable: codex
   claude_executable: claude
+
+computer_control:
+  enabled: false
+  backend: codex
+  allow_screen_context_to_cloud: false
+  timeout_seconds: 600
+  max_queue_size: 8
+  max_prompt_chars: 4000
+  failure_policy: pause
+  end_policy: drain
+  working_directory: runtime/computer-control
+  codex_executable: codex
+  model: null
 
 execution:
   dry_run: true

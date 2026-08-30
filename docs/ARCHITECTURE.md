@@ -2,96 +2,99 @@
 
 ## 目标与非目标
 
-HandsFreePC 是 Windows 11 用户会话中的本地优先语音控制器。它解决的是：双手被占用时，用自定义唤醒词打开文件、切换应用、进入指定对话、可靠听写，并在每一步给出可见或可听反馈。
+HandsFreePC 是 Windows 11 用户会话中的本地优先语音控制器。0.2 的主流程是：双手被占用时，说“开始语音操作”进入连续会话，以英文 `over` 分隔多条指令，在继续收音的同时把完整 prompt 按 FIFO 交给 Codex Computer Use；控制提示要求它在每个桌面动作后刷新观察并自检任务相关后置条件。
 
-它不是远程桌面、管理员提权工具、通用 RPA 平台，也不是“让 LLM 看着整个桌面随便点”。首版不支持控制锁屏/UAC 安全桌面，不读取密码控件，不执行模型生成的 shell 字符串，不自动完成删除、付款、安装或系统安全设置修改。每个真实动作都要求当前输入桌面为 `Default`，包括 `open_path`。
+它不是远程桌面、管理员提权工具或无人值守的通用 RPA 平台。控制提示要求 Computer Use worker 采用选定目标窗口、单动作、刷新、自检的闭环，并禁止终端/Run 对话框、ChatGPT/Codex UI、认证、密码、UAC 和安全/隐私设置；这不是本地 capability sandbox。模型和插件仍可能犯错；0.2 尚未完成真实屏幕 Computer Use 验收，不能把 prompt 约束写成已经由 live test 证明的保证。
 
 ## 总体数据流
 
 ```mermaid
 flowchart LR
-    Mic[麦克风 16 kHz mono] --> Ring[内存预卷缓冲]
-    Ring --> Wake[Vosk 本地唤醒/停止短语]
-    Wake -->|命中唤醒词| ASR[SenseVoice 本地命令 ASR]
-    ASR --> Parser[确定性意图解析]
-    Parser -->|高置信度| Policy[Schema + 本地安全策略]
-    Parser -->|无法确定且已显式开启| Planner[Codex/Claude 可选云规划器]
-    Planner -->|只返回受限 JSON| Policy
-    Policy -->|安全| Exec[Windows 执行器]
-    Policy -->|需确认| Confirm[本地确认状态]
-    Policy -->|禁止/歧义| Feedback[遮罩 / 本机 TTS]
-    Confirm --> Exec
-    Exec --> Verify[目标与后置条件核验]
-    Verify --> Feedback
+    Mic[麦克风 16 kHz mono] --> Wake[Vosk 本地控制口令]
+    Wake -->|开始语音操作| VAD[Silero VAD]
+    VAD --> ASR[SenseVoice 本地转写]
+    ASR --> Assemble[PromptAssembler: 英文 over]
+    Assemble --> FIFO[有界普通 FIFO]
+    FIFO --> Worker[单消费者 worker]
+    Worker --> Codex[codex exec / resume]
+    Codex -.prompt 与屏幕上下文.-> Cloud[(OpenAI)]
+    Codex --> Observe[目标窗口 UIA / 新截图]
+    Observe --> Act[一个原子鼠标/键盘动作]
+    Act --> Refresh[刷新观察并核验后置条件]
+    Refresh -->|未完成| Observe
+    Refresh -->|完成| Worker
+    Codex -->|NEEDS_CONFIRMATION| Pause[队列暂停]
+    Pause -->|确认执行，控制队列优先| Codex
 ```
 
-虚线意义上的隐私边界只有“可选云规划器”：本地音频不发送给规划器，但转写后的命令和最小必要上下文会发送。默认配置同时要求 `planner.enabled: false` 和 `privacy.allow_cloud_planner: false`；公开执行默认还是 `execution.dry_run: true`，语音后备默认 `speech.fallback.backend: none`。
+Computer Use 关闭时保留 0.1 兼容链路：确定性 parser，或显式双重开启的 Codex/Claude 文本 planner，经过 JSON Schema、本地安全策略与旧 Windows/UIA 白名单执行器。该 planner 与新的 Computer Use controller 是两个不同组件，不能混用安全声明。
+
+原始音频只进入本机内存和本地模型。连续 Computer Use 必须同时满足 `computer_control.enabled: true`、`privacy.allow_cloud_planner: true`、`computer_control.allow_screen_context_to_cloud: true` 和 `execution.dry_run: false`；启用后，识别的 prompt、窗口元数据、辅助功能树、目标窗口截图、可见内容和剪贴板状态可能由 OpenAI 处理。公开 `config.example.yaml` 默认关闭前三项并保留 `dry_run: true` 与 `speech.fallback.backend: none`；只应在不提交 Git 的 `config.local.yaml` 中显式启用。`dry_run` 主要约束兼容执行器，但配置加载器也用它阻止在名为 dry-run 的配置中误启真实 Computer Use；它不是 Computer Use 的能力沙箱。
 
 ## 设计不变量
 
 这些约束比任何单个模型或 UI 选择器更重要：
 
-1. **本地急停但不虚构全面抢占。** `ARMED`/`PAUSED` 用 Vosk 监听停止短语；`AWAKE`/`DICTATION`/`CONFIRMING` 的 endpoint 录音同时逐 block 喂给 Vosk，按高优先级子串命中停止短语即抛出本地控制事件并进入 `PAUSED`。因此听写内容说出完整配置停止短语也可能被当作控制并截断。取消确认等其他控制语仍要完成 SenseVoice 转写；0.1.0 的同步动作和完整 SAPI 队列播放也不能由语音抢占，必须保持短小并在边界处重新检查状态。
-2. **确定性优先。** 能用路径解析、应用档案或固定命令完成时，不调用 LLM。
-3. **规划与执行分离。** Codex/Claude 的输出是未受信任建议；只有本地白名单执行器能改变桌面状态。
-4. **不猜歧义。** 同名路径、多个窗口、多个控件或置信度不足时失败关闭；0.1.0 没有交互式候选问答，用户需重新说得更具体。
-5. **输入前核验。** 激活目标时验证允许的进程名/标题；进入听写时固定非密码 Edit/Document 身份，之后每段 `TYPE_TEXT` / `SEND_PROMPT` 前重新检查同一 foreground HWND 与该控件身份。它不是每次都重新读取进程镜像、签名或完整性级别。
-6. **动作证据按能力分级。** 命名 UIA 点击要求观察到选中/焦点/元素消失或 UI 树变化；搜索热键流程会最终重找命名选中项。但 `TYPE_TEXT` 只证明同一非密码输入控件在输入前仍聚焦、`SendInput` 接受了全部 UTF-16 单元且前台未变；`SEND_PROMPT` 只证明相同目标复核后发送 Enter 且前台未变；原生语音热键/按钮也不能证明麦克风已真正 active。`open_path` 目前只能证明 Windows 接受调度。任何这些证据都不得描述成下游应用端到端完成证明。
-7. **最小权限。** 进程以普通用户权限运行，不请求 UIAccess，不尝试同意 UAC。
-8. **默认不留内容。** 原始音频和转写默认不落盘，0.1.0 不创建持久化的运行内容日志；诊断 stdout 仍可能含路径，分享前必须脱敏。
+1. **控制口令本地优先。** Vosk 常开 grammar 识别开始、结束输入、急停、确认和恢复。`phrase_window_seconds` 允许慢速口令跨多个 final 聚合，但它不是声纹认证。
+2. **连续收音与执行解耦。** PromptAssembler 只在独立英文单词 `over` 处完成 prompt；`mouseover` / `voiceover` 不切分。完整普通 prompt 进入有界 FIFO，执行第一条时仍可接收后续输入，队列满则明确拒绝。
+3. **结束不等于急停。** “结束语音操作”丢弃未说 `over` 的半条、停止接收新 prompt，并默认排空当前和已接受队列；急停才请求终止当前 worker 并清空待处理工作。已发生副作用不可撤回。
+4. **状态显式且分层。** 语音会话使用 `ARMED/ACTIVE/DRAINING/PAUSED/STOPPED`；worker 独立使用 `NEW/IDLE/RUNNING/PAUSED/STOPPING/STOPPED`。worker 因失败暂停时，收音仍可继续入队。
+5. **Computer Use 逐动作自检。** 控制提示要求每次只选择一个目标窗口，优先 UIA、必要时使用新截图；一个原子动作后立即刷新，只有它观察到任务相关后置条件成立才继续。旧元素索引、截图和坐标不得复用。最终消息必须是单行 `VERIFIED_COMPLETION:`、`NEEDS_CONFIRMATION:` 或 `FAILURE:`；本地 adapter 校验这一状态协议和 JSONL turn 完整性，但不独立重放视觉证据，因此不得把同一 Codex agent 的完成报告写成本地独立验证。
+6. **确认发生在动作边界并限时。** status 协议要求 Codex 在需要确认的动作执行前返回 `NEEDS_CONFIRMATION`。普通队列暂停；提示实际显示，或纯 `voice` 完整成功播报后，才记录 `confirmation_timeout_seconds` 起点。有效期内完整说“确认执行”会把优先控制 continuation 放入同一 Codex thread，只授权先前描述的确切动作。它不是后台 Timer：下一段本地语音到来时才检查是否过期；过期则拒绝该段、取消本轮/当前 controller 与全部队列并进入 `PAUSED`。描述须单行、无 Unicode C 类控制字符且不超过 160 字；本地仍不能发现 agent 完全漏报的风险。
+7. **默认拒绝云端屏幕上下文。** 只有 `computer_control.enabled: true` 时，配置校验才强制要求识别文本云许可、屏幕上下文许可和 `dry_run: false`；公开默认保持关闭。单独预先设置某个许可不会启动 Computer Use，但仍应只在私有本地配置中表达真实选择。
+8. **兼容路径继续失败关闭。** 旧 parser/planner 仍使用有限 Schema、本地风险重判、歧义关闭和白名单执行器；它的 `blocked_keywords` 不等于 Computer Use 安全边界。
+9. **最小权限。** HandsFreePC 以普通用户权限运行，不请求 UIAccess，不尝试同意 UAC；Computer Use prompt 也禁止认证、密码和安全桌面。
+10. **默认不留语音内容。** 原始音频和转写默认不落盘。Codex CLI/Computer Use 的本地线程记录、缓存和提供商保留属于独立边界，不能被本项目的 `save_transcripts: false` 控制。
 
 ## 运行状态机
 
 ```mermaid
 stateDiagram-v2
     [*] --> ARMED
-    ARMED --> AWAKE: 本地唤醒词
-    AWAKE --> EXECUTING: 安全命令通过策略
-    AWAKE --> CONFIRMING: 风险动作需确认
-    AWAKE --> ARMED: 唤醒窗口超时
-    CONFIRMING --> EXECUTING: 确认短语
-    CONFIRMING --> ARMED: 取消或超时
-    EXECUTING --> ARMED: 普通动作完成/失败
-    EXECUTING --> DICTATION: 输入框已核验
-    EXECUTING --> PAUSED: 应用内原生语音执行尝试成功或失败（保守）
-    DICTATION --> EXECUTING: 明确发送/退出听写
-    ARMED --> PAUSED: 停止/暂停短语
-    AWAKE --> PAUSED: 停止/暂停短语
-    PAUSED --> ARMED: 唤醒词或明确恢复
+    ARMED --> ACTIVE: 开始语音操作
+    ACTIVE --> ACTIVE: 语音片段 / over 入队
+    ACTIVE --> DRAINING: 结束语音操作
+    DRAINING --> ARMED: 当前与队列全部终态
+    ACTIVE --> PAUSED: 急停
+    DRAINING --> PAUSED: 急停
+    PAUSED --> ACTIVE: 开始/恢复语音操作
     ARMED --> STOPPED: 退出程序
     PAUSED --> STOPPED: 退出程序
 ```
 
-- `ARMED`：只运行低成本 Vosk grammar 和短预卷缓冲。
-- `AWAKE`：采集一条完整命令；超时后自动休眠。
-- `EXECUTING`：0.1.0 同步执行一组短动作，期间主识别/控制循环不消费麦克风 block（PortAudio callback 仍可能填充有界缓冲），因而停止短语不能抢占已开始的 OS/UI 调用；每组最多 8 步并在动作边界失败关闭。
-- `DICTATION`：把本地 ASR 结果写入已验证的目标输入框；只有带控制前缀、且整句精确匹配的提交命令才触发 `SEND_PROMPT`，否定句不会提交。普通听写中的全局停止短语仍可能优先触发暂停。
-- `CONFIRMING`：确认只接受配置短语的完整标准化整句，并有超时；“不要确认执行”等包含确认词的否定句不会授权。
-- `PAUSED`：不执行桌面动作；由停止/暂停短语或应用内原生语音流程进入。0.1.0 尚未监听 Windows 锁屏/切换用户事件，麦克风不会自动暂停；桌面动作另外通过 `Default` 输入桌面、前台/UIA 和 SendInput 门禁失败关闭。
+- `ARMED`：只运行低成本 Vosk grammar 和短预卷，不接受普通 prompt。
+- `ACTIVE`：连续转写；片段可跨多次 ASR 累积，只有 `over` 前的非空文本才入队。一个片段可包含多个 `over`，从左到右生成多条普通 FIFO 任务。
+- `DRAINING`：“结束语音操作”后不再接受新普通 prompt；麦克风仍在本地检测急停、确认、继续队列/恢复队列（以及重复结束），但不接受“恢复语音操作”或新 prompt。队列清空后关闭当前 Codex controller/thread 引用并回 `ARMED`。
+- `PAUSED`：急停后的会话状态。未完成半条和待处理队列已清理，当前 Codex 进程树收到取消/终止，controller 被关闭且旧 thread 引用丢弃；说开始/恢复口令会创建新一轮语音会话，下一条任务建立新 Codex thread。
+- worker 的 `PAUSED` 与语音会话的 `PAUSED` 不同：某条任务失败或请求确认时 worker 暂停，语音会话仍可为后续任务收音和入队；确认 continuation 或普通失败后的“继续队列”恢复 worker。若仍有未过期的待确认动作，“继续队列”会被拒绝并再次要求确认或取消；提示送达后超时，则下一段非急停本地语音触发整轮与队列取消。
+
+Computer Use 未启用时仍使用旧 `RuntimeState` 的一次唤醒、确认、听写与同步执行状态机。该兼容状态机不提供 `over` FIFO。
 
 ## 组件与代码边界
 
 ### 配置与数据模型
 
-- `handsfree_pc/config.py`：加载默认值和 `config.local.yaml`，展开路径别名，并强制“启用规划器必须同时允许云规划”。
+- `handsfree_pc/config.py`：加载默认值和 `config.local.yaml`，展开路径别名；强制旧 planner 的双重 opt-in；启用 Computer Use 时还强制识别文本云许可、屏幕上下文许可和 `execution.dry_run: false`。
+- `handsfree_pc/session.py`：`PromptAssembler`、不可变队列命令、普通 FIFO、优先控制 continuation、取消、暂停和排空。
+- `handsfree_pc/computer_control.py`：Codex `exec`/`resume` adapter、JSONL thread 协议、超时/取消和 Computer Use 控制提示。
 - `handsfree_pc/models.py`：定义 `Action`、`Plan`、风险级别、反馈模式和运行状态。
 - `handsfree_pc/schemas/plan.schema.json`：Codex/Claude 共同使用的动作 Schema；禁止未知字段并限制最多 8 个动作。
 
-配置分为 `app`、`privacy`、`speech`、`planner`、`execution`、`apps` 六个命名空间。公开仓库只提交 `config.example.yaml`；本机路径、设备名和应用档案放在被 Git 忽略的本地配置中。公开模板把 `execution.dry_run` 设为 `true`；Codex/Claude 的 `search_hotkey`、`native_voice_hotkey` 设为 `null`，`voice_button_names` 设为空列表，必须本机校准后显式填入。
+配置分为 `app`、`privacy`、`speech`、`planner`、`computer_control`、`execution`、`apps` 七个命名空间。公开仓库只提交 `config.example.yaml`；本机路径、设备名和应用档案放在被 Git 忽略的本地配置中。公开模板关闭 planner、Computer Use 和屏幕上下文许可，启用 `execution.dry_run`；旧 Codex/Claude 档案的搜索/语音热键与按钮名也留空。
 
-`dry_run` 只禁止构造/调用真实 Windows 桌面后端，不等于“整个进程无副作用”：直接 `run` 仍会打开麦克风、驱动状态机并显示遮罩/播放 TTS；若 planner 已双重开启，无法确定解析的命令仍可能调用 Codex/Claude 并联网。`simulate` 会强制 dry-run 并使用 no-op feedback，但仍会解析/读取检查本机路径、验证配置热键，也可能在显式启用 planner 后联网。
+`execution.dry_run` 禁止旧 Windows 执行器构造/调用真实后端，不等于整个进程无副作用：直接 `run` 仍打开麦克风并产生反馈，旧 planner 双重开启后仍可能联网。配置加载器会拒绝 `computer_control.enabled: true` 与 `dry_run: true` 的组合；通过私有配置显式满足全部门禁后，直接 `handsfreepc run` 也会启动 Codex 并可能读取/操作屏幕。`scripts/run.ps1` 额外运行 strict doctor，但它不是能力或隐私沙箱。
 
 ### 语音层
 
 - 音频入口统一为 16 kHz 单声道 PCM。
-- 唤醒器使用 Vosk 小中文模型和很小的 grammar，只负责唤醒、停止等短语。
-- 命令识别器使用 sherpa-onnx SenseVoice；公开默认 `speech.fallback.backend: none`。faster-whisper 只是 opt-in 异常后备，普通安装不包含它，只有 `install.ps1 -WithWhisper` 才安装；使用前还应在联网维护窗口预下载 `large-v3-turbo`，避免第一次后备时发生 GB 级下载。0.1.0 仅在已构造 SenseVoice 的 `transcribe()` 抛异常时触发，不处理空/低置信度结果，也不能补救 SenseVoice 启动/加载失败，且尚无该分支的自动化测试。
+- 唤醒器使用 Vosk 小中文模型和很小的 grammar，只负责“开始语音操作”“结束语音操作”、急停、确认和恢复等控制短语；`phrase_window_seconds` 会在有限窗口内合并多个 final，帮助识别说得较慢的控制口令。
+- 命令识别器使用 sherpa-onnx SenseVoice；公开默认 `speech.fallback.backend: none`。faster-whisper 只是 opt-in 异常后备，普通安装不包含它，只有 `install.ps1 -WithWhisper` 才安装；使用前还应在联网维护窗口预下载 `large-v3-turbo`，避免第一次后备时发生 GB 级下载。0.2.0 仅在已构造 SenseVoice 的 `transcribe()` 抛异常时触发，不处理空/低置信度结果，也不能补救 SenseVoice 启动/加载失败，且尚无该分支的自动化测试。
 - 默认 utterance endpoint 是 Silero VAD v6.2.1 ONNX，由现有 sherpa-onnx 运行时加载，并设置阈值、最短静音、最短/最长语音和窗口大小。
 - 自适应能量门限是可选后备：根据环境噪声调整阈值，并使用预卷、最短语音、尾部静音和最长话语上限；不需要额外 VAD 权重。
 
 音频缓冲属于短生命周期内存对象。当前 Transcriber 接口只返回文本字符串，不暴露 SenseVoice 置信度；默认不提供“自动保存录音”路径。
 
-### 意图与规划层
+### 兼容意图与文本规划层
 
 `handsfree_pc/intents.py` 先解析高频中文命令，包括：
 
@@ -108,7 +111,27 @@ stateDiagram-v2
 - 两个 adapter 都在空临时工作目录中运行，避免自动带入项目级上下文；planner 启动/超时错误会被泛化，不向用户回显原始 prompt 或 provider stderr。
 - 两者都不能直接调用 HandsFreePC 的桌面执行器，也不能绕过随后运行的本地安全策略。本地重判从 planner 声明的风险起步，只能保持或升高，不能降低。Claude 的工具列表为空；Codex 的 `read-only` sandbox 仍可运行模型生成的只读 shell 命令，因此临时工作目录不构成本机文件保密边界。云规划保持默认关闭。
 
-### 路径解析与安全策略
+这些 Schema、风险重判与 `blocked_keywords` 只保护旧兼容链路，不会过滤连续 Computer Use prompt，也不会限制 Computer Use plugin 的鼠标键盘能力。
+
+### 连续 Computer Use 层
+
+`handsfree_pc/computer_control.py` 为第一条任务调用 `codex exec --json`，从 JSONL 事件取得 thread id；后续普通任务和确认 continuation 使用 `codex exec resume <thread-id> --json`。controller 保留用户 Codex 配置和插件，以加载 Computer Use skill 与 `node_repl`，这与上面的临时、ephemeral、忽略用户配置的旧 planner 隔离方式不同。
+
+Windows 目标应用必须位于当前 active desktop 且可见；Computer Use 执行时会占用 foreground 并移动鼠标/键盘。首次控制 app 的 per-app approval / `Always allow` 属于 Codex 自己的授权层，与 HandsFreePC YAML、`read-only` shell sandbox 和队列确认相互独立；关闭本项目配置不会自动撤销已保存的 app approval。
+
+连续反馈在每个 utterance 边界把该边界前的待播项按优先级合并，只朗读最高优先级中的最新一条，清除同批其余项而不保证逐条补播。可见确认反馈实际显示时立即记录确认有效期起点；纯 `voice` 必须等完整、未截断的确认提示成功播完才解锁并起算，播报失败或过早确认都不授权。有效期没有后台 Timer，而由下一段本地语音触发惰性检查。
+
+每条任务的系统控制提示要求：
+
+1. 只选择一个目标应用窗口，不控制 ChatGPT/Codex 自己的界面；
+2. 优先读取新的 UIA 状态，UIA 不足时只截取当前目标窗口；
+3. 每次观察后只执行一个原子鼠标/键盘动作，随后重新观察；
+4. 在高风险或其他需确认动作执行前返回 `NEEDS_CONFIRMATION`，不先做该动作；
+5. 禁止借助 shell、PowerShell、终端、Run 对话框、认证、密码、UAC 或安全/隐私设置完成任务。
+
+这些是发给 Codex/Computer Use 的行为约束，不是本地 capability sandbox。`--sandbox read-only` 约束 Codex shell 的文件写入，但不阻止 Computer Use 改变其他应用。adapter 只接受完整 JSONL turn；最终消息必须单行、不超过 600 字、无 Unicode C 类控制字符，并严格以 `VERIFIED_COMPLETION:`、`NEEDS_CONFIRMATION:` 或 `FAILURE:` 开头。任务后置条件仍由同一个 Codex agent 自检并报告，没有第二个本地视觉 verifier。0.2 的自动化测试使用 fake subprocess，尚未做真实目标窗口、截图、点击和应用后置条件验收。
+
+### 兼容路径解析与安全策略
 
 `handsfree_pc/paths.py` 的路径解析顺序为：
 
@@ -121,7 +144,7 @@ stateDiagram-v2
 
 执行器的 `prepare_plan` 会在确认前解析每个 `open_path`，把最终路径写回计划，再由运行时重新执行 `SafetyPolicy`。因此“安装程序”这类无扩展名说法若最终命中 `.exe`，仍会进入确认，而不会只按原始口令的后缀判级。
 
-`handsfree_pc/safety.py` 对所有来源的计划重新判级。首版动作集合只有：
+`handsfree_pc/safety.py` 对兼容 parser/planner 来源的计划重新判级。旧动作集合只有：
 
 `open_path`、`activate_app`、`open_conversation`、`open_mode`、`enter_dictation`、`start_native_voice`、`set_feedback_mode`、`type_text`、`send_prompt`、`pause`、`resume`、`wait`。
 
@@ -129,14 +152,14 @@ Schema 中没有 shell、PowerShell、坐标点击、注册表、进程注入、
 
 所有 action 文本字段与 plan `summary` 都拒绝 Unicode C 类控制字符；`type_text` 另有 2000 字上限，因此不能夹带 NUL、回车或换行提交。`send_prompt` 只接受完整控制命令带来的显式授权。裸“开始听写/打开语音输入”不能以 `app=current` 写入任意前台框，必须指定已配置的 Codex/Claude 等应用。这里的阻断边界只约束 HandsFreePC 的本地计划：文本一旦由用户明确提交给下游 agent，下游能做什么由其自己的 sandbox、approval 和 permissions 决定，必须另行采用最小权限。
 
-### Windows 执行层
+### 兼容 Windows 执行层
 
 执行器按以下阶梯尝试，不能跳过核验：
 
-1. **原生 handler**：先确认当前输入桌面为 `Default`，再验证路径存在且唯一并通过 Windows 文件关联打开；若没有匹配窗口且配置了应用可执行文件，则从该完整路径启动。已有窗口目前按允许的进程名和标题匹配，尚未核验运行中进程的完整镜像路径或代码签名。0.1.0 对路径打开记录调度方法，但尚未验证最终关联应用内容。
+1. **原生 handler**：先确认当前输入桌面为 `Default`，再验证路径存在且唯一并通过 Windows 文件关联打开；若没有匹配窗口且配置了应用可执行文件，则从该完整路径启动。已有窗口目前按允许的进程名和标题匹配，尚未核验运行中进程的完整镜像路径或代码签名。0.2.0 对路径打开记录调度方法，但尚未验证最终关联应用内容。
 2. **pywinauto/UIA**：首版默认。窗口按应用档案的进程名/标题定位；控件在可见、启用的 UIA 后代中按控件类型和可访问名称做唯一/模糊匹配。`AutomationId` / `RuntimeId` 主要记录为证据，并用于固定已经聚焦的听写目标，不是通用初始 selector。
-3. **WinApp CLI adapter**：未来可选。它仍属 Public Preview，因此不会替代 pywinauto 成为首版唯一后端。
-4. **局部视觉 adapter**：未来兜底。只允许返回目标窗口局部区域中的候选元素；本地执行器仍要重验位置与窗口。
+3. **WinApp CLI adapter**：未来可选。它仍属 Public Preview，因此不会替代 pywinauto 成为兼容路径的唯一后端。
+4. **局部视觉 adapter**：未来可选的兼容执行器兜底；与 Codex Computer Use 当前直接使用的目标窗口截图不是同一组件。
 
 UIA/输入动作采用两阶段核验：
 
@@ -148,7 +171,7 @@ UIA/输入动作采用两阶段核验：
 
 当目标应用以管理员身份运行而 HandsFreePC 不是管理员时，输入注入可能被 UIPI 阻止。这是安全边界，不通过自动提权规避。
 
-### 应用档案
+### 兼容应用档案
 
 每个应用档案定义：
 
@@ -157,11 +180,11 @@ UIA/输入动作采用两阶段核验：
 - 项目/对话通过通用命名 UIA 匹配；composer 使用内置候选名和唯一 Edit/Document fallback；
 - 原生语音只使用本机显式配置的热键或按钮名称。
 
-Codex/Claude 这类 Electron 应用的 UIA 树可能随版本、语言和实验功能变化。0.1.0 没有内置 `inspect` 命令，也没有版本化 selector profile；应用升级后应使用外部 UIA/辅助功能检查器做本机校准，再运行 dry-run 和受控 live smoke。
+Codex/Claude 这类 Electron 应用的 UIA 树可能随版本、语言和实验功能变化。0.2.0 没有内置 `inspect` 命令，也没有版本化 selector profile；应用升级后应使用外部 UIA/辅助功能检查器做本机校准，再运行 dry-run 和受控 live smoke。
 
 公开档案有意不预填 Codex/Claude 的搜索热键、原生语音热键或语音按钮名称；它们的 live UI 选择器尚未验证。没有本机 UIA 校准时，相关动作应失败，而不是猜一个按钮。
 
-## 听写与应用内语音
+## 兼容听写与应用内语音
 
 默认流程是“HandsFreePC 听写”，而不是点击应用自己的麦克风：
 
@@ -175,16 +198,20 @@ Codex/Claude 这类 Electron 应用的 UIA 树可能随版本、语言和实验�
 
 ## 反馈层
 
+连续 Computer Use 会话支持 `overlay`、`voice`、`both`、`silent`，并在本地识别固定反馈切换句；切换句可以独立说，也可以带 `over`，不会进入 Computer Use FIFO。遮罩立即显示；需要朗读的反馈进入最多 32 项的有界、相邻去重队列，只由麦克风 owner 线程在 utterance 边界挑选当前最高优先级（同级取较新）的一项播放，其余该批不重播。播放完成后清空音频输入并重置控制词 detector，避免半句话中途插播和 TTS 回声成为 prompt。切换到 `overlay`/`silent` 会清掉待播语音。
+
+纯 `voice` 模式的确认另有可达性门禁：只有完整、未截断的确认提示成功播完，才把 pending action 标记为已告知；用户过早说“确认执行”不会授权。SAPI 拒绝/报错或提示无法完整播报时会显示强制错误，用户必须先切换到 `overlay` 或 `both` 再确认。`both`/`overlay` 有即时可见提示，因此不等待语音播完才允许确认。
+
 - `overlay`：默认；topmost、高对比、大字、不可聚焦、鼠标穿透，不能抢走 composer 焦点。
-- `voice`：调用本机已安装的 Windows TTS；`speaking` 覆盖整个待播队列。PortAudio callback 仍向有界输入队列/预卷写入，但运行时暂停识别与命令处理；全部播放后两处缓冲一起丢弃。0.1.0 不能用停止词中断这段队列播放，所以反馈只应是短句。SAPI worker/COM 错误当前不会传播成可见失败，纯 `voice` 模式可能静默，必须逐机感知测试；默认 `overlay` 更安全，`both` 至少保留遮罩。
+- `voice`：调用本机已安装的 Windows TTS。连续路径在 utterance 边界延迟朗读，并检查 `speak` 接受状态、播放完成与 `last_error`；失败会强制显示错误，pending confirmation 保持锁定。兼容路径的 `speaking` 覆盖整个待播队列，其 SAPI worker/COM 错误仍可能不传播成可见失败。两者播放时都不处理语音急停，播放后丢弃期间积累的输入，所以反馈只应是短句；默认 `overlay` 更稳妥，`both` 至少保留遮罩。
 - `both`：同时显示和朗读。
 - `silent`：普通反馈不显示、不朗读；确认和错误会强制显示遮罩，避免静默执行或静默失败。
 
-确认文案不信任 plan `summary`，而从已校验动作本地派生；路径动作的普通执行/失败也使用通用摘要，不朗读最终绝对路径。但非确认执行和部分 blocked 流程仍可能显示/朗读未受信任、最长 200 字的 plan `summary`，这是误导反馈残余风险。命令刚识别时，`overlay` / `both` 还会显示完整的“识别：{转写}”，`voice` / `both` 会朗读它，因此口述路径/项目名仍可能暴露给旁观者。反馈链路是半双工：必须等待唤醒/确认 TTS 队列结束再说下一句，否则缓冲会在播放后丢弃。诊断命令的 stdout/JSON（例如 `doctor`）也可能显示配置路径和模型路径，用户在分享输出前必须脱敏。
+兼容确认文案不信任 plan `summary`，而从已校验动作本地派生；Computer Use confirmation detail 来自同一 agent，虽经长度/控制字符协议校验，仍是不可信描述。路径动作的普通执行/失败使用通用摘要，但其他流程仍可能显示/朗读转写、plan summary 或 controller detail。连续与兼容 TTS 都是半双工：播放期间不处理控制词，播完丢弃音频；必须等提示结束再说。诊断 stdout/JSON 也可能显示配置或模型路径，分享前必须脱敏。
 
 ## 常驻与自启
 
-0.1.0 以当前用户登录后的普通进程运行。`scripts/install-autostart.ps1` 会在当前用户的 Startup 文件夹创建 `HandsFreePC.lnk`，目标是项目虚拟环境中的 `pythonw.exe`，并传入本机 `config.local.yaml`；它不安装 Windows Service，也不请求管理员权限。`scripts/run.ps1` 会先跑 `doctor --strict`，但直接执行 `handsfreepc run` 和 Startup 快捷方式不会先跑这道门禁。
+0.2.0 以当前用户登录后的普通进程运行。`scripts/install-autostart.ps1` 会在当前用户的 Startup 文件夹创建 `HandsFreePC.lnk`，目标是项目虚拟环境中的 `pythonw.exe`，并传入本机 `config.local.yaml`；它不安装 Windows Service，也不请求管理员权限。`scripts/run.ps1` 会先跑 `doctor --strict`，但直接执行 `handsfreepc run` 和 Startup 快捷方式不会先跑这道门禁。`ready_for_live_control` 会静态检查 controller 配置的 Codex executable 与相关 skill/config 线索，但不验证 Codex 登录、Computer Use server、active desktop、per-app approval、真实点击或应用后置条件；它是预检，不是 live-ready 证明。
 
 这个简单的 Startup 快捷方式没有严格 doctor 门禁、console、持久日志、托盘状态、失败通知、延迟启动、崩溃重启或重复实例仲裁；模型/麦克风/配置的启动异常可能表现为静默退出，因此不能把这些能力写成当前保证。后续安装器可以在经过测试后改用当前用户的 Task Scheduler `ONLOGON` 任务或受 Windows 设置管理的 `StartupTask`，并补上单实例、有限重启和可见卸载。不要改造成试图在 Session 0 中操控交互桌面的服务。
 
@@ -193,20 +220,21 @@ Codex/Claude 这类 Electron 应用的 UIA 树可能随版本、语言和实验�
 新增能力应通过窄接口扩展：
 
 - 新 ASR：实现统一转写接口，不改变安全策略；
-- 新 planner：只返回现有/经审查扩展后的 Schema；
+- 新兼容 planner：只返回现有/经审查扩展后的 Schema；
+- 新 Computer Use backend：必须有独立的显式总开关、屏幕上下文授权、确认/取消协议和真实屏幕验收；
 - 新应用：新增版本化 profile 和 smoke test；
 - 新动作：同时增加模型、Schema、风险矩阵、执行器、后置条件和测试；
 - 新反馈：不得抢焦点或把敏感内容发往网络。
 
-任何扩展如果需要任意 shell、全屏云视觉、管理员权限或后台发送外部消息，都属于新的威胁模型，不能用一个配置开关悄悄加入。
+任何扩展如果需要任意 shell、扩大屏幕捕获范围、管理员权限或后台发送外部消息，都属于新的威胁模型，不能悄悄复用现有授权。
 
 ## 当前 alpha 边界
 
 - 目标平台是 Windows 11、64 位 Python 3.11 或 3.12（`>=3.11,<3.13`）。
-- 当前默认执行适配器是 pywinauto/UIA；WinApp CLI 和视觉定位属于后续可选能力。
+- 公开配置默认关闭 Computer Use，因此默认真实执行仍安全关闭；显式开启后的连续路径使用 Codex Computer Use，关闭时才回到 pywinauto/UIA 兼容路径。
 - Silero VAD 与能量门限都会受远场、电视、婴儿声和麦克风自动增益影响；应在实际房间分别做误唤醒、漏唤醒和切句回归，不能只依赖上游示例。
 - `open_path` 的 `success` 只表示 Windows 接受打开请求；关联应用是否启动并展示正确文件仍需人工观察或未来的应用级 verifier。
-- 0.1.0 没有主动的会话锁定事件监听器，麦克风采集不会自动暂停；但每个真实 OS/UI 动作都会读取输入桌面名称，非 `Default` 时连 `open_path` 也阻断。用户仍应在锁屏前说停止短语或退出程序。
-- Codex/Claude 应用 UI 必须在目标机器上做 live smoke test；自动化单元测试不能证明某个未来版本的按钮仍可访问。
-- 发布机已通过 SenseVoice 官方样例、Vosk 合成唤醒/停止、Silero 官方样例、16 kHz 麦克风读取、完整本地运行时启动/停止、短 SAPI、遮罩不抢焦点、`examples` 目录 Explorer dispatch、`Default` 输入桌面和 Codex 订阅 planner；Claude 清洗环境后的订阅 OAuth 当前不可用。多 DPI、真实家庭噪声和 Codex/Claude live UI selectors 仍未验证。
+- 0.2.0 没有主动的会话锁定事件监听器，麦克风采集不会自动暂停。旧执行器逐动作检查 `Default` 输入桌面；Computer Use 还必须在目标机器上单独验证锁屏、窗口可见性与应用授权行为。
+- 旧 Codex/Claude 应用 selector 和新的 Codex Computer Use 都必须在目标机器做受控 live smoke；自动化单元/fake subprocess 测试不能证明截图、点击或未来版本控件可用。
+- 先前发布机 smoke 只覆盖本地 ASR/VAD/麦克风、短 SAPI、遮罩、旧 Explorer dispatch、输入桌面和文本 planner 等兼容链路。0.2 没有声称完成真实屏幕 Computer Use 测试，也没有用它证明任何目标应用已被成功控制。
 - 锁屏/Winlogon/UAC 安全桌面、密码框和更高完整性窗口按设计不可控制。
