@@ -1,325 +1,322 @@
-# HandsFreePC 故障排查
+# HandsFreePC 0.3 故障排查
 
-先运行：
+先区分问题发生在哪一层：控制词、正文 ASR、`over` 拼装、FIFO、planner、driver、fresh observation、LocalVerifier 或反馈。不要只看“我在听”或“操作成功”遮罩推断整条链路工作。
+
+## 最小诊断顺序
 
 ```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor --strict
-```
-
-普通 `doctor` 便于查看各项状态；`doctor --strict` 用 `ready_for_run` 汇总本地依赖/模型/输入设备，启用 Computer Use 时还用 `ready_for_live_control` 静态检查四项配置门禁、controller 配置的 Codex executable、Computer Use skill 和 `node_repl` 线索。这不是 live 证明：它不实例化 ASR/VAD、不打开指定麦克风，也不验证 Codex 登录、Computer Use server、per-app approval、active desktop、真实点击或应用后置条件。`scripts/run.ps1` 和 `scripts/smoke-test.ps1` 会先经过 strict；直接执行 `handsfreepc run` 或 Startup 快捷方式不会，但配置加载器仍会拒绝 Computer Use 缺许可或与 `dry_run: true` 同开。输出可能包含本机路径、音频设备名和命令位置，公开前必须脱敏。
-
-## PowerShell 阻止运行脚本
-
-只为当前 PowerShell 进程放行：
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-```
-
-不需要也不建议永久关闭系统执行策略。仍失败时确认是在仓库根目录运行 `./scripts/install.ps1`，并且文件不是从不可信来源取得。
-
-## 找不到 Python 或版本太旧
-
-HandsFreePC 要求 64 位 Python 3.11 或 3.12；`pyproject.toml` 与安装器都拒绝 3.13。检查：
-
-```powershell
-python --version
-py -0p
-```
-
-安装合适版本后删除并重新建立有问题的项目 `.venv`，或在新克隆中重装。不要把全局 site-packages 和项目虚拟环境混用。
-
-## `pytest` 报临时目录 Access denied
-
-某些 Windows 临时目录 ACL 会让 pytest 无法创建 fixture。把基准临时目录显式放在仓库的忽略目录：
-
-```powershell
-./.venv/Scripts/python.exe -m pytest -q --basetemp ./.pytest-tmp
-```
-
-`.pytest-tmp/` 已在 `.gitignore` 中。仍失败时检查该目录是否被另一个 pytest 进程占用。
-
-## 模型不存在或下载不完整
-
-重新运行：
-
-```powershell
-./scripts/download-models.ps1
-```
-
-默认配置期望：
-
-```text
-models/vosk-model-small-cn-0.22/am/final.mdl
-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx
-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/tokens.txt
-models/silero-vad-v6.2.1/silero_vad.onnx
-```
-
-模型相对路径以所用配置文件的目录为基准，而不是永远以当前命令行目录为基准。对于全新下载，下载器在 staging 目录中核对项目固定的归档 SHA-256、解压、检查预期权重、下载许可文本并写入 `HANDSFREEPC_MODEL_SOURCE.txt`；这些全部完成后才替换目标目录，替换失败会尝试恢复旧目录。已有目录只有在预期权重、所有要求的许可文件和来源说明都存在时才跳过；跳过不重新校验历史归档哈希。若只有一个模型目录异常，删除该单个目录后运行不带 `-Force` 的 `./scripts/download-models.ps1`；`-Force` 会重新下载全部三个默认模型，只应在确实需要全量刷新时使用。不要从不明网盘复制模型。
-
-## faster-whisper 后备未安装或首次运行突然下载
-
-这是默认行为边界：普通 `install.ps1` 只安装 `audio` 与 `windows` extras，公开配置的 `speech.fallback.backend` 为 `none`。确实需要 Whisper 后备时，应在维护窗口先安装并显式预下载：
-
-```powershell
-./scripts/install.ps1 -WithWhisper
-./.venv/Scripts/python.exe -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')"
-```
-
-该步骤会联网并产生 GB 级模型下载/缓存，也会增加磁盘、内存和推理负担。确认加载成功后，才把本地配置改为：
-
-```yaml
-speech:
-  fallback:
-    backend: faster-whisper
-    model: large-v3-turbo
-```
-
-当前后备只在已经成功构造 SenseVoice 后、某次 `transcribe()` 调用抛出异常时触发；空文本、低置信度和 SenseVoice 启动/模型加载失败都不会触发。如果先改配置却未预下载，第一次命中这个异常分支时可能临时联网并长时间等待。0.2.0 自动化套件尚未覆盖该分支；不接受这条网络、资源或未覆盖测试边界时保持 `backend: none`。
-
-## 没有音频输入设备
-
-列出设备：
-
-```powershell
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml list-audio-devices
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml simulate --independent --file ./examples/demo_commands.txt
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml overlay-demo --text "我在听"
 ```
 
-在 Windows“设置 → 隐私和安全性 → 麦克风”中同时开启麦克风访问和桌面应用访问。然后在 `config.local.yaml` 中把 `speech.input_device` 设为返回列表中的输入设备编号；`null` 表示系统默认设备。
-
-蓝牙耳机切换 profile、远程桌面重连、休眠恢复或 USB 麦克风拔插后，设备编号可能变化。停止并重新运行 HandsFreePC，再执行 `doctor`。
-
-## 唤醒词总是听不到
-
-逐项检查：
-
-1. Vosk 模型目录存在；
-2. 音频设备有输入电平，没有被应用独占；
-3. `app.wake_phrases` 包含自然中文 `开始语音操作`；
-4. `speech.wake.grammar` 有对应的分词形式 `开始 语音 操作`；
-5. 说话时关键词之间不要刻意停顿太久；
-6. 先在 0.5 m 安静环境测试，再逐步增加距离和噪声。
-
-Vosk 小词表是低资源控制层，不是声纹认证，也不能保证电视或其他人不会误唤醒。运行时用 `speech.wake.phrase_window_seconds`（公开默认 5 秒）在有限 rolling window 内合并多个 final，因此慢速口令不必刻意说得飞快；但单词间停顿超过窗口仍会失败。高风险动作还必须在即将执行时确认。
-
-## 一句话被截断或迟迟不结束
-
-默认使用 Silero VAD。可调整：
-
-- `speech.vad.threshold`：提高会减少噪声触发，但可能漏掉轻声；
-- `min_silence_duration`：提高可容忍更长的句中停顿；
-- `min_speech_duration`：过滤过短噪声；
-- `max_speech_duration`：限制单句最长时间；
-- `speech.trailing_silence_seconds`：仅在 energy 后端使用。
-
-若 Silero 运行时加载或切句行为异常，可以暂时把 `speech.vad.backend` **准确写成** `energy` 做诊断。energy 是自适应能量门限后备，噪声环境下通常不如 Silero 稳；不要依赖拼写错误落入后备。另一个边界是：`doctor --strict` 仍无条件要求 Silero 模型文件和 sherpa 模块存在，因而 `scripts/run.ps1` 会在这些结构缺失时先拒绝；energy 只能在 strict 结构门禁通过时由脚本运行，或用直接 `handsfreepc ... run` 隔离诊断。不要一次改多个参数；每次用固定口令和相同距离记录结果。
-
-## 说了 `over` 仍未入队
-
-`over` 必须被 SenseVoice 转写成独立英文 token，匹配不区分大小写；`mouseover`、`voiceover` 不会切分。看遮罩区分“已记录，等待 over”和“已入队 N 条”：前者表示 delimiter 尚未识别，后者才表示进入普通 FIFO。一次 fragment 可含多个 `over` 并从左到右产生多条任务。
-
-队列满时已完成 prompt 会被明确拒绝，不会静默丢弃；等队列有空间后必须重说。`simulate` 只走兼容 parser，没有连续 `over` 模拟器；无屏幕副作用的 delimiter/FIFO 检查应运行自动化测试，真实麦克风连续链路只能在四门禁全开的受控 Computer Use live test 中验证。
-
-## SenseVoice 无法加载或转写为空
-
-确认虚拟环境内安装的是项目锁定的 `sherpa-onnx==1.13.6`，模型目录同时有 `model.int8.onnx` 和 `tokens.txt`。用上游样例 WAV 隔离“模型问题”和“麦克风问题”：
+需要验证自有 UIA driver 时，再按 [TESTING.md](TESTING.md) 配置 `local_agent/windows_uia`、`planner_backend: none`，显式运行：
 
 ```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml test-asr ./models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/test_wavs/zh.wav
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml computer-doctor --live
 ```
 
-该命令只接受单声道、16-bit PCM WAV。其他格式需先用可信的本地工具转换。样例可用而实时为空，优先排查输入设备、VAD 和麦克风权限。
+普通 `doctor` 是静态预检，`ready_for_live_control` 和 `live_control_verified` 应为 `false`。只有 `computer-doctor --live` 对项目自有 fixture 的实际 Unicode round-trip 可以令后者为 `true`。
 
-## 遮罩不显示、抢焦点或位置不对
+## “开始语音操作”说慢了不识别，说快反而成功
 
-先单独运行：
+控制词由本地 Vosk 小词表和 `phrase_window_seconds` 判断，不是正文 SenseVoice。检查：
 
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml overlay-demo --duration 10 --mode overlay
-```
+1. `app.wake_phrases` 中是完整“开始语音操作”；
+2. `speech.wake.grammar` 有带空格的 `"开始 语音 操作"`；
+3. 使用 `list-audio-devices` 确认选中的麦克风；
+4. 避免在四个字之间停很久；控制词需要落在同一短窗口；
+5. 调整 Windows 输入增益，避免第一个字被噪声门截掉；
+6. 不要同时让另一个应用独占麦克风；
+7. 用 overlay 观察是否真的进入连续 `ACTIVE`，而不是兼容状态机的一次命令。
 
-检查 Windows 缩放、多显示器、远程桌面和全屏独占应用。遮罩使用 Tk 顶层窗口并尝试设置 Windows no-activate / click-through 样式；某些全屏应用或远程环境可能仍把它挡住。不要用不断 `Alt+Tab` 的方式强行让反馈置顶，因为那会破坏目标输入焦点。
+不要为解决这一问题随意降低所有安全阈值或扩充大量相似唤醒词；那会增加旁人和扬声器误触发。先用受控录音对 Vosk grammar 做离线测试。
 
-## 语音反馈没有中文或系统识别了自己的声音
+## 已显示“我在听”，但后续指令不执行
 
-语音反馈使用 Windows 已安装的 SAPI voice；项目不附带中文 TTS 模型。安装合适的 Windows 中文语音，或改用默认 `overlay`：
+按顺序检查：
+
+- `computer_control.enabled` 是否为 `true`；
+- `execution.dry_run` 是否为 `false`；
+- backend 是否为 `local_agent`，不是旧 `legacy_codex_cli`；
+- 指令尾部的 `over` 是否真的出现在 SenseVoice 正文转写；
+- 队列是否已满、暂停或等待确认；
+- 云 planner 开启时，两项许可和 CLI 登录是否齐全；
+- planner miss/失败后是否明确显示 `FAILURE`；0.3 不会静默换成另一套 controller；
+- 目标应用是否已运行并匹配 `apps.*.process_names/title_patterns`。
+
+`enabled: false` 时可以测试麦克风和兼容 parser，但不会启动连续桌面 agent。
+
+## `over` 经常漏掉
+
+这是当前已知架构边界：0.3 的 `over` 仍来自正文 SenseVoice ASR，而不是独立 KWS。`PromptAssembler.finalize()` 只是未来 KWS 的代码 seam，运行时没有调用它。
+
+临时建议：
+
+- 把 `over` 作为一个清晰、独立的英文词说出，前后留一个很短的自然停顿；
+- 用 `overlay` 查看转写和队列数；没有入队就再说完整 `over`，不要继续堆很多正文；
+- 不要在配置中增加过多常见中文短词作为 delimiter，容易在正文误切；
+- `mouseover`、`voiceover` 不会切分，这是预期行为。
+
+正确修复需要单麦克风 audio fan-out、统一 timestamp、ASR prefix flush 和去重。简单地让 KWS 命中就抛异常或另开麦克风会丢掉 delimiter 前正文。候选 sherpa-onnx KWS 模型许可仍待澄清，0.3 不自动下载。
+
+## 任务显示成功，但屏幕没有变化
+
+先检查 backend：
 
 ```yaml
-app:
-  feedback_mode: overlay
+computer_control:
+  backend: local_agent
+  driver: windows_uia
 ```
 
-连续会话支持 `overlay`、`voice`、`both`、`silent`，固定的反馈切换句由本地处理，带或不带 `over` 都不会进入 Computer Use FIFO。遮罩立即显示；`voice` / `both` 的待播反馈延迟到麦克风线程到达 utterance 边界，在该边界把多条按优先级合并，只播最高优先级中的最新一条，其余不会逐条补播。播完再 drain 输入并重置控制检测器。兼容路径也在完整 TTS 队列期间暂停识别并在结束后丢弃输入。**0.2.0 仍不能用停止词打断正在播放的 SAPI**，所以播报应短小；希望持续快速口述或保留逐条可见状态时使用 `overlay`。
+`local_agent` 只有在 fresh observation 和 LocalVerifier 通过后才返回 `LOCAL_VERIFIED_COMPLETION`。若看到单纯 `VERIFIED_COMPLETION:`，通常仍在旧 `legacy_codex_cli`；该状态由同一个 Codex agent 自报，不是可信验收。
 
-纯 `voice` 模式下，高风险确认必须先完整成功播报；抢在提示结束前说“确认执行”不会授权。若 SAPI 拒绝、报错或提示被截断，程序会强制显示“切换到屏幕反馈后再确认”，pending action 继续锁定；先说“切换到屏幕反馈”或切 `both`，看清不超过 160 字的动作描述，再确认。连续路径会显式暴露这类语音错误；兼容路径的 SAPI worker/COM 错误仍可能只在进程内部，纯 `voice` 因而可能静默。
+对通用 agent loop：
 
-`doctor --strict` 不实例化 SAPI，也不枚举/试听声音。`overlay-demo` 与兼容路径的某些 SAPI worker、COM 或 voice dispatch 错误仍可能只保存在进程内部，不会让 `overlay-demo --mode voice` 返回失败；连续确认路径才有上一段的显式失败门禁。每台机器都必须人工听测 `voice`/`both`；默认 `overlay` 更稳妥，`both` 至少保留可见遮罩。
+1. 运行 `computer-doctor --live`，确认自有 fixture 的 Unicode round-trip；
+2. 查看失败是 window resolution、action、fresh observe 还是 completion expectation；
+3. 确认本动作任务后置条件在 fresh before 为 false；若动作前已经成立，系统会拒绝把无变化操作算成功；
+4. 确认 after generation 严格增加、fingerprint 变化且同一后置条件为 true；
+5. 输入任务要求 exact text 出现在新 UIA 状态；应用若不暴露 value，LocalVerifier 会保守失败；
+5. 对“打开/切换”任务要求具体可观察后置条件，不要只要求 planner 报 done；
+6. 人工核对实际屏幕。UIA 文字出现仍不一定证明远端发送、保存或同步成功。
 
-## 急停没有立刻生效
+不要用延迟、重复点击、坐标 fallback 或 shell 来“掩盖”失败；这会破坏动作绑定和防重放。
 
-连续路径的“立即停止所有操作”“取消所有操作”等急停会设置当前任务的取消事件、清空普通/控制队列、终止或杀死 Codex 进程树，并关闭/丢弃当前 controller/thread 引用。这是 best effort：已经到达 Windows 或外部服务的点击、输入、发送等副作用不能撤回；下一轮会创建新的 controller/thread。
+## `computer-doctor --live` 拒绝运行
 
-仍有三个不能承诺“立刻”的边界：
-
-- Computer Use 底层 UI 调用可能在子进程收到终止前已经生效；
-- SAPI 播放期间识别暂停，语音急停只能在播报返回后处理；
-- 兼容 `EXECUTING` 中的同步 Windows/UIA 调用不能被语音抢占。
-
-需要更强的带外停止时在启动终端按 `Ctrl+C`；但进程终止同样不能回滚已经发生的外部副作用。不要把 alpha 用于要求实时物理急停的设备或高风险流程。
-
-## 说“结束语音操作”后仍在听，或一直未结束
-
-这是连续协议的设计：“结束语音操作”只拒绝新的普通 prompt、丢弃未说 `over` 的半条，并进入 `DRAINING`；当前和已入队工作默认继续 FIFO 排空。麦克风仍用本地 Vosk 接收急停、确认和继续/恢复队列，退出进程或关闭系统麦克风权限才停止采集。
-
-若排空中某条失败且后续仍有未完成任务，worker 会暂停，需说“继续队列”或急停；若失败的是最后一条，本轮会显示错误并直接回 `ARMED`，没有剩余队列可恢复。若等待高风险确认，必须在提示实际显示/完整播报后的 `execution.confirmation_timeout_seconds` 内说“确认执行”，或说急停/取消；“继续队列”会被拒绝。超时不是后台 Timer：无人说话时界面可能仍显示等待，下一段本地语音到来才检查；若已过期，该段被拒绝，并取消本轮、当前 controller 与全部队列。处理完当前与队列后才回 `ARMED`；已发生操作仍不可撤回。
-
-## 兼容路径：文件或路径找不到
-
-优先说出完整盘符和逐层名称。路径解析只会：
-
-1. 使用显式别名；
-2. 接受已存在的完整路径；
-3. 对盘符路径逐层匹配；
-4. 在配置的 `search_roots` 内有限搜索。
-
-没有配置搜索根目录时，程序不会扫描整台电脑。两个候选得分过近会报歧义。请增加更具体的父目录或扩展名，不要降低 `ambiguity_threshold` 来掩盖同名问题。
-
-0.2.0 的兼容执行器只接受本地路径合同。UNC、`//server`、URI（如 `file:` / `https:`）和 Win32 device namespace 会在任何文件系统访问前直接阻断，不能通过增加 `search_roots` 或确认短语放行；需要远程资源时先用受信任工具在项目外完成显式同步。这些 parser 白名单不约束连续 Computer Use。
-
-## 兼容路径显示已打开，但文件内容不对
-
-`open_path` 的结构化成功证据表示：路径唯一解析成功，并且 Windows Shell 启动调用返回成功。它不证明关联应用已经渲染了正确内容。检查：
-
-- Windows 默认文件关联是否正常；
-- 查看器是否在另一个桌面、显示器或已有窗口中复用；
-- 文件是否被锁定、损坏或需要额外登录；
-- 窗口标题和测试夹具内容是否一致。
-
-这两层应在测试记录中分别标注。
-
-风险判级并非“只拦一个危险后缀列表”：已存在目录和窄安全文件后缀可直接打开；未知后缀、无后缀普通文件以及主动/间接执行类型都要求完整确认短语。即使文件后缀看似安全，Windows 文件关联仍可能被错误配置或篡改，所以最终查看器状态始终需要人工或应用级 verifier 验收。
-
-## Computer Use 报告完成，但屏幕没有变化
-
-controller 只接受完整 JSONL turn，且最终消息必须是单行 `VERIFIED_COMPLETION:`、`NEEDS_CONFIRMATION:` 或 `FAILURE:`。这能拒绝模糊/无效协议输出，却不是第二个视觉 verifier：`VERIFIED_COMPLETION` 仍由执行动作的同一个 agent 根据自己的新观察报告。0.2 尚未完成真实屏幕验收。
-
-保持目标应用在当前 active desktop 可见，人工检查/录制前台、指针、输入和应用级后置条件；确认是否出现未处理的 per-app approval，是否选错窗口，或 UIA/截图是否陈旧。屏幕与状态行不一致时按失败处理，不要因为 adapter 返回 success 就重试高风险动作。
-
-## 兼容路径：找不到 Codex / Claude 窗口
-
-HandsFreePC 先用 `process_names` 和 `title_patterns` 查找已有窗口；只有配置了 `apps.<name>.executable` 且文件存在时，才会尝试启动应用。
-
-在本地配置中核对真实进程名、窗口标题和可执行文件绝对路径。标题模式不要写得过宽，否则可能误匹配浏览器标签或其他工具。若有多个匹配窗口且预期窗口不在前台，程序会故意报歧义；关闭多余窗口或先手动把目标置前。
-
-## 兼容路径：项目、对话、Design 或语音按钮找不到
-
-这些动作依赖 UI Automation 的可访问名称和控件类型，不依赖坐标。Electron / 自绘应用升级、界面语言变化、A/B 布局和折叠侧栏都可能改变 UIA 树。
-
-建议：
-
-1. 展开目标侧栏，并确保目标控件在 UIA 中可见且启用；
-2. 只保留一个同名项目/对话；
-3. 注意公开 Codex/Claude 档案的 `voice_button_names: []`、`native_voice_hotkey: null` 和 `search_hotkey: null` 是有意的安全默认值，不代表缺失安装步骤；
-4. 用外部 UIA/辅助功能检查器确认唯一的实际可访问名称后，再更新 `voice_button_names`；0.2.0 没有内置 `inspect` 命令。若应用有稳定搜索/语音热键，也只在人工验证后配置；
-5. 优先使用 HandsFreePC 自有听写，不要把原生语音按钮当作默认路径。
-
-当前没有任意坐标点击或全屏视觉兜底。找不到稳定语义控件时应该失败，而不是“差不多点一下”。
-
-## 兼容路径：文字没有输入，或因为窗口切换而失败
-
-这是预期的安全检查。每次输入前程序都会再次核验：
-
-- 目标窗口仍是前台；
-- 焦点仍在唯一的 Edit / Document 控件；
-- 控件不是密码框；
-- 焦点控件仍与进入听写时固定的 RuntimeId/AutomationId 身份一致。
-
-代码不会主动读取并比较目标进程完整性级别；不要以管理员身份运行目标应用而让普通权限 HandsFreePC 给它注入输入，Windows UIPI 通常会阻止跨完整性级别操作。也不要删除前台/控件身份复核来“修复”失败，否则文本可能进入错误窗口。即使输入调用报告成功，也只证明 `SendInput` 接受了 UTF-16 单元，不证明控件值已改变；提交只证明发送了 Enter，不证明消息出现或服务端接受。
-
-## 兼容路径：应用内原生语音开启后像是暂停了
-
-这是设计行为。`start_native_voice` 必须是计划最后一步且不能与反馈模式切换组合；非法组合在执行前阻断并回 `ARMED`。合法计划经确认、开始执行尝试后，成功或失败都会保守地留在 `PAUSED` 且只显示遮罩，因为按钮/热键失败不能证明第三方麦克风绝对未被部分触发。先在屏幕上核实并结束 Codex / Claude 自己的语音会话，再说 HandsFreePC 唤醒词恢复。第三方应用未释放麦克风时，恢复可能仍然失败。
-
-## 连续 Computer Use 未启用、未就绪或不操作屏幕
-
-公开 `config.example.yaml` 有意安全关闭。只在被 Git 忽略的 `config.local.yaml` 同时设置：
+它只支持：
 
 ```yaml
-privacy:
-  allow_cloud_planner: true
 computer_control:
   enabled: true
-  backend: codex
-  allow_screen_context_to_cloud: true
+  backend: local_agent
+  driver: windows_uia
+  planner_backend: none
+
 execution:
   dry_run: false
 ```
 
-配置加载会拒绝缺任一云许可或仍标作 dry-run 的 Computer Use。再确认 controller 配置的 Codex CLI 已安装/登录，Computer Use plugin/server/skill 和 `node_repl` 已启用。`doctor --strict` 的 `ready_for_live_control` 只是静态线索，不验证登录、server、per-app approval、窗口可见性或点击。
+常见 `error_type`：
 
-Windows 目标应用必须在当前 active desktop 可见；Computer Use 会占用 foreground 并移动鼠标/键盘，不能在后台静默操作。首次控制某 app 时处理 Codex 的 per-app approval；`Always allow` 会成为 Codex 自己的持久决定，不受 HandsFreePC YAML 或删除本地配置自动撤销。不要批准密码管理器、支付或敏感通信应用。控制提示还禁止终端/Run、ChatGPT/Codex UI、管理员认证、UAC 和安全/隐私提示；这类目标被拒绝是预期行为。
+- `UnsupportedPlatform`：不是 Windows；
+- `LiveDoctorBackendUnsupported`：不是 `local_agent/windows_uia`；
+- `ComputerControlDisabled`：总开关关闭；
+- `DryRunEnabled`：仍为 dry-run；
+- `ForegroundIntegrityBoundary`：当前前台窗口处于更高完整性级别，Windows 拒绝连接输入队列；
+- fixture/driver 异常：UIA 依赖、前台桌面、唯一文本框或 Unicode 验收失败。
 
-若显示 `VERIFIED_COMPLETION` 但屏幕没变，按上一节作为假成功排查；仓库没有声称真实屏幕链路已通过。
+该命令不会替 Qwen driver、Codex/Claude planner 或真实应用做验收。失败时不要把 `planner_backend` 改成云端来绕过 fixture。
 
-## 兼容文本 planner 被禁用或提示需要云授权
+## 静态 doctor 通过，但 `computer-doctor --live` 失败
 
-云规划需要两个明确开关同时为真：
+静态检查只证明文件和命令存在。live failure 常见原因：
+
+- 当前不是可交互 `Default` desktop（锁屏、UAC、安全桌面、切换用户）；
+- pywinauto/pywin32 安装到了另一个 Python；
+- 杀毒/企业策略阻止 UIA 或 `SendInput`；
+- HandsFreePC 被以不同完整性级别运行；
+- fixture 启动慢、窗口被系统隐藏或 foreground activation 被拒；
+- 中文 token 写入后无法从 UIA value 读回。
+
+`ForegroundIntegrityBoundary` 不是可重试的 selector 错误，也不能靠重复点击、Alt 技巧或跳过前台断言修复。先由用户正常退出/降权造成高完整性前台的应用，或在组织明确评估后让目标应用与 HandsFreePC 处于相同完整性级别；项目不会自动提权、关闭进程或绕过 UIPI。一般仍以普通用户运行，不要仅为了让测试变绿改成管理员。记录 JSON 中的 `error_type`，再在同一 `.venv` 检查模块。
+
+## 找不到或无法唯一选择应用
+
+默认 `windows_uia` 只观察 `apps` 中配置的 profile。检查进程名和窗口标题：
+
+```yaml
+apps:
+  claude:
+    process_names: ["claude.exe"]
+    title_patterns: ["Claude"]
+    mode_names:
+      chat: ["Chat and Cowork", "Chat"]
+      code: ["Code"]
+      design: ["Design"]
+```
+
+- 未运行的应用不会由 generic driver 自动猜路径启动；可由确定性 native skill 在显式 `apps.*.executable` 配置后启动；
+- 零个匹配返回 not found；
+- 多个匹配只在其中唯一一个是 foreground 时接受，否则返回 ambiguous；
+- title pattern 太宽会命中错误窗口，太窄会因语言/版本变化失效；
+- process name/title 不是签名验证，不要为高价值应用信任同名陌生窗口。
+- `mode_names` 同时是 native mode allowlist：只有显式 key 可执行，labels 按优先顺序映射到该版本的精确 accessible label。缺少映射会在输入前拒绝；只接受 normalized exact match，并要求最终 mode 变为 selected，focus-only 不算完成。应用升级后若 `Chat` 变成 `Chat and Cowork`，应更新映射并重测，不要降低模糊阈值。
+
+先关闭重复测试窗口或把正确窗口放前台，再做低风险观察。通用任务的口述还必须肯定且只明确指定一个应用；“不要操作 Claude”“比较 Codex 和 Claude”“我在 Claude 看到了错误，帮我处理”这类零授权、多个或顺带提及不会由 planner 猜目标。把命令改成如“在 Claude 点击 Chat”并保持只授权一个应用。
+
+## 打开路径后仍显示失败，或打开了同名文件
+
+确定性 `OPEN_PATH` 不是只检查 Shell dispatch 返回值：执行前目标后置条件必须为 false；打开后必须成为 true，而且前台 HWND 必须与 before 不同。
+
+- 目录：前台 Explorer 的规范化路径必须与目标精确一致，证据较强；
+- 文件：当前只能检查新前台窗口标题是否包含精确文件名，这是 best-effort；复用同一 HWND 的查看器会保守失败。
+
+因此同名文件、查看器复用旧窗口、标题不显示文件名、启动后仍有选择器/登录页时都可能无法证明或存在误判。增加完整父目录只会改善解析，不会把文件标题验证升级为内容验证；重要文件请人工看屏幕核对，不要放宽 verifier。
+
+## UIA 看不到按钮、输入框或选项卡
+
+Electron/canvas/远程桌面应用可能只暴露部分 accessibility tree。表现包括：元素缺失、多个同名元素、焦点状态不见、输入后 value 不可读。
+
+可做：
+
+- 开启应用自身的辅助功能支持；
+- 在目标版本、语言和账号布局上用 UIA 检查器确认实际 tree；
+- 为稳定动作增加确定性 native skill，而不是猜坐标；
+- 若无法在 fresh state 中验证后置条件，保守失败并人工完成。
+
+不要把 `allow_coordinate_actions` 当通用修复。默认安全层会阻断无 semantic target 的坐标 click/drag。
+
+## planner 不可用或无法解析
+
+配置示例：
 
 ```yaml
 privacy:
   allow_cloud_planner: true
-planner:
-  enabled: true
-  backend: codex  # 或 claude
+
+computer_control:
+  planner_backend: claude
+  allow_screen_context_to_cloud: true
+  allow_codex_cli_host_read: false
 ```
 
-然后确认对应 CLI 已安装并完成官方账号登录。推荐让 HandsFreePC 在与 planner 相同的清洗环境中显式检查：
+检查认证：
 
 ```powershell
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor --check-planner-auth
 ```
 
-普通 `doctor` 只检查命令是否存在；`--check-planner-auth` 才执行认证状态命令，因此可能联网。Codex 的非交互命令是 `codex exec`；`codex -p` 是 profile。Claude 才用 `claude -p`。HandsFreePC 会移除规划器子进程环境中名称含 API key、token、secret、password 或 credential 的变量，因此应使用 CLI 自身的订阅登录会话，不应依赖环境变量密钥。planner 启动或超时错误会泛化反馈，不回显原始 prompt 或 provider stderr。
+Claude 是默认 planner。Codex 与 Claude 登录互不替代。`codex -p` 是 profile；Codex 非交互入口是 `codex exec`。Claude 的 prompt 模式才是 `claude -p`。
 
-超时可在 `planner.timeout_seconds` 中调整，但先确认 CLI 单独可用。不要把含有真实路径、病历、学生信息、账号或秘密的句子用于云规划测试。
+若明确要排查 Codex 备选，配置名必须是 `codex_cli_best_effort`，并单独同意主机读取边界：
 
-## 开机自启没有生效
-
-HandsFreePC 使用当前用户的 Startup 快捷方式，不是 Windows Service：
-
-```powershell
-./scripts/install-autostart.ps1
+```yaml
+computer_control:
+  planner_backend: codex_cli_best_effort
+  allow_codex_cli_host_read: true
 ```
 
-确认 `.venv/Scripts/pythonw.exe` 和 `config.local.yaml` 仍在原位置。移动仓库后应先卸载再重装快捷方式：
+0.3 planner 只能返回一个严格 JSON step。以下都会失败：多动作、未知字段、坐标、任意命令、没有 current observation 的 action、不同 app 的 action、不可本地检查的 done。失败是安全预期，不应切换到 legacy controller。
 
-```powershell
-./scripts/uninstall-autostart.ps1
-./scripts/install-autostart.ps1
+顶层 `planner.enabled` 是另一条仅兼容旧 `VoiceRuntime` 的 one-shot fallback。它只能提出用户原句肯定、非引号/数据引用且精确授权的应用 UI 导航；feedback/pause/resume/wait/path/text/send 必须由本地确定性 parser 完整命中。若旧云 planner 提出这些动作或从“输入‘打开 Claude’”这类数据文本推导导航，看到阻断是预期行为，不要放宽 safety。
+
+Codex adapter 使用 ephemeral 临时目录、known-tool deny list 和 read-only sandbox，但订阅 CLI 没有完整 no-tools 保证，也不是主机级秘密隔离；Claude adapter 使用空工具列表、safe/restricted 模式与严格 MCP 配置。两者启动/超时错误不会回显原始 prompt/provider stderr，以免泄漏窗口内容。
+
+## 屏幕上下文许可错误
+
+使用云 desktop planner 时必须同时设置：
+
+```yaml
+privacy:
+  allow_cloud_planner: true
+
+computer_control:
+  allow_screen_context_to_cloud: true
 ```
 
-Startup 快捷方式用 `pythonw.exe ... run` 直接启动，没有 `doctor --strict` 门禁、console、持久日志、托盘图标、自动重启或失败通知；模型、麦克风或配置异常可能看起来像“什么也没发生”。先在交互式 PowerShell 中运行：
+许可不是形式开关：当前 task、唯一明确授权的可见 app 摘要、本句肯定且精确点名的 UIA 控件子集和本地验收历史会进入 provider context。原始窗口标题、进程 ID、未点名 UI 内容、automation ID、element value、PCM、screenshot bytes 和真实截图可用性当前不进入 HandsFreePC 组装的单步 prompt；完整快照只在本地验收。CLI/provider 仍可能另行处理账户/组织、认证、网络、CLI/OS/runtime、临时 cwd、用量、错误和诊断/遥测等自身元数据；项目开关不能证明这些数据为零。若不接受任何控件标签离机，使用 `planner_backend: none`，此时只能执行命中的本地 deterministic skills。
 
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor --strict
-./scripts/run.ps1
+## 等待确认但“确认执行”无效
+
+0.3 confirmation 绑定一个 runtime 保存的 ID，并为每次 pending action 生成随机四位挑战码。提示会类似“确认执行 4 8 2 7”；只说静态“确认执行”永远无效，也不靠模型理解“确认”。无效原因包括：
+
+- 确认提示尚未实际显示/完整播报；
+- 已超过 `execution.confirmation_timeout_seconds`；
+- 任务被急停/取消，pending ID 已清除；
+- 同一个 ID 已经使用，重放被拒绝；
+- 四位码错误、属于上一轮或只说了静态前缀；
+- 确认前界面 fingerprint 改变；
+- fresh safety 分类不再是同一 confirmation；
+- 对 `native-...` 计划，重新 prepare 后完整 plan/source、规范路径、stat 身份或普通文件 SHA-256 与确认时不同；
+- worker 正在普通失败暂停，而不是等待确认。
+
+同一 `VoiceRuntime` 进程运行期内，已签发码在成功、取消或超时后都不会再次签发；有界重抽耗尽时会拒绝创建新确认。去重集合不跨重启持久化，因此四位码不是持久化防重放凭证。
+
+纯 `voice` 模式要等 SAPI 完整播完再说；需要快速确认时用 `overlay` 或 `both`。准确说出屏幕/语音提示中的本轮完整口令，不要连续重复静态“确认执行”。随机码不做说话人识别：旁人、扬声器或实时转述/重放若听到本轮码仍可能代说，高风险动作必须有人看屏幕。
+
+## 说“继续队列”不能继续
+
+- 等待 typed confirmation 时只能确认或取消，`继续队列` 不得绕过；
+- 普通任务失败导致的 `PAUSED` 才允许恢复；
+- 队列在 `DRAINING`/停止中时不会重新接受普通任务；
+- 先前急停已经清空的任务无法恢复。
+
+## 急停后仍发生了一次点击/输入
+
+急停是 cooperative cancellation。它会设置当前 controller cancel event 并清空待处理队列，但已经到达 Win32/UIA 的一次动作不能撤回。MCP mutating call 若断管/超时，结果会标为 unknown，系统不会自动重试，以免重复副作用。
+
+需要硬停止采集和后续处理时，退出 HandsFreePC 进程或关闭 Windows 麦克风权限。对不可逆动作继续依赖 typed confirmation 和人工监督，不要只依赖急停。
+
+## Qwen Open Computer Use 中文乱码或输入不完整
+
+确认它只是实验配置：
+
+```yaml
+computer_control:
+  driver: open_computer_use
+  allow_experimental_driver: true
 ```
 
-修复这里显示的错误并确认 live 运行后，再重新启用 Startup。
+固定测试上游 0.2.3。其 Windows 中文编码问题仍未合并修复：
 
-不要把它改成 Session 0 服务；服务不能可靠地操作当前登录用户桌面。
+- [Qwen open-computer-use Issue #5](https://github.com/QwenLM/open-computer-use/issues/5)
+- [PR #6](https://github.com/QwenLM/open-computer-use/pull/6)
 
-## 提交问题前
+HandsFreePC 会在 replacement character 或前后空白会被截断时拒绝操作，这是预期 fail closed。不要通过 `errors=ignore`、删掉 Unicode 检查或只跑 ASCII token 来宣称修好。优先改回默认 `windows_uia`；完整边界见 [OPEN_COMPUTER_USE.md](OPEN_COMPUTER_USE.md)。
 
-请提供：
+即使没有乱码，0.2.3 的当前适配也没有可安全绑定的结构化 elements。planner 不能可靠生成元素 index，所以点击/导航受限，`type_text`/`set_value` 会因缺少可验证的焦点元素而失败。这不是提高 timeout、打开坐标或换 planner 能安全修复的问题。
 
-- Windows、Python 和 HandsFreePC 版本；
-- 目标应用名称和版本；
-- 最小可复现口令；
-- 期望/实际状态和脱敏后的 error type；
-- 是否为 dry-run、模型 smoke 或真实 live test；
-- 麦克风距离、噪声和 DPI 等必要环境信息。
+## 旧 `VERIFIED_COMPLETION` 或 Computer Use plugin 问题
 
-不要公开提交音频、完整转写、本机绝对路径、窗口标题、项目/对话真实名称、日志、`config.local.yaml`、token 或其他凭据。安全漏洞请按根目录 [SECURITY.md](../SECURITY.md) 私下报告。
+这些属于显式 `legacy_codex_cli`：
+
+```yaml
+computer_control:
+  backend: legacy_codex_cli
+  allow_codex_cli_host_read: true
+  allow_legacy_codex_computer_use: true
+```
+
+旧路径需要 Codex plugin/thread 并由同一 agent 自报结果，没有 0.3 LocalVerifier。若只是历史配置遗留，请迁移为：
+
+```yaml
+computer_control:
+  backend: local_agent
+  driver: windows_uia
+```
+
+factory 不会自动 fallback。除回归兼容外，不要继续排查 `node_repl`/Computer Use skill 来建立新安装。
+
+## 反馈遮罩不显示或 SAPI 没声音
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml overlay-demo --text "我在听" --mode overlay
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml overlay-demo --text "我在听" --mode voice
+```
+
+- overlay 是置顶、鼠标穿透且不抢焦点的短反馈，不是持久托盘状态；
+- `voice` 依赖本机 Windows SAPI 中文声音；命令返回不代表人工真的听到；
+- TTS 播放期间识别暂停/清缓冲，过早说话可能丢失；
+- 播放中的 SAPI 不能被语音急停打断；
+- `silent` 会隐藏普通状态，但确认和错误仍可能显示。
+
+## pytest 大量错误但代码似乎没坏
+
+若首个错误是用户 Temp 下的 `PermissionError [WinError 5]`，这是 pytest base temp 权限，不要按错误数量判断为代码回归：
+
+```powershell
+$testTemp = Join-Path $PWD ('.pytest-tmp\run-' + [guid]::NewGuid().ToString('N'))
+./.venv/Scripts/python.exe -m pytest -x -vv -m "not live" --basetemp $testTemp
+```
+
+只清理明确的项目内测试目录；不要递归删除用户目录、系统 Temp 根或未知路径。
+
+## 报告问题
+
+请提供：版本/commit、Windows/Python、backend/driver/planner、脱敏 `error_type`、是否为 static/fixture/target-app 哪一层，以及最小复现。不要上传音频、完整转写、绝对路径、窗口截图、UIA 私人内容、token、登录缓存或 provider stderr。
+
+涉及安全绕过时按根目录 [SECURITY.md](../SECURITY.md) 私密报告。

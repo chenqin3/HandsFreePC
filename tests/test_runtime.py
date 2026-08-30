@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import replace
+
+import pytest
 
 import handsfree_pc.runtime as runtime_module
 from handsfree_pc.computer_control import ComputerControlResult
@@ -108,6 +112,18 @@ def build_runtime(settings):
     executor = FakeExecutor()
     feedback = FakeFeedback()
     return VoiceRuntime(settings, executor, feedback=feedback), executor, feedback
+
+
+def pending_controller_confirmation_instruction(runtime: VoiceRuntime) -> str:
+    challenge = runtime._pending_controller_confirmation_challenge
+    assert challenge is not None
+    return runtime._confirmation_instruction(challenge)
+
+
+def pending_plan_confirmation_instruction(runtime: VoiceRuntime) -> str:
+    challenge = runtime._plan_confirmation_challenge
+    assert challenge is not None
+    return runtime._confirmation_instruction(challenge)
 
 
 def test_continuous_session_queues_only_at_over_and_stays_active(settings) -> None:
@@ -268,7 +284,7 @@ def test_spoken_feedback_boundary_plays_only_highest_priority_latest_message(set
         runtime.stop()
 
 
-def test_voice_confirmation_is_rejected_until_exact_action_is_spoken(settings) -> None:
+def test_voice_confirmation_requires_announced_action_and_one_time_challenge(settings) -> None:
     enable_computer_control(settings)
     controller = FakeController(
         responses=[
@@ -299,21 +315,162 @@ def test_voice_confirmation_is_rejected_until_exact_action_is_spoken(settings) -
         runtime.handle_session_text("开始语音操作")
         runtime.handle_session_text("提交表单 over")
         wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
-
-        premature = runtime.handle_session_text("确认执行")
-        assert not premature.success
-        assert controller.calls == ["提交表单"]
         assert not runtime._pending_controller_confirmation_announced
         assert runtime._pending_controller_confirmation_started_at == 0
 
+        instruction = pending_controller_confirmation_instruction(runtime)
+
         runtime._flush_voice_feedback(Speech())
         assert any("send the prepared form" in text for text in feedback.speaker.messages)
+        assert any(instruction in text for text in feedback.speaker.messages)
         assert runtime._pending_controller_confirmation_announced
         assert runtime._pending_controller_confirmation_started_at > 0
 
-        assert runtime.handle_session_text("确认执行").success
+        static_phrase = runtime.handle_session_text("确认执行")
+        assert not static_phrase.success
+        assert controller.calls == ["提交表单"]
+
+        assert runtime.handle_session_text(instruction).success
         assert runtime.command_worker.drain(timeout=2)
         assert "send the prepared form" in controller.calls[1]
+    finally:
+        runtime.stop()
+
+
+def test_one_shot_confirmation_code_is_consumed_by_exactly_one_concurrent_caller(
+    settings,
+) -> None:
+    executor = FakeExecutor()
+    runtime = VoiceRuntime(
+        settings,
+        executor,
+        feedback=FakeFeedback(),
+        confirmation_challenge_factory=lambda: "4827",
+    )
+    runtime.state = RuntimeState.AWAKE
+    requested = runtime.handle_text("打开codex并使用应用内语音", require_wake=False)
+    assert requested.state == RuntimeState.CONFIRMING
+    instruction = pending_plan_confirmation_instruction(runtime)
+
+    original_match = runtime._matches_confirmation_challenge
+    rendezvous = threading.Barrier(2)
+
+    def coordinated_match(text, challenge):
+        with suppress(threading.BrokenBarrierError):
+            rendezvous.wait(timeout=0.25)
+        return original_match(text, challenge)
+
+    runtime._matches_confirmation_challenge = coordinated_match
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(
+            pool.map(
+                lambda _index: runtime.handle_text(instruction, require_wake=False),
+                range(2),
+            )
+        )
+
+    assert len(executor.plans) == 1
+    assert sum(outcome.success for outcome in outcomes) == 1
+    assert runtime.pending_plan is None
+
+
+def test_continuous_confirmation_code_enqueues_exactly_one_concurrent_legacy_resume(
+    settings,
+) -> None:
+    enable_computer_control(settings)
+    controller = FakeController(
+        responses=[
+            ComputerControlResult(False, "NEEDS_CONFIRMATION: click exact approved button"),
+            ComputerControlResult(True, "LOCAL_VERIFIED_COMPLETION: clicked"),
+        ]
+    )
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+        confirmation_challenge_factory=lambda: "4827",
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+        runtime.handle_session_text("点击已批准按钮 over")
+        wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
+        runtime._mark_pending_controller_confirmation_announced("click exact approved button")
+        instruction = pending_controller_confirmation_instruction(runtime)
+
+        original_match = runtime._matches_confirmation_challenge
+        rendezvous = threading.Barrier(2)
+
+        def coordinated_match(text, challenge):
+            with suppress(threading.BrokenBarrierError):
+                rendezvous.wait(timeout=0.25)
+            return original_match(text, challenge)
+
+        runtime._matches_confirmation_challenge = coordinated_match
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(lambda _index: runtime._confirm_controller_action(instruction), range(2))
+            )
+
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls[0] == "点击已批准按钮"
+        assert len(controller.calls) == 2
+        assert controller.calls[1].startswith("The user has explicitly confirmed")
+        assert sum(outcome.success for outcome in outcomes) == 1
+        assert runtime._pending_controller_confirmation is None
+    finally:
+        runtime.stop()
+
+
+def test_voice_confirmation_prefers_bound_compact_announcement_over_static_mismatch(
+    settings,
+) -> None:
+    enable_computer_control(settings)
+    detail = (
+        "enter exact user-spoken text; action=type_text; app=Claude; "
+        'user-spoken-target="Prompt"; payload="DRAFT_SAMPLE"; '
+        + "verified-context-digest=abcdef12; " * 12
+        + "binding=0123456789"
+    )
+    controller = FakeController(
+        responses=[ComputerControlResult(False, f"NEEDS_CONFIRMATION: {detail}")]
+    )
+    feedback = FakeFeedback()
+    feedback.mode = FeedbackMode.VOICE
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=feedback,
+        controller=controller,
+        confirmation_challenge_factory=lambda: "4827",
+    )
+
+    class Speech:
+        class Source:
+            def drain(self):
+                pass
+
+        source = Source()
+
+        def reset_control_detector(self):
+            pass
+
+    try:
+        runtime.handle_session_text("开始语音操作")
+        runtime.handle_session_text("在 Claude 的 Prompt 输入 DRAFT_SAMPLE over")
+        wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
+
+        rejected = runtime.handle_session_text("确认执行")
+        assert not rejected.success
+        assert not runtime._pending_controller_confirmation_announced
+
+        runtime._flush_voice_feedback(Speech())
+        spoken = feedback.speaker.messages[-1]
+        assert len(spoken) <= 235
+        assert "确认执行 4 8 2 7" in spoken
+        assert "enter exact user-spoken text" in spoken
+        assert "binding=0123456789" in spoken
+        assert runtime._pending_controller_confirmation_announced
     finally:
         runtime.stop()
 
@@ -355,10 +512,11 @@ def test_failed_voice_feedback_never_unlocks_confirmation(settings) -> None:
         runtime.handle_session_text("开始语音操作")
         runtime.handle_session_text("提交表单 over")
         wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
+        instruction = pending_controller_confirmation_instruction(runtime)
         runtime._flush_voice_feedback(Speech())
 
         assert not runtime._pending_controller_confirmation_announced
-        assert not runtime.handle_session_text("确认执行").success
+        assert not runtime.handle_session_text(instruction).success
         assert controller.calls == ["提交表单"]
         assert any("语音反馈失败" in text for text, _kwargs in feedback.events)
     finally:
@@ -387,9 +545,10 @@ def test_failed_overlay_feedback_never_unlocks_confirmation(settings) -> None:
         runtime.handle_session_text("开始语音操作")
         runtime.handle_session_text("提交表单 over")
         wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
+        instruction = pending_controller_confirmation_instruction(runtime)
 
         assert not runtime._pending_controller_confirmation_announced
-        assert not runtime.handle_session_text("确认执行").success
+        assert not runtime.handle_session_text(instruction).success
         assert controller.calls == ["提交表单"]
     finally:
         runtime.stop()
@@ -476,13 +635,62 @@ def test_controller_confirmation_runs_before_later_fifo_jobs(settings) -> None:
         assert runtime.command_worker.state == WorkerState.PAUSED
         assert controller.calls == ["第一条"]
 
-        confirmed = runtime.handle_session_text("确认执行")
+        instruction = pending_controller_confirmation_instruction(runtime)
+        confirmed = runtime.handle_session_text(instruction)
         assert confirmed.success
         assert runtime.command_worker.drain(timeout=2)
         assert controller.calls[0] == "第一条"
         assert controller.calls[1].startswith("The user has explicitly confirmed")
         assert 'the JSON string "send the form"' in controller.calls[1]
         assert controller.calls[2] == "第二条"
+    finally:
+        runtime.stop()
+
+
+def test_typed_controller_confirmation_never_becomes_a_model_prompt(settings) -> None:
+    enable_computer_control(settings)
+
+    class ConfirmableController(FakeController):
+        def __init__(self):
+            super().__init__()
+            self.confirmed_ids = []
+
+        def run(self, instruction, *, cancel_event=None):
+            del cancel_event
+            self.calls.append(instruction)
+            if instruction == "第一条":
+                return ComputerControlResult(
+                    False,
+                    "NEEDS_CONFIRMATION: send exact prepared message",
+                    needs_confirmation=True,
+                    confirmation_id="desktop-deadbeef",
+                )
+            return ComputerControlResult(True, "LOCAL_VERIFIED_COMPLETION: done")
+
+        def confirm(self, confirmation_id, *, cancel_event=None):
+            del cancel_event
+            self.confirmed_ids.append(confirmation_id)
+            return ComputerControlResult(True, "LOCAL_VERIFIED_COMPLETION: confirmed")
+
+    controller = ConfirmableController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+        runtime.handle_session_text("第一条 over 第二条 over")
+        wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
+
+        instruction = pending_controller_confirmation_instruction(runtime)
+        assert runtime.handle_session_text(instruction).success
+        assert runtime.command_worker.drain(timeout=2)
+
+        assert controller.confirmed_ids == ["desktop-deadbeef"]
+        assert controller.calls == ["第一条", "第二条"]
+        assert all("explicitly confirmed" not in item for item in controller.calls)
     finally:
         runtime.stop()
 
@@ -510,9 +718,11 @@ def test_end_session_waits_for_confirmation_on_last_job(settings) -> None:
 
         assert runtime.session_state == SessionState.DRAINING
         assert not controller.closed
-        assert runtime.handle_session_text("确认执行").success
+        instruction = pending_controller_confirmation_instruction(runtime)
+        assert runtime.handle_session_text(instruction).success
         wait_until(lambda: runtime.session_state == SessionState.ARMED)
         assert controller.closed
+        assert runtime._pending_controller_confirmation_challenge is None
         assert controller.calls[0] == "提交表单"
         assert "send the final form" in controller.calls[1]
     finally:
@@ -603,6 +813,7 @@ def test_late_confirmation_result_after_emergency_cannot_restore_pending_action(
         assert runtime.command_worker.drain(timeout=2)
 
         assert runtime._pending_controller_confirmation is None
+        assert runtime._pending_controller_confirmation_challenge is None
         assert not runtime.handle_session_text("确认执行").success
     finally:
         release.set()
@@ -696,16 +907,18 @@ def test_continuous_confirmation_timeout_cancels_session_and_queued_work(setting
         runtime.handle_session_text("稍后打开另一个窗口 over")
         assert runtime.command_worker.pending_count == 1
         assert runtime._pending_controller_confirmation_announced
+        instruction = pending_controller_confirmation_instruction(runtime)
         runtime._pending_controller_confirmation_started_at = (
             time.monotonic() - settings.execution.confirmation_timeout_seconds - 1
         )
 
-        outcome = runtime.handle_session_text("确认执行")
+        outcome = runtime.handle_session_text(instruction)
 
         assert not outcome.success
         assert outcome.state == RuntimeState.PAUSED
         assert outcome.message.startswith("确认已超时")
         assert runtime._pending_controller_confirmation is None
+        assert runtime._pending_controller_confirmation_challenge is None
         assert runtime.command_worker.pending_count == 0
         assert runtime.command_worker.unfinished_count == 0
         assert controller.closed
@@ -726,7 +939,7 @@ def test_emergency_stop_is_last_feedback_across_outcome_race(settings) -> None:
 
         def emit(self, text, **kwargs):
             super().emit(text, **kwargs)
-            if "Codex 报告" in text and "已完成" in text:
+            if "已完成本地验收" in text:
                 self.outcome_entered.set()
                 assert self.release_outcome.wait(timeout=2)
 
@@ -755,7 +968,7 @@ def test_emergency_stop_is_last_feedback_across_outcome_race(settings) -> None:
         assert not stopper.is_alive()
         assert stop_outcomes[0].success
         texts = [text for text, _kwargs in feedback.events]
-        completion = next(text for text in texts if "Codex 报告" in text and "已完成" in text)
+        completion = next(text for text in texts if "已完成本地验收" in text)
         assert texts.index(completion) < texts.index(
             next(text for text in texts if "已请求立即停止" in text)
         )
@@ -802,6 +1015,24 @@ def test_wake_and_command_same_utterance(settings) -> None:
     assert len(executor.plans) == 1
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "do not open Claude",
+        "不要打开 Claude",
+        "打开 Codex，然后保存当前文件",
+    ],
+)
+def test_one_shot_runtime_never_executes_a_partial_deterministic_match(settings, command) -> None:
+    runtime, executor, _ = build_runtime(settings)
+    runtime.state = RuntimeState.AWAKE
+
+    outcome = runtime.handle_text(command, require_wake=False)
+
+    assert not outcome.success
+    assert executor.plans == []
+
+
 def test_codex_command_enters_own_dictation(settings) -> None:
     runtime, executor, _ = build_runtime(settings)
     outcome = runtime.handle_text(
@@ -839,9 +1070,160 @@ def test_native_voice_waits_for_confirmation(settings) -> None:
     outcome = runtime.handle_text("打开codex并使用应用内语音", require_wake=False)
     assert outcome.state == RuntimeState.CONFIRMING
     assert executor.plans == []
-    confirmed = runtime.handle_text("确认执行", require_wake=False)
+    instruction = pending_plan_confirmation_instruction(runtime)
+    confirmed = runtime.handle_text(instruction, require_wake=False)
     assert confirmed.state == RuntimeState.PAUSED
     assert len(executor.plans) == 1
+
+
+def test_static_confirmation_phrase_never_authorizes_pending_plan(settings) -> None:
+    runtime, executor, _ = build_runtime(settings)
+    runtime.state = RuntimeState.AWAKE
+    requested = runtime.handle_text("打开codex并使用应用内语音", require_wake=False)
+    assert requested.state == RuntimeState.CONFIRMING
+    challenge = runtime._plan_confirmation_challenge
+    assert challenge is not None
+
+    rejected = runtime.handle_text(
+        settings.execution.confirmation_phrases[0],
+        require_wake=False,
+    )
+
+    assert rejected.state == RuntimeState.CONFIRMING
+    assert executor.plans == []
+    assert runtime.pending_plan is not None
+    assert runtime._plan_confirmation_challenge == challenge
+
+
+def test_stale_replayed_and_colliding_one_time_challenges_never_authorize(settings) -> None:
+    challenges = iter(["4827", "4827", "9051"])
+    executor = FakeExecutor()
+    runtime = VoiceRuntime(
+        settings,
+        executor,
+        feedback=FakeFeedback(),
+        confirmation_challenge_factory=lambda: next(challenges),
+    )
+    runtime.state = RuntimeState.AWAKE
+
+    first = runtime.handle_text("打开codex并使用应用内语音", require_wake=False)
+    assert first.state == RuntimeState.CONFIRMING
+    first_instruction = pending_plan_confirmation_instruction(runtime)
+    cancelled = runtime.handle_text(
+        settings.execution.cancellation_phrases[0],
+        require_wake=False,
+    )
+    assert cancelled.state == RuntimeState.ARMED
+    assert runtime.pending_plan is None
+    assert runtime._plan_confirmation_challenge is None
+
+    second = runtime.handle_text("打开codex并使用应用内语音", require_wake=False)
+    assert second.state == RuntimeState.CONFIRMING
+    second_instruction = pending_plan_confirmation_instruction(runtime)
+    assert second_instruction != first_instruction
+
+    stale = runtime.handle_text(first_instruction, require_wake=False)
+    assert stale.state == RuntimeState.CONFIRMING
+    assert executor.plans == []
+    assert runtime.pending_plan is not None
+
+    accepted = runtime.handle_text(second_instruction, require_wake=False)
+    assert accepted.state == RuntimeState.PAUSED
+    assert len(executor.plans) == 1
+    assert runtime.pending_plan is None
+    assert runtime._plan_confirmation_challenge is None
+
+    replayed = runtime.handle_text(second_instruction, require_wake=False)
+    assert not replayed.success
+    assert len(executor.plans) == 1
+
+
+def test_controller_confirmation_resamples_collision_and_rejects_old_code(settings) -> None:
+    enable_computer_control(settings)
+    challenges = iter(["4827", "4827", "5931"])
+    first_controller = FakeController(
+        responses=[ComputerControlResult(False, "NEEDS_CONFIRMATION: click First")]
+    )
+    second_controller = FakeController(
+        responses=[
+            ComputerControlResult(False, "NEEDS_CONFIRMATION: click Second"),
+            ComputerControlResult(True, "VERIFIED_COMPLETION: Second clicked"),
+        ]
+    )
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=first_controller,
+        controller_factory=lambda: second_controller,
+        confirmation_challenge_factory=lambda: next(challenges),
+    )
+
+    try:
+        runtime.handle_session_text("开始语音操作")
+        runtime.handle_session_text("执行第一个不同操作 over")
+        wait_until(lambda: runtime._pending_controller_confirmation_challenge == "4827")
+        first_instruction = pending_controller_confirmation_instruction(runtime)
+
+        runtime.handle_session_text(settings.execution.cancellation_phrases[0])
+        runtime.handle_session_text("开始语音操作")
+        runtime.handle_session_text("执行第二个不同操作 over")
+        wait_until(lambda: runtime._pending_controller_confirmation_challenge == "5931")
+        runtime._mark_pending_controller_confirmation_announced("click Second")
+        second_instruction = pending_controller_confirmation_instruction(runtime)
+        assert second_instruction != first_instruction
+
+        stale = runtime.handle_session_text(first_instruction)
+        assert not stale.success
+        assert second_controller.calls == ["执行第二个不同操作"]
+        assert runtime._pending_controller_confirmation == "click Second"
+
+        accepted = runtime.handle_session_text(second_instruction)
+        assert accepted.success
+        assert runtime.command_worker.drain(timeout=2)
+        assert len(second_controller.calls) == 2
+        assert "click Second" in second_controller.calls[1]
+        assert runtime._pending_controller_confirmation is None
+    finally:
+        runtime.stop()
+
+
+def test_exhausted_challenge_factory_fails_closed_without_half_pending_state(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController(
+        responses=[ComputerControlResult(False, "NEEDS_CONFIRMATION: click Protected")]
+    )
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+        confirmation_challenge_factory=lambda: "4827",
+    )
+
+    try:
+        assert runtime._create_confirmation_challenge() == "4827"
+
+        runtime.state = RuntimeState.AWAKE
+        rejected_plan = runtime.handle_text(
+            "打开codex并使用应用内语音",
+            require_wake=False,
+        )
+        assert not rejected_plan.success
+        assert rejected_plan.state == RuntimeState.ARMED
+        assert runtime.pending_plan is None
+        assert runtime._plan_confirmation_challenge is None
+
+        runtime.handle_session_text("开始语音操作")
+        runtime.handle_session_text("执行受保护操作 over")
+        wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
+        assert runtime._pending_controller_confirmation is None
+        assert runtime._pending_controller_confirmation_id is None
+        assert runtime._pending_controller_confirmation_challenge is None
+        assert controller.cancelled
+        assert controller.closed
+    finally:
+        runtime.stop()
 
 
 def test_confirmation_phrase_must_be_the_entire_utterance(settings) -> None:
@@ -849,12 +1231,39 @@ def test_confirmation_phrase_must_be_the_entire_utterance(settings) -> None:
     runtime.state = RuntimeState.AWAKE
     requested = runtime.handle_text("打开codex并使用应用内语音", require_wake=False)
     assert requested.state == RuntimeState.CONFIRMING
+    instruction = pending_plan_confirmation_instruction(runtime)
 
-    rejected = runtime.handle_text("不要确认执行", require_wake=False)
+    rejected = runtime.handle_text(f"不要{instruction}", require_wake=False)
 
     assert rejected.state == RuntimeState.CONFIRMING
     assert executor.plans == []
     assert runtime.pending_plan is not None
+
+
+def test_stop_clears_pending_controller_confirmation_challenge(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController(
+        responses=[ComputerControlResult(False, "NEEDS_CONFIRMATION: send prepared form")]
+    )
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    runtime.handle_session_text("开始语音操作")
+    runtime.handle_session_text("提交表单 over")
+    wait_until(lambda: runtime.command_worker.state == WorkerState.PAUSED)
+    instruction = pending_controller_confirmation_instruction(runtime)
+
+    runtime.stop()
+
+    assert runtime._pending_controller_confirmation is None
+    assert runtime._pending_controller_confirmation_id is None
+    assert runtime._pending_controller_confirmation_challenge is None
+    assert runtime._pending_controller_confirmation_started_at == 0
+    assert runtime.session_state == SessionState.STOPPED
+    assert not runtime.handle_session_text(instruction).success
 
 
 def test_pause_action_changes_runtime_state(settings) -> None:
@@ -889,6 +1298,43 @@ def test_unexpected_planner_exception_does_not_escape_runtime(settings) -> None:
     assert executor.plans == []
 
 
+@pytest.mark.parametrize(
+    ("command", "action"),
+    [
+        ("不要打开 Claude", Action(ActionType.ACTIVATE_APP, app="claude")),
+        (
+            "请勿在 Claude 里打开 Design",
+            Action(ActionType.OPEN_MODE, app="claude", mode="design"),
+        ),
+        (
+            "输入‘打开 Claude’到提示框",
+            Action(ActionType.ACTIVATE_APP, app="claude"),
+        ),
+    ],
+)
+def test_legacy_cloud_fallback_cannot_execute_negated_or_quoted_ui_actions(
+    settings, command, action
+) -> None:
+    class FixedPlanner:
+        def plan(self, _command, *, context):
+            del context
+            return Plan("untrusted navigation", [action], source="claude")
+
+    executor = FakeExecutor()
+    runtime = VoiceRuntime(
+        settings,
+        executor,
+        planner=FixedPlanner(),
+        feedback=FakeFeedback(),
+    )
+    runtime.state = RuntimeState.AWAKE
+
+    outcome = runtime.handle_text(command, require_wake=False)
+
+    assert not outcome.success
+    assert executor.plans == []
+
+
 def test_confirmation_feedback_is_derived_from_actions_not_planner_summary(settings) -> None:
     runtime, executor, feedback = build_runtime(settings)
     plan = Plan(
@@ -898,7 +1344,7 @@ def test_confirmation_feedback_is_derived_from_actions_not_planner_summary(setti
         source="codex",
     )
 
-    outcome = runtime._dispatch(plan, user_text="open voice")
+    outcome = runtime._dispatch(plan, user_text="open Codex in-app voice")
 
     assert outcome.state == RuntimeState.CONFIRMING
     assert executor.plans == []
@@ -1071,25 +1517,28 @@ def test_confirmation_timeout_cancels_pending_plan(settings) -> None:
     runtime.state = RuntimeState.AWAKE
     requested = runtime.handle_text("打开codex并使用应用内语音", require_wake=False)
     assert requested.state == RuntimeState.CONFIRMING
+    instruction = pending_plan_confirmation_instruction(runtime)
     runtime.confirmation_started_at = (
         time.monotonic() - settings.execution.confirmation_timeout_seconds - 1
     )
 
-    outcome = runtime.handle_text("确认执行", require_wake=False)
+    outcome = runtime.handle_text(instruction, require_wake=False)
 
     assert outcome.state == RuntimeState.ARMED
     assert outcome.message == "确认已超时"
     assert runtime.pending_plan is None
+    assert runtime._plan_confirmation_challenge is None
     assert executor.plans == []
 
 
-def test_resolved_executable_requires_confirmation(settings) -> None:
+def test_resolved_executable_requires_confirmation(settings, tmp_path) -> None:
+    target = tmp_path / "installer.exe"
+    target.write_bytes(b"trusted installer fixture")
+
     class ResolvingExecutor(FakeExecutor):
         def prepare_plan(self, plan):
             actions = [
-                replace(action, path=r"C:\safe-test\installer.exe")
-                if action.type == ActionType.OPEN_PATH
-                else action
+                replace(action, path=str(target)) if action.type == ActionType.OPEN_PATH else action
                 for action in plan.actions
             ]
             return replace(plan, actions=actions)
@@ -1099,8 +1548,217 @@ def test_resolved_executable_requires_confirmation(settings) -> None:
     runtime = VoiceRuntime(settings, executor, feedback=feedback)
     runtime.state = RuntimeState.AWAKE
 
-    outcome = runtime.handle_text("打开C盘的safe-test文件夹里的installer", require_wake=False)
+    outcome = runtime.handle_text("打开D盘的项目文件夹里的说明.txt", require_wake=False)
 
     assert outcome.state == RuntimeState.CONFIRMING
     assert executor.plans == []
     assert "installer.exe" in feedback.events[-1][0]
+
+
+def test_confirmed_file_is_rebound_and_replacement_is_never_executed(settings, tmp_path) -> None:
+    target = tmp_path / "installer.exe"
+    target.write_bytes(b"trusted installer fixture")
+
+    class ResolvingExecutor(FakeExecutor):
+        def prepare_plan(self, plan):
+            return replace(
+                plan,
+                actions=[
+                    replace(action, path=str(target))
+                    if action.type == ActionType.OPEN_PATH
+                    else action
+                    for action in plan.actions
+                ],
+            )
+
+    executor = ResolvingExecutor()
+    runtime = VoiceRuntime(settings, executor, feedback=FakeFeedback())
+    plan = Plan(
+        "open installer",
+        [Action(ActionType.OPEN_PATH, path=str(target))],
+        risk=RiskLevel.CONFIRM,
+    )
+
+    requested = runtime._dispatch(plan, user_text=f"打开 {target}")
+    assert requested.state == RuntimeState.CONFIRMING
+    instruction = pending_plan_confirmation_instruction(runtime)
+    target.write_bytes(b"replaced payload")
+
+    confirmed = runtime.handle_text(instruction, require_wake=False)
+
+    assert not confirmed.success
+    assert confirmed.state == RuntimeState.ARMED
+    assert executor.plans == []
+    assert runtime.pending_plan is None
+    assert runtime._plan_confirmation_binding_digest is None
+
+
+def test_confirmed_file_executes_only_when_plan_and_target_binding_are_unchanged(
+    settings, tmp_path
+) -> None:
+    target = tmp_path / "installer.exe"
+    target.write_bytes(b"stable installer fixture")
+
+    class ResolvingExecutor(FakeExecutor):
+        def prepare_plan(self, plan):
+            return replace(
+                plan,
+                actions=[
+                    replace(action, path=str(target))
+                    if action.type == ActionType.OPEN_PATH
+                    else action
+                    for action in plan.actions
+                ],
+            )
+
+    executor = ResolvingExecutor()
+    runtime = VoiceRuntime(settings, executor, feedback=FakeFeedback())
+    plan = Plan(
+        "open installer",
+        [Action(ActionType.OPEN_PATH, path=str(target))],
+        risk=RiskLevel.CONFIRM,
+    )
+
+    requested = runtime._dispatch(plan, user_text=f"打开 {target}")
+    instruction = pending_plan_confirmation_instruction(runtime)
+    confirmed = runtime.handle_text(instruction, require_wake=False)
+
+    assert requested.state == RuntimeState.CONFIRMING
+    assert confirmed.success
+    assert len(executor.plans) == 1
+    assert executor.plans[0].actions[0].path == str(target)
+
+
+def test_safe_directory_replaced_after_classification_is_never_opened(settings, tmp_path) -> None:
+    target = tmp_path / "fixture.exe"
+    target.mkdir()
+    runtime, executor, _feedback = build_runtime(settings)
+    original_execute = runtime._execute
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_execute(plan, **kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return original_execute(plan, **kwargs)
+
+    runtime._execute = blocking_execute
+    plan = Plan(
+        "open fixture directory",
+        [Action(ActionType.OPEN_PATH, path=str(target))],
+        risk=RiskLevel.SAFE,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(runtime._dispatch, plan, user_text=f"打开 {target}")
+        assert entered.wait(timeout=2)
+        target.rmdir()
+        target.write_bytes(b"replacement executable")
+        release.set()
+        result = future.result(timeout=2)
+
+    assert not result.success
+    assert executor.plans == []
+
+
+def test_stop_during_initial_confirmation_binding_cannot_publish_pending_state(settings) -> None:
+    runtime, executor, _feedback = build_runtime(settings)
+    runtime.state = RuntimeState.AWAKE
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_binding(_plan):
+        entered.set()
+        assert release.wait(timeout=2)
+        return "bound"
+
+    runtime._plan_confirmation_binding = blocking_binding
+    plan = Plan(
+        "voice",
+        [Action(ActionType.START_NATIVE_VOICE, app="claude")],
+        risk=RiskLevel.CONFIRM,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(runtime._dispatch, plan, user_text="打开 Claude 语音")
+        assert entered.wait(timeout=2)
+        stopped = runtime.handle_text(settings.app.stop_phrases[0], require_wake=False)
+        release.set()
+        result = future.result(timeout=2)
+
+    assert stopped.state == RuntimeState.PAUSED
+    assert not result.success
+    assert runtime.pending_plan is None
+    assert runtime.state == RuntimeState.PAUSED
+    assert executor.plans == []
+
+
+def test_stop_during_confirmed_rebind_wins_before_executor_call(settings) -> None:
+    runtime, executor, _feedback = build_runtime(settings)
+    runtime.state = RuntimeState.AWAKE
+    original_binding = runtime._plan_confirmation_binding
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocking_second_binding(plan):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            assert release.wait(timeout=2)
+        return original_binding(plan)
+
+    runtime._plan_confirmation_binding = blocking_second_binding
+    plan = Plan(
+        "voice",
+        [Action(ActionType.START_NATIVE_VOICE, app="claude")],
+        risk=RiskLevel.CONFIRM,
+    )
+    runtime._dispatch(plan, user_text="打开 Claude 语音")
+    instruction = pending_plan_confirmation_instruction(runtime)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(runtime.handle_text, instruction, require_wake=False)
+        assert entered.wait(timeout=2)
+        stopped = runtime.handle_text(settings.app.stop_phrases[0], require_wake=False)
+        release.set()
+        result = future.result(timeout=2)
+
+    assert stopped.state == RuntimeState.PAUSED
+    assert not result.success
+    assert executor.plans == []
+
+
+def test_confirmed_execution_uses_private_snapshot_not_mutable_returned_plan(settings) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BarrierExecutor(PreparingFakeExecutor):
+        def execute_plan(self, plan):
+            entered.set()
+            assert release.wait(timeout=2)
+            return super().execute_plan(plan)
+
+    executor = BarrierExecutor()
+    runtime = VoiceRuntime(settings, executor, feedback=FakeFeedback())
+    plan = Plan(
+        "voice",
+        [Action(ActionType.START_NATIVE_VOICE, app="claude")],
+        risk=RiskLevel.CONFIRM,
+    )
+    waiting = runtime._dispatch(plan, user_text="打开 Claude 语音")
+    leaked_pending_copy = runtime.pending_plan
+    assert waiting.plan is not None and leaked_pending_copy is not None
+    instruction = pending_plan_confirmation_instruction(runtime)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(runtime.handle_text, instruction, require_wake=False)
+        assert entered.wait(timeout=2)
+        waiting.plan.actions[0].app = "codex"
+        leaked_pending_copy.actions[0].app = "codex"
+        release.set()
+        result = future.result(timeout=2)
+
+    assert result.success
+    assert [executed.actions[0].app for executed in executor.plans] == ["claude"]

@@ -116,7 +116,24 @@ def test_first_run_preserves_user_config_and_builds_safe_computer_use_prompt(
     )
     environment = {
         "PATH": "safe-path",
-        "CODEX_HOME": "safe-codex-home",
+        "PATHEXT": ".EXE;.CMD",
+        "SystemRoot": "safe-system-root",
+        "WINDIR": "safe-windows-directory",
+        "TEMP": "safe-temp",
+        "TMP": "safe-tmp",
+        "COMSPEC": "safe-command-processor",
+        "USERPROFILE": "safe-profile",
+        "APPDATA": "safe-app-data",
+        "LOCALAPPDATA": "safe-local-app-data",
+        "LANG": "zh_CN.UTF-8",
+        "LC_CTYPE": "C.UTF-8",
+        "CODEX_HOME": "fake-codex-home",
+        "NODE_OPTIONS": "--require=fake-hook.js",
+        "PYTHONPATH": "fake-python-path",
+        "GIT_ASKPASS": "fake-askpass.exe",
+        "SSH_AUTH_SOCK": "fake-agent.sock",
+        "GITHUB_PAT": "not-a-real-pat",
+        "AWS_ACCESS_KEY_ID": "not-a-real-key-id",
         "OPENAI_API_KEY": "remove-me",
         "GITHUB_TOKEN": "remove-me-too",
         "MY_PASSWORD": "also-remove",
@@ -145,7 +162,20 @@ def test_first_run_preserves_user_config_and_builds_safe_computer_use_prompt(
     assert args[args.index("--model") + 1] == "gpt-test"
     assert args[-1] == "-"
     assert kwargs["cwd"] == str(tmp_path)
-    assert kwargs["env"] == {"PATH": "safe-path", "CODEX_HOME": "safe-codex-home"}
+    assert set(kwargs["env"]) == {
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "COMSPEC",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "LANG",
+        "LC_CTYPE",
+    }
     assert kwargs["stdin"] is subprocess.PIPE
     assert kwargs["stdout"] is subprocess.PIPE
     assert kwargs["stderr"] is subprocess.PIPE

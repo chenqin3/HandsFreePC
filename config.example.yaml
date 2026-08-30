@@ -71,8 +71,11 @@ speech:
     compute_type: auto
 
 planner:
+  # Legacy one-shot VoiceRuntime fallback only. Cloud output is locally restricted
+  # to affirmatively and exactly authorized app UI navigation; it cannot choose
+  # feedback/pause/resume/wait/path/text/send actions.
   enabled: false
-  backend: codex
+  backend: claude
   timeout_seconds: 90
   model: null
   codex_executable: codex
@@ -80,22 +83,44 @@ planner:
 
 computer_control:
   enabled: false
-  backend: codex
+  backend: local_agent
+  driver: windows_uia
+  # Each generic spoken task must affirmatively name exactly one configured app.
+  # Every generic planner action needs a locally checkable false-before/true-after
+  # condition. Deterministic native skills use action-specific local evidence.
+  # claude is the default strict planner. Other accepted values are
+  # codex_cli_best_effort (requires separate host-read consent) and none.
+  planner_backend: claude
   allow_screen_context_to_cloud: false
+  # Codex subscription CLI has no complete no-tools mode. This separate consent
+  # is required for any enabled Codex CLI planner or legacy Codex controller.
+  allow_codex_cli_host_read: false
+  # Legacy Codex Computer Use has broader tools and no 0.3 local action verifier.
+  allow_legacy_codex_computer_use: false
   timeout_seconds: 600
+  max_steps: 20
+  max_observation_chars: 24000
   max_queue_size: 8
   max_prompt_chars: 4000
   failure_policy: pause
   end_policy: drain
   working_directory: runtime/computer-control
   codex_executable: codex
+  claude_executable: claude
   model: null
+  open_computer_use_executable: open-computer-use
+  open_computer_use_args: [mcp]
+  allow_experimental_driver: false
+  allow_coordinate_actions: false
 
 execution:
   dry_run: true
   ambiguity_threshold: 0.78
   max_search_results: 5
   confirmation_timeout_seconds: 15
+  # This is only the spoken prefix. Runtime appends a new random four-digit
+  # one-time challenge within the current VoiceRuntime process; codes are not
+  # persisted across restarts, and the static prefix alone never authorizes.
   confirmation_phrases:
     - "确认执行"
   cancellation_phrases:
@@ -113,6 +138,8 @@ execution:
     下载: "%USERPROFILE%\\Downloads"
   search_roots: []
 
+# Canonical spoken modes map to exact, version-specific accessible labels.
+# Labels are tried in order; a fuzzy-only match is rejected.
 apps:
   codex:
     process_names: ["ChatGPT.exe", "codex.exe"]
@@ -121,6 +148,9 @@ apps:
     search_hotkey: null
     native_voice_hotkey: null
     voice_button_names: []
+    mode_names:
+      chat: ["Chat"]
+      code: ["Code"]
   claude:
     process_names: ["claude.exe"]
     executable: null
@@ -128,3 +158,8 @@ apps:
     search_hotkey: null
     native_voice_hotkey: null
     voice_button_names: []
+    mode_names:
+      chat: ["Chat and Cowork", "Chat"]
+      cowork: ["Chat and Cowork", "Cowork"]
+      code: ["Code"]
+      design: ["Design"]

@@ -224,6 +224,13 @@ class Plan:
         }
 
 
+def clone_plan(plan: Plan) -> Plan:
+    """Return a validated canonical deep copy with no shared ``Action`` objects."""
+
+    plan.validate()
+    return Plan.from_dict(plan.to_dict(), source=plan.source)
+
+
 @dataclass(slots=True)
 class ExecutionResult:
     success: bool

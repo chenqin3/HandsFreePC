@@ -60,6 +60,18 @@ class _LocatedElement:
     match: ElementMatch
 
 
+@dataclass(frozen=True, slots=True)
+class _ElementIdentity:
+    name: str
+    control_type: str
+    automation_id: str | None
+    runtime_id: tuple[int, ...] | str | None
+    exists: bool | None
+    visible: bool | None
+    enabled: bool | None
+    password: bool
+
+
 def _normalize(value: str) -> str:
     return " ".join(value.casefold().strip().split())
 
@@ -76,8 +88,15 @@ def _score(requested: str, actual: str) -> float:
     return SequenceMatcher(None, requested_normalized, actual_normalized).ratio()
 
 
+def _safe_attr(value: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(value, name, default)
+    except Exception:
+        return default
+
+
 def _safe_call(value: Any, name: str, default: Any = None) -> Any:
-    attribute = getattr(value, name, None)
+    attribute = _safe_attr(value, name, None)
     if attribute is None:
         return default
     try:
@@ -106,6 +125,7 @@ class UIABackend:
         postcondition_timeout: float = 1.5,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        foreground_guard: Callable[[int], None] | None = None,
     ) -> None:
         if not 0 < threshold <= 1:
             raise ValueError("threshold must be in (0, 1]")
@@ -119,6 +139,13 @@ class UIABackend:
         self.postcondition_timeout = postcondition_timeout
         self._monotonic = monotonic
         self._sleep = sleeper
+        self._foreground_guard = foreground_guard or self._assert_foreground
+
+    @staticmethod
+    def _assert_foreground(hwnd: int) -> None:
+        from .native import NativeWindows
+
+        NativeWindows().assert_foreground(hwnd)
 
     def _desktop(self) -> Any:
         if self._desktop_factory is not None:
@@ -176,6 +203,18 @@ class UIABackend:
         return str(value)
 
     @staticmethod
+    def _element_value(element: Any) -> str | None:
+        value = _safe_call(element, "get_value", None)
+        if value is None:
+            iface_value = getattr(element, "iface_value", None)
+            value = getattr(iface_value, "CurrentValue", None)
+        if value is None:
+            properties = _safe_call(element, "legacy_properties", None)
+            if isinstance(properties, dict):
+                value = properties.get("Value") or properties.get("value")
+        return str(value) if value is not None else None
+
+    @staticmethod
     def _is_password(element: Any) -> bool:
         """Read UIA_IsPasswordPropertyId (30019) through common wrapper surfaces."""
 
@@ -219,13 +258,48 @@ class UIABackend:
         if self._is_password(element):
             raise PasswordFieldError("Refusing to focus or type into a password field")
 
+    def _element_identity(self, element: Any) -> _ElementIdentity:
+        return _ElementIdentity(
+            name=self._element_name(element),
+            control_type=self._control_type(element),
+            automation_id=self._automation_id(element),
+            runtime_id=self._runtime_id(element),
+            exists=_coerce_bool(_safe_call(element, "exists", None)),
+            visible=_coerce_bool(_safe_call(element, "is_visible", None)),
+            enabled=_coerce_bool(_safe_call(element, "is_enabled", None)),
+            password=self._is_password(element),
+        )
+
+    def _assert_identity_unchanged(
+        self,
+        element: Any,
+        expected: _ElementIdentity,
+    ) -> None:
+        current = self._element_identity(element)
+        if current != expected:
+            raise UIAError("UI target identity changed immediately before input")
+        if current.exists is False or current.visible is not True or current.enabled is not True:
+            raise UIAError("UI target is not currently present, visible, and enabled")
+        if current.password:
+            raise PasswordFieldError("Refusing to act on a password field")
+
+    @staticmethod
+    def _assert_located_match(identity: _ElementIdentity, match: ElementMatch) -> None:
+        if (
+            identity.name != match.name
+            or identity.control_type != match.control_type
+            or identity.automation_id != match.automation_id
+            or identity.runtime_id != match.runtime_id
+        ):
+            raise UIAError("UI target identity changed after exact matching")
+
     @staticmethod
     def _selection_state(element: Any) -> bool | None:
         selected = _coerce_bool(_safe_call(element, "is_selected", None))
         if selected is not None:
             return selected
-        selection_item = getattr(element, "iface_selection_item", None)
-        selected = _coerce_bool(getattr(selection_item, "CurrentIsSelected", None))
+        selection_item = _safe_attr(element, "iface_selection_item", None)
+        selected = _coerce_bool(_safe_attr(selection_item, "CurrentIsSelected", None))
         if selected is not None:
             return selected
         toggle_state = _safe_call(element, "get_toggle_state", None)
@@ -338,7 +412,7 @@ class UIABackend:
             raise AmbiguousElementError(requested_names, ambiguous)
         return _LocatedElement(wrapper=scored[0][1], match=scored[0][2])
 
-    def click_named(
+    def click_named_exact(
         self,
         hwnd: int,
         names: str | Sequence[str],
@@ -346,10 +420,18 @@ class UIABackend:
         control_types: Iterable[str] = ("Button", "ListItem", "TreeItem", "TabItem"),
     ) -> dict[str, object]:
         located = self.find_named(hwnd, names, control_types=control_types)
+        if located.match.exact is not True:
+            raise ElementNotFoundError(
+                f"No exact enabled visible UI element matched the configured label {names!r}"
+            )
         element = located.wrapper
+        target_identity = self._element_identity(element)
+        self._assert_located_match(target_identity, located.match)
+        self._assert_identity_unchanged(element, target_identity)
         before_tree = self._tree_signature(hwnd)
         before_selected = self._selection_state(element)
         if before_selected is True:
+            self._assert_identity_unchanged(element, target_identity)
             evidence = located.match.to_evidence()
             evidence.update(
                 {
@@ -364,12 +446,21 @@ class UIABackend:
         try:
             invoke = getattr(element, "invoke", None)
             if callable(invoke):
+                # Once Invoke has been called, an exception leaves its side
+                # effect unknown. Never retry the same logical action through
+                # physical input; the caller must re-observe and fail closed.
+                self._assert_identity_unchanged(element, target_identity)
                 invoke()
             else:
                 method = "click_input"
                 click_input = getattr(element, "click_input", None)
                 if not callable(click_input):
                     raise UIAError("Matched UI element exposes neither invoke nor click_input")
+                # Physical click_input targets screen coordinates. Re-check the
+                # exact HWND immediately before that input, not only in the
+                # executor before/after this method.
+                self._foreground_guard(int(hwnd))
+                self._assert_identity_unchanged(element, target_identity)
                 click_input()
         except UIAError:
             raise
@@ -392,6 +483,17 @@ class UIABackend:
         )
         return evidence
 
+    def click_named(
+        self,
+        hwnd: int,
+        names: str | Sequence[str],
+        *,
+        control_types: Iterable[str] = ("Button", "ListItem", "TreeItem", "TabItem"),
+    ) -> dict[str, object]:
+        """Backward-compatible alias; semantic clicks are exact-only."""
+
+        return self.click_named_exact(hwnd, names, control_types=control_types)
+
     def focus_named(
         self,
         hwnd: int,
@@ -400,11 +502,17 @@ class UIABackend:
         control_types: Iterable[str] = ("Edit", "Document"),
     ) -> dict[str, object]:
         located = self.find_named(hwnd, names, control_types=control_types)
+        if located.match.exact is not True:
+            raise ElementNotFoundError(f"No exact UI element matched names: {names!r}")
         self._assert_not_password(located.wrapper)
+        target_identity = self._element_identity(located.wrapper)
+        self._assert_located_match(target_identity, located.match)
+        self._assert_identity_unchanged(located.wrapper, target_identity)
         set_focus = getattr(located.wrapper, "set_focus", None)
         if not callable(set_focus):
             raise UIAError(f"Matched element {located.match.name!r} cannot receive focus")
         try:
+            self._assert_identity_unchanged(located.wrapper, target_identity)
             set_focus()
         except Exception as exc:
             raise UIAError(f"Could not focus UI element {located.match.name!r}") from exc
@@ -440,6 +548,10 @@ class UIABackend:
             )
             if not candidates:
                 raise
+            if any(self._element_name(item) for item in candidates):
+                raise ElementNotFoundError(
+                    "No exact named text entry matched, and the fallback was not unnamed"
+                ) from not_found
             matches = [
                 ElementMatch(
                     name=self._element_name(item),
@@ -455,10 +567,13 @@ class UIABackend:
                 raise AmbiguousElementError(names, matches) from not_found
             element = candidates[0]
             self._assert_not_password(element)
+            target_identity = self._element_identity(element)
+            self._assert_identity_unchanged(element, target_identity)
             set_focus = getattr(element, "set_focus", None)
             if not callable(set_focus):
                 raise UIAError("The only text entry element cannot receive focus") from not_found
             try:
+                self._assert_identity_unchanged(element, target_identity)
                 set_focus()
             except Exception as exc:
                 raise UIAError("Could not focus the only text entry element") from exc
@@ -518,6 +633,48 @@ class UIABackend:
         )
         return evidence
 
+    def verify_focused_text_contains(self, hwnd: int, expected: str) -> dict[str, object]:
+        """Verify exact input on the unique focused non-password text control.
+
+        The observed value itself is deliberately not returned as evidence.
+        """
+
+        candidates = self._candidates(
+            hwnd,
+            control_types=("Edit", "Document"),
+            require_name=False,
+        )
+        focused = [
+            element
+            for element in candidates
+            if _safe_call(element, "has_keyboard_focus", None) is True
+        ]
+        if len(focused) != 1:
+            raise UIAPostconditionError("Exactly one text entry must retain focus after text input")
+        element = focused[0]
+        self._assert_not_password(element)
+        value = self._element_value(element)
+        if value is None or expected not in value:
+            raise UIAPostconditionError("The exact input text is absent from the focused UIA value")
+        match = ElementMatch(
+            name=self._element_name(element),
+            control_type=self._control_type(element),
+            score=1.0,
+            exact=True,
+            automation_id=self._automation_id(element),
+            runtime_id=self._runtime_id(element),
+        )
+        evidence = match.to_evidence()
+        evidence.update(
+            {
+                "operation": "verify_text_value",
+                "focus_verified": True,
+                "input_text_verified": True,
+                "character_count": len(expected),
+            }
+        )
+        return evidence
+
     def verify_named_selected(
         self,
         hwnd: int,
@@ -526,6 +683,8 @@ class UIABackend:
         control_types: Iterable[str] = ("ListItem", "TreeItem", "TabItem", "Button"),
     ) -> dict[str, object]:
         located = self.find_named(hwnd, names, control_types=control_types)
+        if located.match.exact is not True:
+            raise UIAPostconditionError("Selected postcondition matched only fuzzily")
         if self._selection_state(located.wrapper) is not True:
             raise UIAPostconditionError(
                 f"UI element {located.match.name!r} is present but not selected"
@@ -535,6 +694,31 @@ class UIABackend:
             {
                 "operation": "verify_selection",
                 "selection_verified": True,
+            }
+        )
+        return evidence
+
+    def verify_named_focused(
+        self,
+        hwnd: int,
+        names: str | Sequence[str],
+        *,
+        control_types: Iterable[str] = ("ListItem", "TreeItem", "TabItem", "Button"),
+    ) -> dict[str, object]:
+        """Re-resolve an exact semantic target after a UI tree transition and verify focus."""
+
+        located = self.find_named(hwnd, names, control_types=control_types)
+        if located.match.exact is not True:
+            raise UIAPostconditionError("Focused postcondition matched only fuzzily")
+        if _safe_call(located.wrapper, "has_keyboard_focus", None) is not True:
+            raise UIAPostconditionError(
+                f"UI element {located.match.name!r} is present but not focused"
+            )
+        evidence = located.match.to_evidence()
+        evidence.update(
+            {
+                "operation": "verify_focus",
+                "focus_verified": True,
             }
         )
         return evidence

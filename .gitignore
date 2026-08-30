@@ -24,6 +24,8 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .pytest-tmp*/
+.pytest-root/
+.pytest-audit*/
 .ruff_cache/
 .coverage
 htmlcov/

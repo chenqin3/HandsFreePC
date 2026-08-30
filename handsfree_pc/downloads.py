@@ -94,7 +94,7 @@ def _safe_destination(root: Path, member_name: str) -> Path:
 
 def _download(url: str, destination: Path, progress: Callable[[str], None]) -> str:
     digest = hashlib.sha256()
-    request = urllib.request.Request(url, headers={"User-Agent": "HandsFreePC/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "HandsFreePC/0.3"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
         total = int(response.headers.get("Content-Length", "0"))
         received = 0
@@ -109,7 +109,7 @@ def _download(url: str, destination: Path, progress: Callable[[str], None]) -> s
 
 def _download_small_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "HandsFreePC/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "HandsFreePC/0.3"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
         shutil.copyfileobj(response, output)
 

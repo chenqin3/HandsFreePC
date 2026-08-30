@@ -58,27 +58,103 @@ def test_allow_listed_document_type_is_safe(settings) -> None:
 
 
 @pytest.mark.parametrize("source", ["codex", "claude", "llm"])
-@pytest.mark.parametrize("action_type", [ActionType.TYPE_TEXT, ActionType.SEND_PROMPT])
-def test_cloud_planner_cannot_generate_or_submit_text(settings, source, action_type) -> None:
+@pytest.mark.parametrize(
+    "action_type",
+    [ActionType.OPEN_PATH, ActionType.TYPE_TEXT, ActionType.SEND_PROMPT],
+)
+def test_cloud_planner_cannot_choose_paths_generate_or_submit_text(
+    settings, source, action_type
+) -> None:
     policy = SafetyPolicy(settings.execution)
     action = (
-        Action(action_type, text="untrusted text")
+        Action(ActionType.TYPE_TEXT, text="untrusted text")
         if action_type == ActionType.TYPE_TEXT
-        else Action(action_type)
+        else Action(ActionType.OPEN_PATH, path=r"C:\private\invented.txt")
+        if action_type == ActionType.OPEN_PATH
+        else Action(ActionType.SEND_PROMPT)
     )
     plan = Plan("harmless", [action], source=source)
 
     assert policy.evaluate(plan, explicit_submission=True).risk == RiskLevel.BLOCKED
 
 
-def test_cloud_planner_may_only_enter_dictation_without_text(settings) -> None:
+def test_cloud_planner_may_only_enter_explicitly_authorized_dictation_without_text(
+    settings,
+) -> None:
     policy = SafetyPolicy(settings.execution)
     plan = Plan(
         "focus composer",
         [Action(ActionType.ENTER_DICTATION, app="codex")],
         source="codex",
     )
-    assert policy.evaluate(plan).risk == RiskLevel.SAFE
+    assert policy.evaluate(plan, user_text="在 Codex 中开启语音输入").risk == RiskLevel.SAFE
+    assert policy.evaluate(plan, user_text="打开 Codex").risk == RiskLevel.BLOCKED
+
+
+@pytest.mark.parametrize(
+    ("user_text", "action"),
+    [
+        ("不要打开 Claude", Action(ActionType.ACTIVATE_APP, app="claude")),
+        (
+            "请勿在 Claude 里打开 Design",
+            Action(ActionType.OPEN_MODE, app="claude", mode="design"),
+        ),
+        (
+            "输入‘打开 Claude’到提示框",
+            Action(ActionType.ACTIVATE_APP, app="claude"),
+        ),
+    ],
+)
+def test_cloud_ui_navigation_requires_affirmative_unquoted_authority(
+    settings, user_text, action
+) -> None:
+    policy = SafetyPolicy(settings.execution)
+    plan = Plan("untrusted navigation", [action], source="claude")
+
+    assert policy.evaluate(plan, user_text=user_text).risk == RiskLevel.BLOCKED
+
+
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "click Open outside Claude",
+        "click Open away from Claude",
+        "在 Claude 之外点击 Open",
+        "在 Claude 外点击 Open",
+        "在 Claude 旁边点击 Open",
+        "在 Claude 上方点击 Open",
+        "click Open until Done appears in Claude",
+        "点击 Open 直到 Done 出现在 Claude",
+    ],
+)
+def test_cloud_planner_cannot_treat_an_excluded_app_as_the_control_scope(
+    settings,
+    user_text,
+) -> None:
+    policy = SafetyPolicy(settings.execution)
+    plan = Plan(
+        "activate excluded app",
+        [Action(ActionType.ACTIVATE_APP, app="claude")],
+        source="claude",
+    )
+
+    assert policy.evaluate(plan, user_text=user_text).risk == RiskLevel.BLOCKED
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        Action(ActionType.SET_FEEDBACK_MODE, feedback_mode=FeedbackMode.SILENT),
+        Action(ActionType.PAUSE),
+        Action(ActionType.RESUME),
+        Action(ActionType.WAIT, seconds=0.1),
+    ],
+)
+def test_cloud_planner_cannot_change_runtime_state_or_feedback(settings, action) -> None:
+    policy = SafetyPolicy(settings.execution)
+    plan = Plan("untrusted runtime control", [action], source="claude")
+
+    assert policy.evaluate(plan, user_text="please continue").risk == RiskLevel.BLOCKED
 
 
 def test_native_voice_must_be_last_and_cannot_switch_feedback(settings) -> None:

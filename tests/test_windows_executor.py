@@ -12,10 +12,14 @@ from handsfree_pc.windows import (
     AmbiguousWindowError,
     DesktopUnavailableError,
     ElementMatch,
+    ElementNotFoundError,
     InvalidHotkeyError,
     NativeWindows,
+    NativeWindowsError,
     PasswordFieldError,
     UIABackend,
+    UIAError,
+    UIAPostconditionError,
     WindowActivationError,
     WindowInfo,
     WindowsExecutor,
@@ -69,6 +73,18 @@ class FakeNative:
         self.calls.append(("open_path", str(path)))
         return "os.startfile"
 
+    def path_open_state(self, path):
+        self.calls.append(("path_open_state", str(path)))
+        return {"verified": False, "foreground_hwnd": self.foreground}
+
+    def wait_for_path_open(self, path, *, before):
+        self.calls.append(("wait_for_path_open", str(path), before["foreground_hwnd"]))
+        return {
+            "postcondition_verified": True,
+            "verification_kind": "test_fixture",
+            "foreground_changed": True,
+        }
+
     def wait_for_windows(self, *, title_patterns, process_names):
         self.calls.append(("wait_for_windows", tuple(title_patterns), tuple(process_names)))
         return self.find_windows(title_patterns=title_patterns, process_names=process_names)
@@ -98,6 +114,9 @@ class FakeUIA:
             "operation": "click",
         }
 
+    def click_named_exact(self, hwnd, names, *, control_types):
+        return self.click_named(hwnd, names, control_types=control_types)
+
     def focus_text_entry(self, hwnd):
         self.calls.append(("focus_text_entry", hwnd))
         return {
@@ -121,12 +140,25 @@ class FakeUIA:
             "runtime_id": self.entry_runtime_id,
         }
 
+    def verify_focused_text_contains(self, hwnd, expected):
+        self.calls.append(("verify_focused_text_contains", hwnd, expected))
+        return {
+            "name": "Message Codex",
+            "control_type": "Edit",
+            "operation": "verify_text_value",
+            "focus_verified": True,
+            "input_text_verified": True,
+            "character_count": len(expected),
+            "runtime_id": self.entry_runtime_id,
+        }
+
     def verify_named_selected(self, hwnd, names, *, control_types):
         normalized = [names] if isinstance(names, str) else list(names)
         self.calls.append(("verify_named_selected", hwnd, tuple(normalized), tuple(control_types)))
         return {
             "name": normalized[0],
             "control_type": tuple(control_types)[0],
+            "exact": True,
             "operation": "verify_selection",
             "selection_verified": True,
         }
@@ -215,7 +247,56 @@ def test_open_path_resolves_then_uses_native_path_api(settings, tmp_path):
 
     assert result.success
     assert result.evidence["opened_via"] == "os.startfile"
+    assert result.evidence["postcondition_verified"] is True
     assert ("open_path", str(target.resolve())) in native.calls
+
+
+def test_open_path_refuses_a_postcondition_that_was_already_true(settings, tmp_path):
+    class AlreadyOpenNative(FakeNative):
+        def path_open_state(self, path):
+            self.calls.append(("path_open_state", str(path)))
+            return {"verified": True, "foreground_hwnd": self.foreground}
+
+    target = tmp_path / "already-open.txt"
+    target.write_text("safe", encoding="utf-8")
+    native = AlreadyOpenNative()
+    executor = WindowsExecutor(settings, native=native, uia=FakeUIA())
+
+    result = executor.execute(Action(ActionType.OPEN_PATH, path=str(target)))
+
+    assert not result.success
+    assert "already open" in result.message
+    assert "open_path" not in {call[0] for call in native.calls}
+
+
+def test_file_title_match_without_new_foreground_window_is_not_verified(monkeypatch):
+    clock = [0.0]
+
+    def sleeper(duration):
+        clock[0] += duration
+
+    native = NativeWindows(
+        user32=object(),
+        shell32=object(),
+        monotonic=lambda: clock[0],
+        sleeper=sleeper,
+    )
+    monkeypatch.setattr(
+        native,
+        "path_open_state",
+        lambda _path: {
+            "kind": "foreground_document_title",
+            "verified": True,
+            "foreground_hwnd": 101,
+        },
+    )
+
+    with pytest.raises(NativeWindowsError, match="verified foreground"):
+        native.wait_for_path_open(
+            "report.txt",
+            before={"verified": False, "foreground_hwnd": 101},
+            timeout=0.2,
+        )
 
 
 def test_secure_desktop_blocks_path_dispatch(settings, tmp_path):
@@ -294,7 +375,11 @@ def test_open_conversation_uses_exact_uia_targets_when_no_search_hotkey(settings
 
     assert result.success
     assert result.evidence["method"] == "uia"
-    assert [call[2] for call in uia.calls] == [("Demo project",), ("Voice design",)]
+    assert [call[2] for call in uia.calls if call[0] == "click_named"] == [
+        ("Demo project",),
+        ("Voice design",),
+    ]
+    assert result.evidence["postcondition_verified"] is True
     assert native.calls.count(("assert_foreground", 101)) >= 3
 
 
@@ -348,11 +433,47 @@ def test_open_mode_selects_tab_then_named_mode(settings):
     result = executor.execute(Action(ActionType.OPEN_MODE, app="claude", tab="Chat", mode="Design"))
 
     assert result.success
-    assert [call[2] for call in uia.calls] == [("Chat",), ("Design",)]
+    assert [call[2] for call in uia.calls if call[0] == "click_named"] == [
+        ("Chat and Cowork",),
+        ("Design",),
+    ]
     assert all(call[1] == 202 for call in uia.calls)
+    assert result.evidence["postcondition_verified"] is True
 
 
-def test_own_dictation_focuses_entry_then_sends_unicode_to_same_window(settings):
+def test_open_mode_does_not_treat_focus_only_as_selected(settings):
+    class FocusOnlyUIA(FakeUIA):
+        def click_named(self, hwnd, names, *, control_types):
+            evidence = super().click_named(hwnd, names, control_types=control_types)
+            evidence.update({"postcondition": "focused", "postcondition_verified": True})
+            return evidence
+
+        def verify_named_selected(self, hwnd, names, *, control_types):
+            self.calls.append(("verify_named_selected", hwnd, (names,), tuple(control_types)))
+            raise UIAPostconditionError("not selected")
+
+    executor = WindowsExecutor(settings, native=FakeNative(), uia=FocusOnlyUIA())
+
+    result = executor.execute(Action(ActionType.OPEN_MODE, app="claude", mode="Code"))
+
+    assert not result.success
+    assert result.evidence["error_type"] == "WindowsExecutionError"
+
+
+def test_open_mode_rejects_unmapped_label_before_activation_or_click(settings):
+    native = FakeNative()
+    uia = FakeUIA()
+    executor = WindowsExecutor(settings, native=native, uia=uia)
+
+    result = executor.execute(Action(ActionType.OPEN_MODE, app="claude", mode="Settings"))
+
+    assert not result.success
+    assert result.evidence["error_type"] == "WindowsExecutionError"
+    assert "activate_window" not in {call[0] for call in native.calls}
+    assert not uia.calls
+
+
+def test_own_dictation_types_unicode_but_unverified_submission_fails_closed(settings):
     native = FakeNative()
     uia = FakeUIA()
     executor = WindowsExecutor(settings, native=native, uia=uia)
@@ -361,12 +482,14 @@ def test_own_dictation_focuses_entry_then_sends_unicode_to_same_window(settings)
     typed = executor.execute(Action(ActionType.TYPE_TEXT, text="请继续设计"))
     sent = executor.execute(Action(ActionType.SEND_PROMPT))
 
-    assert ready.success and typed.success and sent.success
+    assert ready.success and typed.success and not sent.success
     assert ready.evidence["uses_application_native_voice"] is False
     assert ("focus_text_entry", 101) in uia.calls
-    assert uia.calls.count(("verify_focused_text_entry", 101)) == 2
+    assert uia.calls.count(("verify_focused_text_entry", 101)) == 1
+    assert ("verify_focused_text_contains", 101, "请继续设计") in uia.calls
     assert ("send_text", "请继续设计") in native.calls
-    assert ("send_hotkey", "enter") in native.calls
+    assert ("send_hotkey", "enter") not in native.calls
+    assert "postcondition" in sent.message
 
 
 def test_text_injection_fails_closed_if_focus_changes_after_dictation(settings):
@@ -428,7 +551,7 @@ def test_text_injection_rejects_enter_control_character(settings):
     assert ("send_text", "do not submit\r") not in native.calls
 
 
-def test_native_voice_prefers_only_explicitly_configured_hotkey(settings):
+def test_native_voice_hotkey_fails_closed_without_active_state_postcondition(settings):
     settings.apps["codex"].native_voice_hotkey = "ctrl+shift+v"
     native = FakeNative()
     uia = FakeUIA()
@@ -436,13 +559,13 @@ def test_native_voice_prefers_only_explicitly_configured_hotkey(settings):
 
     result = executor.execute(Action(ActionType.START_NATIVE_VOICE, app="codex"))
 
-    assert result.success
-    assert result.evidence["method"] == "configured_hotkey"
-    assert ("send_hotkey", "ctrl+shift+v") in native.calls
+    assert not result.success
+    assert result.evidence["error_type"] == "WindowsExecutionError"
+    assert ("send_hotkey", "ctrl+shift+v") not in native.calls
     assert not uia.calls
 
 
-def test_native_voice_uses_only_allow_listed_named_uia_button(settings):
+def test_native_voice_button_fails_closed_without_active_state_postcondition(settings):
     settings.apps["codex"].voice_button_names = ["Calibrated voice button"]
     native = FakeNative()
     uia = FakeUIA()
@@ -450,9 +573,10 @@ def test_native_voice_uses_only_allow_listed_named_uia_button(settings):
 
     result = executor.execute(Action(ActionType.START_NATIVE_VOICE, app="codex"))
 
-    assert result.success
-    assert result.evidence["method"] == "named_uia_button"
-    assert uia.calls[0][2] == tuple(settings.apps["codex"].voice_button_names)
+    assert not result.success
+    assert result.evidence["error_type"] == "WindowsExecutionError"
+    assert not uia.calls
+    assert ("activate_window", 101) not in native.calls
 
 
 def test_native_voice_fails_when_profile_has_no_authorized_mechanism(settings):
@@ -552,6 +676,83 @@ def test_uia_prefers_exact_match_and_reports_evidence():
     assert evidence["postcondition_verified"] is True
 
 
+def test_uia_falls_back_to_verified_click_when_element_has_no_invoke_capability():
+    class ClickOnlyElement(FakeElement):
+        invoke = None
+
+        def click_input(self):
+            self.selected = True
+
+    wanted = ClickOnlyElement("Chat")
+    backend = UIABackend(
+        desktop_factory=desktop_factory([wanted]),
+        foreground_guard=lambda _hwnd: None,
+    )
+
+    evidence = backend.click_named(77, "Chat")
+
+    assert evidence["method"] == "click_input"
+    assert evidence["postcondition"] == "selected"
+    assert evidence["postcondition_verified"] is True
+
+
+def test_uia_never_retries_failed_invoke_through_physical_click() -> None:
+    class UnknownResultElement(FakeElement):
+        physical_clicks = 0
+
+        def invoke(self):
+            self.selected = True
+            raise RuntimeError("provider result unknown")
+
+        def click_input(self):
+            self.physical_clicks += 1
+
+    wanted = UnknownResultElement("Chat")
+    backend = UIABackend(
+        desktop_factory=desktop_factory([wanted]),
+        foreground_guard=lambda _hwnd: None,
+    )
+
+    with pytest.raises(UIAError, match="Could not activate"):
+        backend.click_named_exact(77, "Chat")
+
+    assert wanted.physical_clicks == 0
+
+
+def test_uia_checks_foreground_immediately_before_physical_click() -> None:
+    class ClickOnlyElement(FakeElement):
+        invoke = None
+        physical_clicks = 0
+
+        def click_input(self):
+            self.physical_clicks += 1
+
+    wanted = ClickOnlyElement("Chat")
+
+    def stolen_focus(_hwnd):
+        raise WindowActivationError("focus changed")
+
+    backend = UIABackend(
+        desktop_factory=desktop_factory([wanted]),
+        foreground_guard=stolen_focus,
+    )
+
+    with pytest.raises(UIAError, match="Could not activate"):
+        backend.click_named_exact(77, "Chat")
+
+    assert wanted.physical_clicks == 0
+
+
+def test_uia_can_re_resolve_exact_target_and_verify_focus_after_tree_change():
+    wanted = FakeElement("Chat", focused=True)
+    backend = UIABackend(desktop_factory=desktop_factory([wanted]))
+
+    evidence = backend.verify_named_focused(77, "Chat")
+
+    assert evidence["exact"] is True
+    assert evidence["focus_verified"] is True
+
+
 def test_uia_fuzzy_match_fails_closed_when_top_candidates_are_ambiguous():
     backend = UIABackend(
         desktop_factory=desktop_factory([FakeElement("Design one"), FakeElement("Design two")]),
@@ -564,6 +765,19 @@ def test_uia_fuzzy_match_fails_closed_when_top_candidates_are_ambiguous():
 
     assert len(caught.value.candidates) == 2
     assert all(isinstance(item, ElementMatch) for item in caught.value.candidates)
+
+
+def test_uia_single_fuzzy_match_is_rejected_before_any_click() -> None:
+    fuzzy = FakeElement("Designer tools")
+    backend = UIABackend(
+        desktop_factory=desktop_factory([fuzzy]),
+        threshold=0.6,
+    )
+
+    with pytest.raises(ElementNotFoundError, match="No exact"):
+        backend.click_named_exact(77, "Design")
+
+    assert not fuzzy.invoked
 
 
 def test_uia_refuses_password_field_before_focus_or_typing():
@@ -581,3 +795,20 @@ def test_uia_refuses_password_field_before_focus_or_typing():
         backend.verify_focused_text_entry(77)
 
     assert password.focused is True
+
+
+def test_uia_rechecks_exact_identity_immediately_before_invoke() -> None:
+    class RenamingElement(FakeElement):
+        reads = 0
+
+        def window_text(self):
+            self.reads += 1
+            return "Chat" if self.reads <= 2 else "Delete"
+
+    target = RenamingElement("Chat")
+    backend = UIABackend(desktop_factory=desktop_factory([target]))
+
+    with pytest.raises(UIAError, match="identity changed"):
+        backend.click_named_exact(77, "Chat")
+
+    assert not target.invoked

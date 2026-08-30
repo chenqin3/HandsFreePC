@@ -4,6 +4,10 @@ from dataclasses import replace
 from pathlib import Path, PureWindowsPath
 
 from .config import ExecutionSettings
+from .desktop.safety import (
+    affirmatively_authorized_action_reference,
+    affirmatively_authorized_app_scope,
+)
 from .models import Action, ActionType, Plan, RiskLevel
 from .normalize import compact_text
 from .paths import is_disallowed_path_text
@@ -38,7 +42,22 @@ _SAFE_OPEN_SUFFIXES = {
 
 _CONFIRM_ACTIONS = {ActionType.START_NATIVE_VOICE}
 _CLOUD_PLANNER_SOURCES = {"codex", "claude", "llm"}
-_PLANNER_FORBIDDEN_ACTIONS = {ActionType.TYPE_TEXT, ActionType.SEND_PROMPT}
+_CLOUD_PLANNER_UI_ACTIONS = {
+    ActionType.ACTIVATE_APP,
+    ActionType.OPEN_CONVERSATION,
+    ActionType.OPEN_MODE,
+    ActionType.ENTER_DICTATION,
+    ActionType.START_NATIVE_VOICE,
+}
+_DICTATION_AUTHORITY_TERMS = ("听写", "语音输入", "dictation", "voice input")
+_NATIVE_VOICE_AUTHORITY_TERMS = (
+    "应用内语音",
+    "语音输入",
+    "麦克风",
+    "in-app voice",
+    "voice input",
+    "microphone",
+)
 
 
 class SafetyPolicy:
@@ -65,14 +84,22 @@ class SafetyPolicy:
         if any(compact_text(keyword) in compact for keyword in self.settings.blocked_keywords):
             return replace(plan, risk=RiskLevel.BLOCKED, summary="命令包含首版明确禁止的高风险操作")
 
-        if plan.source in _CLOUD_PLANNER_SOURCES and any(
-            action.type in _PLANNER_FORBIDDEN_ACTIONS for action in plan.actions
-        ):
-            return replace(
-                plan,
-                risk=RiskLevel.BLOCKED,
-                summary="云规划器不得生成或提交输入文本",
-            )
+        if plan.source in _CLOUD_PLANNER_SOURCES:
+            if any(action.type not in _CLOUD_PLANNER_UI_ACTIONS for action in plan.actions):
+                return replace(
+                    plan,
+                    risk=RiskLevel.BLOCKED,
+                    summary="旧云规划器仅可执行原句精确授权的应用内导航",
+                )
+            if any(
+                not self._cloud_ui_action_is_authorized(action, user_text)
+                for action in plan.actions
+            ):
+                return replace(
+                    plan,
+                    risk=RiskLevel.BLOCKED,
+                    summary="云规划动作未被原句肯定且精确授权",
+                )
 
         native_voice_indices = [
             index
@@ -101,6 +128,28 @@ class SafetyPolicy:
             if action_risk == RiskLevel.CONFIRM and risk == RiskLevel.SAFE:
                 risk = RiskLevel.CONFIRM
         return replace(plan, risk=risk)
+
+    @staticmethod
+    def _cloud_ui_action_is_authorized(action: Action, user_text: str) -> bool:
+        app = (action.app or "").strip()
+        if not app or app.casefold() == "current":
+            return False
+        if not affirmatively_authorized_app_scope(app, user_text):
+            return False
+        for value in (action.project, action.conversation, action.tab, action.mode):
+            if value and not affirmatively_authorized_action_reference(value, user_text):
+                return False
+        if action.type == ActionType.ENTER_DICTATION:
+            return any(
+                affirmatively_authorized_action_reference(term, user_text)
+                for term in _DICTATION_AUTHORITY_TERMS
+            )
+        if action.type == ActionType.START_NATIVE_VOICE:
+            return any(
+                affirmatively_authorized_action_reference(term, user_text)
+                for term in _NATIVE_VOICE_AUTHORITY_TERMS
+            )
+        return True
 
     @staticmethod
     def _action_risk(action: Action, *, explicit_submission: bool) -> RiskLevel:

@@ -14,6 +14,90 @@ _APP_ALIASES = {
     "克劳德": "claude",
 }
 
+_APP_NAMES_BY_CANONICAL = {
+    canonical: tuple(alias for alias, value in _APP_ALIASES.items() if value == canonical)
+    for canonical in frozenset(_APP_ALIASES.values())
+}
+
+_FEEDBACK_FULL_UTTERANCE_PATTERNS = (
+    r"(?:切换到|切换成|使用|开启)?(?:屏幕反馈|大字模式|遮罩反馈)",
+    r"(?:切换到|切换成|使用|开启)?(?:语音反馈|声音反馈|说话反馈)",
+    r"(?:切换到|切换成|使用|开启)?(?:静默模式|安静模式|不要反馈)",
+    r"(?:大字和语音)(?:两种)?(?:都开|同时开启)?",
+    r"(?:两种反馈|两种都开)",
+)
+
+_PATH_UNCONSUMED_OPERATION_MARKERS = (
+    "打开",
+    "然后",
+    "接着",
+    "随后",
+    "再",
+    "同时",
+    "并且",
+    "最大化",
+    "最小化",
+    "保存",
+    "归档",
+    "退出账户",
+    "退出登录",
+    "登出",
+    "注销",
+    "创建",
+    "新建",
+    "点击",
+    "滚动",
+    "拖动",
+    "勾选",
+    "填写",
+    "搜索",
+    "输入",
+    "上传",
+    "回复",
+    "发布",
+    "关闭",
+    "删除",
+    "重命名",
+    "复制",
+    "移动",
+    "发送",
+    "提交",
+    "安装",
+    "maximize",
+    "minimize",
+    "save",
+    "archive",
+    "signout",
+    "logout",
+    "create",
+    "click",
+    "scroll",
+    "drag",
+    "check",
+    "fill",
+    "search",
+    "type",
+    "upload",
+    "reply",
+    "publish",
+    "close",
+    "delete",
+    "rename",
+    "copy",
+    "move",
+    "send",
+    "submit",
+    "install",
+)
+
+_APP_ENTITY_OPERATION_MARKERS = tuple(
+    marker
+    for marker in _PATH_UNCONSUMED_OPERATION_MARKERS
+    if marker not in {"打开", "然后", "接着", "随后", "再", "同时", "并且"}
+)
+
+_APP_SURFACE_PATTERN = r"(?<![a-z0-9_-])(chat|code|cowork)(?![a-z0-9_-])"
+
 
 def _detect_app(text: str) -> str | None:
     lower = normalize_text(text)
@@ -30,6 +114,29 @@ def _clean_entity(value: str) -> str:
         if result.startswith(prefix):
             result = result[len(prefix) :]
     return result.strip("的")
+
+
+def _detect_app_surface(compact: str) -> str | None:
+    """Return an explicitly requested application surface.
+
+    The ASCII boundaries are important: without them, ``code`` would match the
+    first four letters of ``codex`` and every ordinary Codex activation would
+    incorrectly become a request for the Code tab.
+    """
+
+    labelled = re.search(
+        rf"{_APP_SURFACE_PATTERN}(?:选项卡|标签页|tab)",
+        compact,
+        re.IGNORECASE,
+    )
+    if labelled:
+        return labelled.group(1).lower()
+    navigated = re.search(
+        rf"(?:切换到|切换至|进入|打开|到)(?:其中的)?{_APP_SURFACE_PATTERN}",
+        compact,
+        re.IGNORECASE,
+    )
+    return navigated.group(1).lower() if navigated else None
 
 
 def _normalize_spoken_path_tail(value: str) -> str:
@@ -66,6 +173,152 @@ def _spoken_path(text: str) -> str | None:
 
 class DeterministicIntentParser:
     """Parse high-confidence commands; ambiguous language is left to a planner."""
+
+    def covers_full_text(self, text: str, plan: Plan | None = None) -> bool:
+        """Return whether ``plan`` consumes the complete normalized utterance.
+
+        ``parse`` intentionally remains a cheap candidate detector.  Callers
+        that execute a deterministic plan must additionally use this anchored,
+        fail-closed check so an application or path prefix cannot hide a second
+        unsupported request.
+        """
+
+        compact = compact_text(text)
+        candidate = plan if plan is not None else self.parse(text)
+        if not compact or candidate is None:
+            return False
+
+        actions = candidate.actions
+        action_types = tuple(action.type for action in actions)
+        if action_types == (ActionType.SET_FEEDBACK_MODE,):
+            return any(
+                re.fullmatch(pattern, compact) is not None
+                for pattern in _FEEDBACK_FULL_UTTERANCE_PATTERNS
+            )
+        if action_types == (ActionType.PAUSE,):
+            if actions[0].mode == "dictation":
+                return compact in {"退出听写", "结束听写", "停止听写"}
+            return compact in {"暂停语音操作", "暂停监听", "先暂停"}
+        if action_types == (ActionType.RESUME,):
+            return compact in {"恢复语音操作", "恢复监听", "继续监听"}
+        if action_types == (ActionType.SEND_PROMPT,):
+            return compact in {
+                "发送提示",
+                "发送prompt",
+                "提交提示",
+                "电脑发送提示",
+                "电脑发送prompt",
+                "电脑提交提示",
+            }
+        if not actions and candidate.risk == RiskLevel.BLOCKED:
+            return compact in {"开始听写", "进入听写", "打开语音输入", "语音输入"}
+        if action_types == (ActionType.OPEN_PATH,):
+            return self._covers_full_path_text(text, compact)
+        if actions and actions[0].type == ActionType.ACTIVATE_APP:
+            return self._covers_full_app_text(compact, actions)
+        return False
+
+    @staticmethod
+    def _consume_prefix(value: str, pattern: str) -> str | None:
+        match = re.match(pattern, value, re.IGNORECASE)
+        if match is None:
+            return None
+        return value[match.end() :]
+
+    @staticmethod
+    def _covers_full_path_text(text: str, compact: str) -> bool:
+        """Recognize one anchored path-opening utterance and no later clause."""
+
+        direct = re.fullmatch(
+            r"\s*(?:打开|进入|查看)\s*[a-z]:[\\/](?P<tail>[^，。；;!?]+?)\s*",
+            text,
+            re.IGNORECASE,
+        )
+        if direct is not None:
+            tail = compact_text(direct.group("tail"))
+            return not any(marker in tail for marker in _PATH_UNCONSUMED_OPERATION_MARKERS)
+        spoken = re.fullmatch(
+            r"(?:打开|进入|查看)(?:桌面|文档|下载|[a-z]盘)"
+            r"(?:上的|下的|里的|中的|上|下|里|的)?(?P<tail>.*)",
+            compact,
+            re.IGNORECASE,
+        )
+        if spoken is None:
+            return False
+        tail = spoken.group("tail")
+        return not any(marker in tail for marker in _PATH_UNCONSUMED_OPERATION_MARKERS)
+
+    @classmethod
+    def _covers_full_app_text(cls, compact: str, actions: list[Action]) -> bool:
+        """Consume an allow-listed app command one planned action at a time."""
+
+        app = actions[0].app
+        aliases = _APP_NAMES_BY_CANONICAL.get(app or "")
+        if not aliases:
+            return False
+        app_pattern = "(?:" + "|".join(re.escape(compact_text(alias)) for alias in aliases) + ")"
+        remainder = cls._consume_prefix(
+            compact,
+            r"^(?:打开|启动|进入|切换到|切换至|切换)"
+            r"(?:桌面上的?|桌面里(?:的)?|桌面)?" + app_pattern + r"(?:app|应用)?",
+        )
+        if remainder is None:
+            return False
+
+        for action in actions[1:]:
+            if action.app != app:
+                return False
+            if action.type == ActionType.OPEN_CONVERSATION:
+                if not action.project or not action.conversation:
+                    return False
+                if any(
+                    marker in compact_text(value)
+                    for value in (action.project, action.conversation)
+                    for marker in _APP_ENTITY_OPERATION_MARKERS
+                ):
+                    return False
+                pattern = (
+                    r"^(?:并|然后)?(?:打开|进入)?(?:其中的)?"
+                    + re.escape(compact_text(action.project))
+                    + r"项目(?:下|里|中的|下面的)?(?:的)?"
+                    + re.escape(compact_text(action.conversation))
+                    + r"(?:对话|任务)"
+                )
+            elif action.type == ActionType.OPEN_MODE:
+                mode = compact_text(action.mode or "")
+                if not mode:
+                    return False
+                if any(marker in mode for marker in _APP_ENTITY_OPERATION_MARKERS):
+                    return False
+                if action.tab:
+                    pattern = (
+                        r"^(?:并|然后)?(?:到|至|进入|打开|切换到|切换至)(?:其中的)?"
+                        + re.escape(compact_text(action.tab))
+                        + r"(?:选项卡|标签页|tab)(?:里面|中)?"
+                        r"(?:并|然后)?(?:开启|创建|打开)(?:一个)?" + re.escape(mode)
+                    )
+                elif mode in {"chat", "code", "cowork"}:
+                    pattern = (
+                        r"^(?:并|然后)?(?:的|到|至|进入|打开|切换到|切换至)?(?:其中的)?"
+                        + re.escape(mode)
+                        + r"(?:选项卡|标签页|tab)(?:里面|中)?"
+                    )
+                else:
+                    pattern = r"^(?:并|然后)?(?:开启|创建|打开)(?:一个)?" + re.escape(mode)
+            elif action.type == ActionType.ENTER_DICTATION:
+                pattern = (
+                    r"^(?:并|然后)?(?:(?:接下来)?我会)?"
+                    r"(?:打开|开启|开始|使用)?(?:语音输入|听写)"
+                )
+            elif action.type == ActionType.START_NATIVE_VOICE:
+                pattern = r"^(?:并|然后)?(?:使用|打开|开启|开始)?(?:应用内语音|原生语音)"
+            else:
+                return False
+            consumed = cls._consume_prefix(remainder, pattern)
+            if consumed is None:
+                return False
+            remainder = consumed
+        return remainder == ""
 
     def parse(self, text: str) -> Plan | None:
         compact = compact_text(text)
@@ -152,8 +405,8 @@ class DeterministicIntentParser:
                 )
             )
 
+        requested_surface = _detect_app_surface(compact)
         if app == "claude":
-            tab_match = re.search(r"(chat|code)(?:选项卡|标签页|tab)?", compact, re.IGNORECASE)
             mode_match = re.search(r"(?:开启|创建)(?:一个)?([a-zA-Z][a-zA-Z0-9_-]*)", compact)
             if mode_match is None:
                 mode_match = re.search(r"打开一个([a-zA-Z][a-zA-Z0-9_-]*)", compact)
@@ -164,10 +417,14 @@ class DeterministicIntentParser:
                         Action(
                             ActionType.OPEN_MODE,
                             app=app,
-                            tab=tab_match.group(1).lower() if tab_match else None,
+                            tab=requested_surface,
                             mode=mode,
                         )
                     )
+            elif requested_surface:
+                actions.append(Action(ActionType.OPEN_MODE, app=app, mode=requested_surface))
+        elif requested_surface:
+            actions.append(Action(ActionType.OPEN_MODE, app=app, mode=requested_surface))
 
         native_voice = any(token in compact for token in ("应用内语音", "原生语音"))
         wants_voice = any(token in compact for token in ("语音输入", "开始听写", "开启语音"))

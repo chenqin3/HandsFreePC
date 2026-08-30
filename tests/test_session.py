@@ -84,6 +84,14 @@ def test_prompt_assembler_discards_and_returns_unfinished_prompt() -> None:
     assert not assembler.has_pending
 
 
+def test_prompt_assembler_can_finalize_from_out_of_band_keyword_event() -> None:
+    assembler = PromptAssembler(["over"])
+    assert assembler.feed("打开 Claude 并进入 Chat") == []
+
+    assert assembler.finalize() == "打开 Claude 并进入 Chat"
+    assert assembler.finalize() is None
+
+
 @pytest.mark.parametrize("delimiters", [[], [""], ["  "]])
 def test_prompt_assembler_rejects_empty_delimiter_configuration(delimiters) -> None:
     with pytest.raises(ValueError, match="delimiter"):

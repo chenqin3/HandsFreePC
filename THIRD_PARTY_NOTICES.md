@@ -1,4 +1,4 @@
-# Third-party model notices
+# Third-party notices
 
 HandsFreePC 源代码使用根目录 `LICENSE` 中的 MIT License。默认模型**不包含在本 Git 仓库中**；`handsfreepc download-models` 会直接从各上游下载，在 staging 中完成归档 SHA-256、预期权重、许可文件和来源说明核验后再替换目标目录。每个完整模型目录包含来源、下载时间、归档 SHA-256、许可链接和可获取的许可文本；已有目录也只有这些元数据齐全时才会跳过。
 
@@ -43,6 +43,22 @@ The FunASR Model License requires users to attribute the source and author infor
 - License text used by the downloader: https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.1/LICENSE
 
 The MIT License requires the copyright notice and permission notice to be included in copies or substantial portions of the software. The model installer saves the upstream `LICENSE` beside the downloaded ONNX file.
+
+## Optional Qwen Open Computer Use 0.2.3
+
+- Package: `@qwen-code/open-computer-use@0.2.3`
+- Upstream: QwenLM
+- Source: https://github.com/QwenLM/open-computer-use
+- Purpose in HandsFreePC: optional experimental MCP desktop driver
+- License: MIT License
+
+HandsFreePC does not bundle, auto-install, or auto-update this package. Users who explicitly select `driver: open_computer_use` must install the exact supported version separately and set `allow_experimental_driver: true`. A redistributor must retain the upstream MIT copyright and permission notice and should lock and review the exact npm artifact it ships.
+
+Version 0.2.3 has an unresolved Windows Chinese encoding boundary documented in [upstream Issue #5](https://github.com/QwenLM/open-computer-use/issues/5); [PR #6](https://github.com/QwenLM/open-computer-use/pull/6) is not part of the supported release. This is a compatibility and correctness warning, not a change to the MIT license. See [docs/OPEN_COMPUTER_USE.md](docs/OPEN_COMPUTER_USE.md).
+
+## Future keyword-spotting models are not included
+
+HandsFreePC 0.3 contains only an out-of-band `PromptAssembler.finalize()` seam. It does not download or run a separate keyword-spotting model for `over`. Candidate sherpa-onnx KWS model licensing and attribution remain to be clarified upstream; see [sherpa-onnx Issue #3802](https://github.com/k2-fsa/sherpa-onnx/issues/3802). No KWS weight should be added to the default downloader or redistributed until its exact source and governing terms are recorded here and enforced by the model installer.
 
 ## Runtime packages
 

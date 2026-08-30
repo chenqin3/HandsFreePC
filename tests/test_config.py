@@ -15,13 +15,21 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.privacy.allow_cloud_planner is False
     assert settings.planner.enabled is False
     assert settings.computer_control.enabled is False
+    assert settings.computer_control.backend == "local_agent"
+    assert settings.computer_control.driver == "windows_uia"
+    assert settings.computer_control.planner_backend == "claude"
     assert settings.computer_control.allow_screen_context_to_cloud is False
+    assert settings.computer_control.allow_codex_cli_host_read is False
+    assert settings.computer_control.allow_legacy_codex_computer_use is False
     assert settings.execution.dry_run is True
     assert settings.speech.fallback["backend"] == "none"
     assert settings.app.feedback_mode == FeedbackMode.OVERLAY
     assert settings.speech.vad["backend"] == "silero"
     assert settings.apps["codex"].voice_button_names == []
     assert settings.apps["claude"].voice_button_names == []
+    assert settings.apps["codex"].mode_names["chat"] == ["Chat"]
+    assert settings.apps["claude"].mode_names["chat"] == ["Chat and Cowork", "Chat"]
+    assert settings.apps["claude"].mode_names["design"] == ["Design"]
 
 
 def test_cloud_planner_requires_explicit_privacy_opt_in(tmp_path: Path) -> None:
@@ -74,6 +82,116 @@ def test_computer_control_requires_screen_context_opt_in(tmp_path: Path) -> None
     )
 
     with pytest.raises(ValueError, match="allow_screen_context_to_cloud=true"):
+        load_settings(config)
+
+
+def test_native_only_computer_control_does_not_require_cloud_consent(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+computer_control:
+  enabled: true
+  backend: local_agent
+  driver: windows_uia
+  planner_backend: none
+execution:
+  dry_run: false
+""",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.computer_control.enabled
+    assert settings.computer_control.planner_backend == "none"
+    assert not settings.privacy.allow_cloud_planner
+
+
+def test_codex_cli_desktop_planner_requires_host_read_consent(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+privacy:
+  allow_cloud_planner: true
+computer_control:
+  enabled: true
+  planner_backend: codex_cli_best_effort
+  allow_screen_context_to_cloud: true
+execution:
+  dry_run: false
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="allow_codex_cli_host_read=true"):
+        load_settings(config)
+
+    config.write_text(
+        """
+privacy:
+  allow_cloud_planner: true
+computer_control:
+  enabled: true
+  planner_backend: codex_cli_best_effort
+  allow_screen_context_to_cloud: true
+  allow_codex_cli_host_read: true
+execution:
+  dry_run: false
+""",
+        encoding="utf-8",
+    )
+    settings = load_settings(config)
+    assert settings.computer_control.planner_backend == "codex_cli_best_effort"
+    assert settings.computer_control.allow_codex_cli_host_read is True
+
+
+def test_legacy_codex_backend_requires_both_independent_consents(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    base = """
+privacy:
+  allow_cloud_planner: true
+computer_control:
+  enabled: true
+  backend: legacy_codex_cli
+  allow_screen_context_to_cloud: true
+  allow_codex_cli_host_read: {host_read}
+  allow_legacy_codex_computer_use: {legacy_control}
+execution:
+  dry_run: false
+"""
+
+    config.write_text(
+        base.format(host_read="false", legacy_control="true"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="allow_codex_cli_host_read=true"):
+        load_settings(config)
+
+    config.write_text(
+        base.format(host_read="true", legacy_control="false"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="allow_legacy_codex_computer_use=true"):
+        load_settings(config)
+
+    config.write_text(
+        base.format(host_read="true", legacy_control="true"),
+        encoding="utf-8",
+    )
+    settings = load_settings(config)
+    assert settings.computer_control.backend == "legacy_codex_cli"
+    assert settings.computer_control.allow_codex_cli_host_read is True
+    assert settings.computer_control.allow_legacy_codex_computer_use is True
+
+
+def test_open_computer_use_requires_explicit_experimental_opt_in(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "computer_control:\n  driver: open_computer_use\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="experimental"):
         load_settings(config)
 
 
@@ -148,6 +266,10 @@ def test_example_configuration_matches_packaged_defaults() -> None:
         ("planner", "enabled"),
         ("computer_control", "enabled"),
         ("computer_control", "allow_screen_context_to_cloud"),
+        ("computer_control", "allow_codex_cli_host_read"),
+        ("computer_control", "allow_legacy_codex_computer_use"),
+        ("computer_control", "allow_experimental_driver"),
+        ("computer_control", "allow_coordinate_actions"),
         ("execution", "dry_run"),
         ("speech.command", "use_itn"),
     ],

@@ -33,6 +33,11 @@ class WorkerState(StrEnum):
     STOPPED = "stopped"
 
 
+class CommandKind(StrEnum):
+    TASK = "task"
+    CONFIRM = "confirm"
+
+
 @dataclass(frozen=True, slots=True)
 class QueuedCommand:
     """An immutable prompt accepted by a voice session."""
@@ -40,6 +45,8 @@ class QueuedCommand:
     text: str
     sequence: int = 0
     session_id: str | None = None
+    kind: CommandKind = CommandKind.TASK
+    confirmation_id: str | None = None
     command_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     enqueued_at: float = field(default_factory=time.monotonic)
 
@@ -52,6 +59,13 @@ class QueuedCommand:
             raise ValueError("Queued command sequence cannot be negative")
         if self.session_id is not None and not isinstance(self.session_id, str):
             raise ValueError("Queued command session_id must be a string or null")
+        if not isinstance(self.kind, CommandKind):
+            raise ValueError("Queued command kind is invalid")
+        if self.kind == CommandKind.CONFIRM:
+            if not isinstance(self.confirmation_id, str) or not self.confirmation_id:
+                raise ValueError("Confirmation commands require a confirmation_id")
+        elif self.confirmation_id is not None:
+            raise ValueError("Task commands cannot carry a confirmation_id")
         if not isinstance(self.command_id, str) or not self.command_id:
             raise ValueError("Queued command command_id must be a non-empty string")
 
@@ -153,6 +167,18 @@ class PromptAssembler:
         discarded = self.pending_text
         self._pending = ""
         return discarded
+
+    def finalize(self) -> str | None:
+        """Finish the current prompt at an out-of-band delimiter event.
+
+        A future keyword spotter can call this after its timestamped audio
+        prefix has been transcribed, without injecting the delimiter word into
+        the command text.
+        """
+
+        completed = self.pending_text
+        self._pending = ""
+        return completed or None
 
     @staticmethod
     def _clean_edge(value: str) -> str:

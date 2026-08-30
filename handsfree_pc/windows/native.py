@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import re
 import time
@@ -20,6 +21,12 @@ class WindowNotFoundError(NativeWindowsError):
 
 class WindowActivationError(NativeWindowsError):
     pass
+
+
+class ForegroundIntegrityBoundary(WindowActivationError):
+    """The current process cannot join a higher-integrity foreground input queue."""
+
+    reason_code = "foreground_integrity_boundary"
 
 
 class DesktopUnavailableError(NativeWindowsError):
@@ -108,6 +115,8 @@ SW_RESTORE = 9
 SW_SHOWNORMAL = 1
 DESKTOP_READOBJECTS = 0x0001
 UOI_NAME = 2
+PM_NOREMOVE = 0x0000
+ERROR_ACCESS_DENIED = 5
 _CALLBACK_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 WNDENUMPROC = _CALLBACK_FACTORY(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -211,6 +220,18 @@ def _configure_user32(user32: object) -> None:
     user32.BringWindowToTop.restype = wintypes.BOOL
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SetFocus.argtypes = [wintypes.HWND]
+    user32.SetFocus.restype = wintypes.HWND
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG),
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.PeekMessageW.restype = wintypes.BOOL
     user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
     user32.SendInput.restype = wintypes.UINT
     user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -225,6 +246,11 @@ def _configure_user32(user32: object) -> None:
     user32.GetUserObjectInformationW.restype = wintypes.BOOL
     user32.CloseDesktop.argtypes = [wintypes.HANDLE]
     user32.CloseDesktop.restype = wintypes.BOOL
+
+
+def _configure_kernel32(kernel32: object) -> None:
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
 
 def _configure_shell32(shell32: object) -> None:
@@ -247,6 +273,7 @@ class NativeWindows:
         *,
         user32: object | None = None,
         shell32: object | None = None,
+        kernel32: object | None = None,
         path_opener: Callable[[str], object] | None = None,
         process_name_resolver: Callable[[int], str | None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -260,12 +287,18 @@ class NativeWindows:
         owns_shell32 = shell32 is None and os.name == "nt"
         if shell32 is None and os.name == "nt":
             shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        owns_kernel32 = kernel32 is None and os.name == "nt"
+        if kernel32 is None and os.name == "nt":
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         if owns_user32:
             _configure_user32(user32)
         if owns_shell32 and shell32 is not None:
             _configure_shell32(shell32)
+        if owns_kernel32 and kernel32 is not None:
+            _configure_kernel32(kernel32)
         self.user32 = user32
         self.shell32 = shell32
+        self.kernel32 = kernel32
         self._path_opener = path_opener
         self._process_name_resolver = process_name_resolver or _default_process_name
         self._monotonic = monotonic
@@ -394,11 +427,70 @@ class NativeWindows:
             self.user32.ShowWindow(hwnd, SW_RESTORE)
         self.user32.BringWindowToTop(hwnd)
         self.user32.SetForegroundWindow(hwnd)
+        if not self.is_foreground(hwnd):
+            self._attach_and_activate(hwnd)
         deadline = self._monotonic() + max(0.0, timeout)
         while not self.is_foreground(hwnd) and self._monotonic() < deadline:
             self._sleep(0.05)
         self.assert_foreground(hwnd)
         return candidates[int(hwnd)]
+
+    def _attach_and_activate(self, hwnd: int) -> None:
+        """Retry foreground activation with temporarily attached input queues."""
+
+        if self.kernel32 is None or not all(
+            hasattr(self.user32, name)
+            for name in (
+                "AttachThreadInput",
+                "GetWindowThreadProcessId",
+                "PeekMessageW",
+                "SetFocus",
+            )
+        ):
+            return
+        # AttachThreadInput fails when either thread has no message queue.  A
+        # command-line worker normally has none, so explicitly create ours
+        # before trying to join the foreground input queue.
+        message = wintypes.MSG()
+        self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, PM_NOREMOVE)
+        foreground_hwnd = int(self.user32.GetForegroundWindow())
+        current_thread = int(self.kernel32.GetCurrentThreadId())
+        foreground_thread = (
+            int(self.user32.GetWindowThreadProcessId(foreground_hwnd, None))
+            if foreground_hwnd
+            else 0
+        )
+        target_thread = int(self.user32.GetWindowThreadProcessId(hwnd, None))
+        thread_ids: list[int] = []
+        # Join the actual foreground queue first.  A set made this order
+        # nondeterministic and could join the target before discovering that
+        # Windows had denied access to the foreground integrity level.
+        for thread_id in (foreground_thread, target_thread):
+            if thread_id and thread_id != current_thread and thread_id not in thread_ids:
+                thread_ids.append(thread_id)
+        attached: list[int] = []
+        try:
+            for thread_id in thread_ids:
+                ctypes.set_last_error(0)
+                if self.user32.AttachThreadInput(current_thread, thread_id, True):
+                    attached.append(thread_id)
+                    continue
+                error = ctypes.get_last_error()
+                foreground_is_unchanged = (
+                    not foreground_hwnd or int(self.user32.GetForegroundWindow()) == foreground_hwnd
+                )
+                if error == ERROR_ACCESS_DENIED and foreground_is_unchanged:
+                    raise ForegroundIntegrityBoundary(
+                        "Windows denied access to the foreground input queue across an "
+                        "integrity boundary. Run HandsFreePC at the same integrity level "
+                        "as the foreground desktop application or focus the target manually."
+                    )
+            self.user32.BringWindowToTop(hwnd)
+            self.user32.SetForegroundWindow(hwnd)
+            self.user32.SetFocus(hwnd)
+        finally:
+            for thread_id in reversed(attached):
+                self.user32.AttachThreadInput(current_thread, thread_id, False)
 
     def wait_for_windows(
         self,
@@ -431,6 +523,87 @@ class NativeWindows:
         if result <= 32:
             raise NativeWindowsError(f"ShellExecuteW failed with result {result}")
         return "ShellExecuteW"
+
+    @staticmethod
+    def _canonical_path(path: str | Path) -> str:
+        return os.path.normcase(str(Path(path).resolve()))
+
+    def _explorer_directory_hwnds(self, target: Path) -> tuple[int, ...]:
+        """Return Explorer windows whose COM folder identity exactly matches target."""
+
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError as exc:
+            raise NativeWindowsError(
+                "Exact Explorer path verification requires the Windows pywin32 extra"
+            ) from exc
+        expected = self._canonical_path(target)
+        matches: list[int] = []
+        pythoncom.CoInitialize()
+        try:
+            shell = win32com.client.Dispatch("Shell.Application")
+            for window in shell.Windows():
+                try:
+                    current = str(window.Document.Folder.Self.Path)
+                    hwnd = int(window.HWND)
+                except Exception:
+                    continue
+                if self._canonical_path(current) == expected:
+                    matches.append(hwnd)
+        finally:
+            pythoncom.CoUninitialize()
+        return tuple(matches)
+
+    def path_open_state(self, path: str | Path) -> dict[str, object]:
+        """Inspect an exact local postcondition without opening the target."""
+
+        target = Path(path).resolve()
+        foreground = self.get_foreground_window_info()
+        foreground_hwnd = foreground.hwnd if foreground is not None else None
+        if target.is_dir():
+            matches = self._explorer_directory_hwnds(target)
+            return {
+                "kind": "explorer_directory",
+                "verified": foreground_hwnd in matches,
+                "foreground_hwnd": foreground_hwnd,
+                "matching_hwnds": matches,
+            }
+        expected_name = target.name.casefold()
+        title = (foreground.title if foreground is not None else "").casefold()
+        return {
+            "kind": "foreground_document_title",
+            "verified": bool(expected_name and expected_name in title),
+            "foreground_hwnd": foreground_hwnd,
+            "title_digest": (hashlib.sha256(title.encode("utf-8")).hexdigest() if title else None),
+        }
+
+    def wait_for_path_open(
+        self,
+        path: str | Path,
+        *,
+        before: dict[str, object],
+        timeout: float = 8.0,
+    ) -> dict[str, object]:
+        """Wait until a false-before exact path condition becomes true locally."""
+
+        if before.get("verified") is True:
+            raise NativeWindowsError("The requested path was already open in the foreground")
+        deadline = self._monotonic() + max(0.0, timeout)
+        while True:
+            current = self.path_open_state(path)
+            foreground_changed = current.get("foreground_hwnd") != before.get("foreground_hwnd")
+            if current.get("verified") is True and foreground_changed:
+                return {
+                    "postcondition_verified": True,
+                    "verification_kind": current.get("kind"),
+                    "foreground_changed": True,
+                }
+            if self._monotonic() >= deadline:
+                raise NativeWindowsError(
+                    "The opened path did not reach a verified foreground state"
+                )
+            self._sleep(0.1)
 
     @staticmethod
     def _keyboard_input(*, virtual_key: int = 0, scan_code: int = 0, flags: int = 0) -> INPUT:

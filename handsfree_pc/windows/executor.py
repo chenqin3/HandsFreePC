@@ -16,7 +16,7 @@ from .native import (
     WindowNotFoundError,
     parse_hotkey,
 )
-from .uia import UIABackend
+from .uia import ElementNotFoundError, UIABackend, UIAError
 
 
 class WindowsExecutionError(RuntimeError):
@@ -66,7 +66,10 @@ class WindowsExecutor:
 
     def _uia_backend(self) -> UIABackend:
         if self._uia is None:
-            self._uia = UIABackend(threshold=self.settings.execution.ambiguity_threshold)
+            self._uia = UIABackend(
+                threshold=self.settings.execution.ambiguity_threshold,
+                foreground_guard=self._native_backend().assert_foreground,
+            )
         return self._uia
 
     def execute(self, action: Action) -> ExecutionResult:
@@ -167,7 +170,14 @@ class WindowsExecutor:
         if self.dry_run:
             evidence["would_open_via"] = "Windows shell path API"
             return self._success(action, f"Dry run: would open {target}", evidence)
-        evidence["opened_via"] = self._native_backend().open_path(target)
+        native = self._native_backend()
+        before = native.path_open_state(target)
+        if before.get("verified") is True:
+            raise WindowsExecutionError(
+                "The requested path is already open in the foreground; no new action can be proven"
+            )
+        evidence["opened_via"] = native.open_path(target)
+        evidence.update(native.wait_for_path_open(target, before=before))
         return self._success(action, f"Opened {target}", evidence)
 
     def _dry_activation_evidence(self, app: str, profile: AppProfile) -> dict[str, Any]:
@@ -234,6 +244,9 @@ class WindowsExecutor:
     def _activate_app_action(self, action: Action) -> ExecutionResult:
         hwnd, evidence = self._activate(action.app)
         evidence["hwnd"] = hwnd
+        evidence["postcondition_verified"] = bool(
+            not self.dry_run and evidence.get("foreground_verified") is True
+        )
         return self._success(action, f"Activated {action.app}", evidence)
 
     def _verified_hotkey(self, hwnd: int, hotkey: str) -> tuple[int, ...]:
@@ -293,7 +306,7 @@ class WindowsExecutor:
             clicks: list[dict[str, object]] = []
             if action.project:
                 clicks.append(
-                    self._uia_backend().click_named(
+                    self._uia_backend().click_named_exact(
                         hwnd,
                         action.project,
                         control_types=("Button", "ListItem", "TreeItem", "TabItem"),
@@ -301,18 +314,46 @@ class WindowsExecutor:
                 )
                 self._native_backend().assert_foreground(hwnd)
             clicks.append(
-                self._uia_backend().click_named(
+                self._uia_backend().click_named_exact(
                     hwnd,
                     action.conversation,
                     control_types=("Button", "ListItem", "TreeItem", "TabItem"),
                 )
             )
             self._native_backend().assert_foreground(hwnd)
-            evidence.update({"method": "uia", "matches": clicks, "foreground_verified": True})
+            selected = self._uia_backend().verify_named_selected(
+                hwnd,
+                action.conversation,
+                control_types=("ListItem", "TreeItem", "TabItem", "Button"),
+            )
+            evidence.update(
+                {
+                    "method": "uia",
+                    "matches": clicks,
+                    "selected_conversation": selected,
+                    "foreground_verified": True,
+                }
+            )
+        evidence["postcondition_verified"] = bool(
+            evidence.get("foreground_verified") is True
+            and isinstance(evidence.get("selected_conversation"), dict)
+            and evidence["selected_conversation"].get("selection_verified") is True
+            and evidence["selected_conversation"].get("exact") is True
+        )
+        if not evidence["postcondition_verified"]:
+            raise WindowsExecutionError("The exact conversation did not become selected")
         return self._success(action, f"Opened conversation {query}", evidence)
 
     def _open_mode(self, action: Action) -> ExecutionResult:
         assert action.app is not None and action.mode is not None
+        profile = self._profile(action.app)
+        requested_names = [action.mode, *([action.tab] if action.tab else [])]
+        for canonical_name in requested_names:
+            assert canonical_name is not None
+            if canonical_name.casefold() not in profile.mode_names:
+                raise WindowsExecutionError(
+                    f"Mode {canonical_name!r} is not in the configured exact-label allowlist"
+                )
         hwnd, activation = self._activate(action.app)
         evidence: dict[str, Any] = {
             "dry_run": self.dry_run,
@@ -324,25 +365,62 @@ class WindowsExecutor:
             evidence["method"] = "uia"
             return self._success(action, f"Dry run: would open mode {action.mode}", evidence)
         assert hwnd is not None
+
+        def click_mode(canonical_name: str) -> tuple[str, dict[str, object]]:
+            labels = profile.mode_names[canonical_name.casefold()]
+            last_not_found: ElementNotFoundError | None = None
+            for label in labels:
+                try:
+                    match = self._uia_backend().click_named_exact(
+                        hwnd,
+                        label,
+                        control_types=("TabItem", "Button", "ListItem", "TreeItem"),
+                    )
+                except ElementNotFoundError as exc:
+                    last_not_found = exc
+                    continue
+                return label, match
+            raise WindowsExecutionError(
+                f"No exact configured UI label matched mode {canonical_name!r}"
+            ) from last_not_found
+
         matches: list[dict[str, object]] = []
         if action.tab:
-            matches.append(
-                self._uia_backend().click_named(
-                    hwnd,
-                    action.tab,
-                    control_types=("TabItem", "Button", "ListItem"),
-                )
-            )
+            _tab_label, tab_match = click_mode(action.tab)
+            matches.append(tab_match)
             self._native_backend().assert_foreground(hwnd)
-        matches.append(
-            self._uia_backend().click_named(
+        mode_label, mode_match = click_mode(action.mode)
+        matches.append(mode_match)
+        self._native_backend().assert_foreground(hwnd)
+        try:
+            selected = self._uia_backend().verify_named_selected(
                 hwnd,
-                action.mode,
+                mode_label,
                 control_types=("Button", "ListItem", "TreeItem", "TabItem"),
             )
+        except UIAError:
+            selected = None
+        mode_verified = bool(
+            isinstance(selected, dict)
+            and selected.get("selection_verified") is True
+            and selected.get("exact") is True
+        ) or bool(
+            mode_match.get("exact") is True
+            and mode_match.get("postcondition_verified") is True
+            and mode_match.get("postcondition") in {"selected", "already_selected"}
         )
-        self._native_backend().assert_foreground(hwnd)
-        evidence.update({"method": "uia", "matches": matches, "foreground_verified": True})
+        evidence.update(
+            {
+                "method": "uia",
+                "matches": matches,
+                "selected_mode": selected,
+                "resolved_mode_label": mode_label,
+                "foreground_verified": True,
+                "postcondition_verified": mode_verified,
+            }
+        )
+        if not mode_verified:
+            raise WindowsExecutionError("The exact configured mode did not become selected")
         return self._success(action, f"Opened mode {action.mode}", evidence)
 
     def _enter_dictation(self, action: Action) -> ExecutionResult:
@@ -361,6 +439,7 @@ class WindowsExecutor:
             evidence["text_entry"] = text_entry
             self._native_backend().assert_foreground(hwnd)
             evidence["foreground_verified"] = True
+            evidence["postcondition_verified"] = bool(text_entry.get("focus_verified") is True)
         self._dictation_target = _DictationTarget(
             app=action.app.casefold(),
             hwnd=hwnd,
@@ -380,9 +459,9 @@ class WindowsExecutor:
             raise WindowsExecutionError(
                 f"No configured native voice hotkey or named voice button for {action.app}"
             )
-        hwnd, activation = self._activate(action.app)
-        evidence: dict[str, Any] = {"dry_run": self.dry_run, "activation": activation}
         if self.dry_run:
+            _hwnd, activation = self._activate(action.app)
+            evidence: dict[str, Any] = {"dry_run": True, "activation": activation}
             evidence["method"] = (
                 "configured_hotkey" if configured_voice_keys is not None else "named_uia_button"
             )
@@ -393,32 +472,10 @@ class WindowsExecutor:
                 f"Dry run: would start native voice in {action.app}",
                 evidence,
             )
-        assert hwnd is not None
-        if configured_voice_keys is not None:
-            assert profile.native_voice_hotkey is not None
-            keys = self._verified_hotkey(hwnd, profile.native_voice_hotkey)
-            evidence.update(
-                {
-                    "method": "configured_hotkey",
-                    "hotkey_key_count": len(keys),
-                    "foreground_verified": True,
-                }
-            )
-        else:
-            match = self._uia_backend().click_named(
-                hwnd,
-                voice_button_names,
-                control_types=("Button",),
-            )
-            self._native_backend().assert_foreground(hwnd)
-            evidence.update(
-                {
-                    "method": "named_uia_button",
-                    "match": match,
-                    "foreground_verified": True,
-                }
-            )
-        return self._success(action, f"Started native voice in {action.app}", evidence)
+        raise WindowsExecutionError(
+            "Native voice activation is disabled because no application-specific active-state "
+            "postcondition is configured"
+        )
 
     def _require_dictation_target(self) -> _DictationTarget:
         if self._dictation_target is None:
@@ -467,7 +524,17 @@ class WindowsExecutor:
             raise WindowsExecutionError("Dictation target has no verified window")
         evidence["text_entry"] = self._verify_dictation_entry(target)
         evidence["utf16_units"] = self._verified_text(target.hwnd, action.text)
+        text_result = self._uia_backend().verify_focused_text_contains(
+            target.hwnd,
+            action.text,
+        )
+        if self._entry_identity(text_result) != target.entry_identity:
+            raise WindowsExecutionError(
+                "Text appeared in a different UI element than the verified dictation target"
+            )
+        evidence["text_postcondition"] = text_result
         evidence["foreground_verified"] = True
+        evidence["postcondition_verified"] = bool(text_result.get("input_text_verified") is True)
         return self._success(action, "Typed dictated text", evidence)
 
     def _send_prompt(self, action: Action) -> ExecutionResult:
@@ -476,13 +543,10 @@ class WindowsExecutor:
         if self.dry_run:
             evidence["would_send"] = "enter"
             return self._success(action, "Dry run: would submit prompt", evidence)
-        if target.hwnd is None:
-            raise WindowsExecutionError("Dictation target has no verified window")
-        evidence["text_entry"] = self._verify_dictation_entry(target)
-        self._verified_hotkey(target.hwnd, "enter")
-        self._dictation_target = None
-        evidence.update({"key": "enter", "foreground_verified": True})
-        return self._success(action, "Submitted prompt", evidence)
+        raise WindowsExecutionError(
+            "Prompt submission is disabled because no application-specific sent-message "
+            "postcondition is configured"
+        )
 
     def _wait(self, action: Action) -> ExecutionResult:
         assert action.seconds is not None
@@ -491,7 +555,11 @@ class WindowsExecutor:
         return self._success(
             action,
             f"{'Dry run: would wait' if self.dry_run else 'Waited'} {action.seconds:g} seconds",
-            {"dry_run": self.dry_run, "seconds": action.seconds},
+            {
+                "dry_run": self.dry_run,
+                "seconds": action.seconds,
+                "postcondition_verified": not self.dry_run,
+            },
         )
 
     def _runtime_action(self, action: Action) -> ExecutionResult:

@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +189,10 @@ def command_doctor(args: argparse.Namespace) -> int:
         )
     except OSError:
         node_repl_config_mentioned = False
+    control = settings.computer_control
+    uses_cloud_desktop_planner = control.backend == "legacy_codex_cli" or (
+        control.backend == "local_agent" and control.planner_backend != "none"
+    )
     report: dict[str, Any] = {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
@@ -200,13 +206,17 @@ def command_doctor(args: argparse.Namespace) -> int:
                 settings.privacy.allow_cloud_planner and settings.planner.enabled
             ),
             "computer_control_transcripts_to_cloud": (
-                settings.privacy.allow_cloud_planner and settings.computer_control.enabled
+                settings.privacy.allow_cloud_planner
+                and settings.computer_control.enabled
+                and uses_cloud_desktop_planner
             ),
         },
         "effective_mode": "live" if not settings.execution.dry_run else "dry-run",
         "computer_control": {
             "enabled": settings.computer_control.enabled,
             "backend": settings.computer_control.backend,
+            "driver": settings.computer_control.driver,
+            "planner_backend": settings.computer_control.planner_backend,
             "screen_context_to_cloud": (
                 settings.computer_control.enabled
                 and settings.computer_control.allow_screen_context_to_cloud
@@ -215,6 +225,9 @@ def command_doctor(args: argparse.Namespace) -> int:
             "computer_use_skill_discovered": computer_use_skill_discovered,
             "node_repl_config_mentioned": node_repl_config_mentioned,
             "preflight_is_static_only": True,
+            "experimental_driver_enabled": (
+                settings.computer_control.driver == "open_computer_use"
+            ),
         },
         "modules": {name: importlib.util.find_spec(name) is not None for name in modules},
         "commands": {
@@ -228,10 +241,18 @@ def command_doctor(args: argparse.Namespace) -> int:
                 ["login", "status"] if args.check_planner_auth else None,
                 env=_sanitized_env(),
             ),
-            "claude": _check_command(
+            "claude_planner": _check_command(
                 settings.planner.claude_executable,
                 ["auth", "status"] if args.check_planner_auth else None,
                 env=_sanitized_env(),
+            ),
+            "claude_computer_control": _check_command(
+                control.claude_executable,
+                ["auth", "status"] if args.check_planner_auth else None,
+                env=_sanitized_env(),
+            ),
+            "open_computer_use": _check_command(
+                settings.computer_control.open_computer_use_executable,
             ),
         },
     }
@@ -273,24 +294,195 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     report["ready_for_run"] = ready_for_run
     codex_ready = bool(report["commands"]["codex_computer_control"]["found"])
-    ready_for_live_control = (
+    if control.driver == "windows_uia":
+        driver_ready = all(report["modules"].get(name, False) for name in ("win32api", "pywinauto"))
+    elif control.driver == "open_computer_use":
+        driver_ready = bool(report["commands"]["open_computer_use"]["found"])
+    else:
+        driver_ready = True
+    planner_ready = {
+        "none": True,
+        "codex_cli_best_effort": bool(report["commands"]["codex_computer_control"]["found"]),
+        "claude": bool(report["commands"]["claude_computer_control"]["found"]),
+    }[control.planner_backend]
+    consent_ready = not uses_cloud_desktop_planner or (
+        settings.privacy.allow_cloud_planner and control.allow_screen_context_to_cloud
+    )
+    if control.backend == "legacy_codex_cli":
+        controller_ready = (
+            codex_ready and computer_use_skill_discovered and node_repl_config_mentioned
+        )
+    else:
+        controller_ready = driver_ready and planner_ready
+    static_control_preflight_passed = (
         ready_for_run
         and not settings.execution.dry_run
         and settings.computer_control.enabled
-        and settings.privacy.allow_cloud_planner
-        and settings.computer_control.allow_screen_context_to_cloud
-        and codex_ready
-        and computer_use_skill_discovered
-        and node_repl_config_mentioned
+        and consent_ready
+        and controller_ready
     )
-    report["ready_for_live_control"] = ready_for_live_control
+    report["static_control_preflight_passed"] = static_control_preflight_passed
+    report["live_control_verified"] = False
+    report["ready_for_live_control"] = False
     _json(report)
     if getattr(args, "strict", False):
         strict_ready = (
-            ready_for_live_control if settings.computer_control.enabled else ready_for_run
+            static_control_preflight_passed if settings.computer_control.enabled else ready_for_run
         )
         return 0 if strict_ready else 1
     return 0 if core_ok else 1
+
+
+def _run_windows_uia_live_smoke(settings: Any) -> dict[str, Any]:
+    """Exercise a harmless owned fixture and verify text through fresh UIA state."""
+
+    from .config import AppProfile
+    from .desktop.protocol import (
+        DesktopAction,
+        DesktopActionType,
+        DesktopExpectation,
+        DesktopExpectationKind,
+    )
+    from .desktop.safety import DesktopSafetyDisposition, DesktopSafetyPolicy
+    from .desktop.verifier import DesktopVerifier
+    from .desktop.windows_uia import WindowsUiaDriver
+
+    title = f"HandsFreePC Live Fixture {uuid.uuid4().hex[:10]}"
+    verification_text = f"HandsFreePC-中文验收-{uuid.uuid4().hex[:10]}"
+    executable_name = Path(sys.executable).name
+    profile = AppProfile(
+        name="handsfreepc_live_fixture",
+        process_names=[executable_name],
+        executable=None,
+        title_patterns=[title],
+        search_hotkey=None,
+        native_voice_hotkey=None,
+        voice_button_names=[],
+    )
+    process: subprocess.Popen[str] | None = None
+    driver = WindowsUiaDriver({profile.name: profile})
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "handsfree_pc.live_fixture", "--title", title],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=_sanitized_env(),
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
+        )
+        deadline = time.monotonic() + 12
+        observation = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("live UIA fixture exited before observation")
+            try:
+                observation = driver.observe(profile.name)
+                break
+            except Exception:
+                time.sleep(0.1)
+        if observation is None:
+            raise RuntimeError("live UIA fixture did not become observable")
+        candidates = [
+            item
+            for item in observation.elements
+            if item.control_type.casefold() in {"edit", "document"}
+            and item.enabled
+            and not item.password
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError("live UIA fixture did not expose one unambiguous text field")
+        action = DesktopAction(
+            DesktopActionType.SET_VALUE,
+            app=observation.app,
+            generation=observation.generation,
+            element_index=candidates[0].index,
+            value=verification_text,
+        )
+        policy = DesktopSafetyPolicy()
+        inspection = policy.inspect_observation(observation)
+        user_task = f"fill {verification_text} into {candidates[0].name}"
+        safety = policy.evaluate(
+            action,
+            observation,
+            user_text=user_task,
+            expectation=DesktopExpectation(
+                DesktopExpectationKind.TEXT_PRESENT,
+                text=verification_text,
+            ),
+        )
+        if (
+            inspection.disposition != DesktopSafetyDisposition.ALLOW
+            or safety.disposition != DesktopSafetyDisposition.CONFIRM
+            or safety.confirmation is None
+        ):
+            raise RuntimeError("live UIA fixture was rejected by local safety policy")
+        # `computer-doctor --live` is itself an explicit, foreground opt-in to
+        # mutate this process-owned fixture.  Production controller actions go
+        # through VoiceRuntime's separate random one-time challenge.
+        receipt = driver.execute(action, observation)
+        after = driver.observe(observation.app)
+        verification = DesktopVerifier().verify_action(action, receipt, observation, after)
+        return {
+            "driver": "windows_uia",
+            "fixture_started": True,
+            "fresh_observation": after.generation > observation.generation,
+            "text_round_trip_verified": verification.verified,
+            "unicode_round_trip_verified": verification.verified,
+            "live_control_verified": verification.verified,
+            "verification_reason": verification.reason,
+        }
+    finally:
+        driver.close()
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+
+def command_computer_doctor(args: argparse.Namespace) -> int:
+    settings = load_settings(args.config, allow_missing=False)
+    control = settings.computer_control
+    report: dict[str, Any] = {
+        "backend": control.backend,
+        "driver": control.driver,
+        "planner_backend": control.planner_backend,
+        "live_requested": bool(args.live),
+        "live_control_verified": False,
+    }
+    if not args.live:
+        report["next_step"] = "Run computer-doctor --live for the owned UIA fixture test"
+        _json(report)
+        return 0
+    if platform.system() != "Windows":
+        report["error_type"] = "UnsupportedPlatform"
+        _json(report)
+        return 2
+    if control.backend != "local_agent" or control.driver != "windows_uia":
+        report["error_type"] = "LiveDoctorBackendUnsupported"
+        report["supported_backend"] = "local_agent/windows_uia"
+        _json(report)
+        return 2
+    if not control.enabled:
+        report["error_type"] = "ComputerControlDisabled"
+        _json(report)
+        return 2
+    if settings.execution.dry_run:
+        report["error_type"] = "DryRunEnabled"
+        _json(report)
+        return 2
+    try:
+        report.update(_run_windows_uia_live_smoke(settings))
+    except Exception as exc:
+        report["error_type"] = type(exc).__name__
+        _json(report)
+        return 2
+    _json(report)
+    return 0 if report["live_control_verified"] else 2
 
 
 def command_download_models(args: argparse.Namespace) -> int:
@@ -386,6 +578,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail unless default runtime dependencies, models, and an input device are ready",
     )
     doctor.set_defaults(func=command_doctor)
+
+    computer_doctor = subparsers.add_parser(
+        "computer-doctor",
+        help="Run static or opt-in live checks for the owned desktop driver",
+    )
+    computer_doctor.add_argument(
+        "--live",
+        action="store_true",
+        help="Open a harmless owned fixture, type a random Unicode token, and read it back",
+    )
+    computer_doctor.set_defaults(func=command_computer_doctor)
 
     downloader = subparsers.add_parser(
         "download-models", help="Download official local speech models"

@@ -4,18 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "handsfree-pc"
-version = "0.2.0"
-description = "Continuous Windows voice control with queued prompts and verified Codex Computer Use."
+version = "0.3.0"
+description = "Continuous Windows voice control with an owned, locally verified desktop agent."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "chenqin3" }]
-keywords = ["voice-control", "windows", "accessibility", "speech-recognition", "codex", "computer-use"]
+keywords = ["voice-control", "windows", "accessibility", "speech-recognition", "desktop-agent", "computer-use"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Win32 (MS Windows)",
   "Intended Audience :: End Users/Desktop",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: Microsoft :: Windows :: Windows 11",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",

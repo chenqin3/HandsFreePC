@@ -88,7 +88,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "planner": {
         "enabled": False,
-        "backend": "codex",
+        "backend": "claude",
         "timeout_seconds": 90,
         "model": None,
         "codex_executable": "codex",
@@ -96,16 +96,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "computer_control": {
         "enabled": False,
-        "backend": "codex",
+        "backend": "local_agent",
+        "driver": "windows_uia",
+        "planner_backend": "claude",
         "allow_screen_context_to_cloud": False,
+        "allow_codex_cli_host_read": False,
+        "allow_legacy_codex_computer_use": False,
         "timeout_seconds": 600,
+        "max_steps": 20,
+        "max_observation_chars": 24000,
         "max_queue_size": 8,
         "max_prompt_chars": 4000,
         "failure_policy": "pause",
         "end_policy": "drain",
         "working_directory": "runtime/computer-control",
         "codex_executable": "codex",
+        "claude_executable": "claude",
         "model": None,
+        "open_computer_use_executable": "open-computer-use",
+        "open_computer_use_args": ["mcp"],
+        "allow_experimental_driver": False,
+        "allow_coordinate_actions": False,
     },
     "execution": {
         "dry_run": True,
@@ -130,6 +141,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "search_hotkey": None,
             "native_voice_hotkey": None,
             "voice_button_names": [],
+            "mode_names": {"chat": ["Chat"], "code": ["Code"]},
         },
         "claude": {
             "process_names": ["claude.exe"],
@@ -138,6 +150,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "search_hotkey": None,
             "native_voice_hotkey": None,
             "voice_button_names": [],
+            "mode_names": {
+                "chat": ["Chat and Cowork", "Chat"],
+                "cowork": ["Chat and Cowork", "Cowork"],
+                "code": ["Code"],
+                "design": ["Design"],
+            },
         },
     },
 }
@@ -171,6 +189,26 @@ def _require_string_list(mapping: dict[str, Any], key: str, *, section: str) -> 
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{section}.{key} must be a YAML list of strings")
     return list(value)
+
+
+def _require_string_list_mapping(
+    mapping: dict[str, Any], key: str, *, section: str
+) -> dict[str, list[str]]:
+    value = mapping.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"{section}.{key} must be a YAML mapping of string lists")
+    result: dict[str, list[str]] = {}
+    for item_key, item_value in value.items():
+        if (
+            not isinstance(item_key, str)
+            or not item_key.strip()
+            or not isinstance(item_value, list)
+            or not item_value
+            or any(not isinstance(item, str) or not item.strip() for item in item_value)
+        ):
+            raise ValueError(f"{section}.{key} must map non-empty strings to string lists")
+        result[item_key.strip().casefold()] = [item.strip() for item in item_value]
+    return result
 
 
 @dataclass(slots=True)
@@ -223,15 +261,26 @@ class PlannerSettings:
 class ComputerControlSettings:
     enabled: bool
     backend: str
+    driver: str
+    planner_backend: str
     allow_screen_context_to_cloud: bool
+    allow_codex_cli_host_read: bool
+    allow_legacy_codex_computer_use: bool
     timeout_seconds: float
+    max_steps: int
+    max_observation_chars: int
     max_queue_size: int
     max_prompt_chars: int
     failure_policy: str
     end_policy: str
     working_directory: Path
     codex_executable: str
+    claude_executable: str
     model: str | None
+    open_computer_use_executable: str
+    open_computer_use_args: list[str]
+    allow_experimental_driver: bool
+    allow_coordinate_actions: bool
 
 
 @dataclass(slots=True)
@@ -256,6 +305,7 @@ class AppProfile:
     search_hotkey: str | None
     native_voice_hotkey: str | None
     voice_button_names: list[str]
+    mode_names: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -322,6 +372,26 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
         "allow_screen_context_to_cloud",
         section="computer_control",
     )
+    allow_codex_cli_host_read = _require_bool(
+        computer_control_raw,
+        "allow_codex_cli_host_read",
+        section="computer_control",
+    )
+    allow_legacy_codex_computer_use = _require_bool(
+        computer_control_raw,
+        "allow_legacy_codex_computer_use",
+        section="computer_control",
+    )
+    allow_experimental_driver = _require_bool(
+        computer_control_raw,
+        "allow_experimental_driver",
+        section="computer_control",
+    )
+    allow_coordinate_actions = _require_bool(
+        computer_control_raw,
+        "allow_coordinate_actions",
+        section="computer_control",
+    )
     execution_dry_run = _require_bool(execution_raw, "dry_run", section="execution")
     _require_bool(speech_raw["command"], "use_itn", section="speech.command")
 
@@ -361,6 +431,11 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             native_voice_hotkey=value.get("native_voice_hotkey"),
             voice_button_names=_require_string_list(
                 value, "voice_button_names", section=f"apps.{name}"
+            ),
+            mode_names=_require_string_list_mapping(
+                value,
+                "mode_names",
+                section=f"apps.{name}",
             ),
         )
 
@@ -402,8 +477,14 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
         computer_control=ComputerControlSettings(
             enabled=computer_control_enabled,
             backend=str(computer_control_raw["backend"]).lower(),
+            driver=str(computer_control_raw["driver"]).lower(),
+            planner_backend=str(computer_control_raw["planner_backend"]).lower(),
             allow_screen_context_to_cloud=allow_screen_context,
+            allow_codex_cli_host_read=allow_codex_cli_host_read,
+            allow_legacy_codex_computer_use=allow_legacy_codex_computer_use,
             timeout_seconds=float(computer_control_raw["timeout_seconds"]),
+            max_steps=int(computer_control_raw["max_steps"]),
+            max_observation_chars=int(computer_control_raw["max_observation_chars"]),
             max_queue_size=int(computer_control_raw["max_queue_size"]),
             max_prompt_chars=int(computer_control_raw["max_prompt_chars"]),
             failure_policy=str(computer_control_raw["failure_policy"]).lower(),
@@ -412,7 +493,16 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
                 str(computer_control_raw["working_directory"]), base_dir=base_dir
             ),
             codex_executable=str(computer_control_raw["codex_executable"]),
+            claude_executable=str(computer_control_raw["claude_executable"]),
             model=computer_control_raw.get("model"),
+            open_computer_use_executable=str(computer_control_raw["open_computer_use_executable"]),
+            open_computer_use_args=_require_string_list(
+                computer_control_raw,
+                "open_computer_use_args",
+                section="computer_control",
+            ),
+            allow_experimental_driver=allow_experimental_driver,
+            allow_coordinate_actions=allow_coordinate_actions,
         ),
         execution=ExecutionSettings(
             dry_run=execution_dry_run,
@@ -462,19 +552,53 @@ def _validate(settings: Settings) -> None:
             "planner.enabled requires privacy.allow_cloud_planner=true because "
             "transcripts leave the machine"
         )
-    if settings.computer_control.backend != "codex":
-        raise ValueError("computer_control.backend must be codex")
+    if settings.computer_control.backend not in {"local_agent", "legacy_codex_cli"}:
+        raise ValueError("computer_control.backend must be local_agent or legacy_codex_cli")
+    if settings.computer_control.driver not in {
+        "windows_uia",
+        "open_computer_use",
+        "none",
+    }:
+        raise ValueError("computer_control.driver must be windows_uia, open_computer_use, or none")
+    if settings.computer_control.planner_backend not in {
+        "codex_cli_best_effort",
+        "claude",
+        "none",
+    }:
+        raise ValueError(
+            "computer_control.planner_backend must be codex_cli_best_effort, claude, or none"
+        )
+    if (
+        settings.computer_control.driver == "open_computer_use"
+        and not settings.computer_control.allow_experimental_driver
+    ):
+        raise ValueError(
+            "open_computer_use is experimental on Chinese Windows; set "
+            "computer_control.allow_experimental_driver=true to opt in"
+        )
     if settings.computer_control.max_queue_size < 1:
         raise ValueError("computer_control.max_queue_size must be at least 1")
     if not 1 <= settings.computer_control.max_prompt_chars <= 8000:
         raise ValueError("computer_control.max_prompt_chars must be between 1 and 8000")
     if settings.computer_control.timeout_seconds <= 0:
         raise ValueError("computer_control.timeout_seconds must be positive")
+    if not 1 <= settings.computer_control.max_steps <= 100:
+        raise ValueError("computer_control.max_steps must be between 1 and 100")
+    if not 1000 <= settings.computer_control.max_observation_chars <= 100000:
+        raise ValueError("computer_control.max_observation_chars must be between 1000 and 100000")
     if settings.computer_control.failure_policy != "pause":
         raise ValueError("computer_control.failure_policy must be pause")
     if settings.computer_control.end_policy != "drain":
         raise ValueError("computer_control.end_policy must be drain")
-    if settings.computer_control.enabled and not settings.privacy.allow_cloud_planner:
+    uses_cloud_desktop_planner = settings.computer_control.backend == "legacy_codex_cli" or (
+        settings.computer_control.backend == "local_agent"
+        and settings.computer_control.planner_backend != "none"
+    )
+    if (
+        settings.computer_control.enabled
+        and uses_cloud_desktop_planner
+        and not settings.privacy.allow_cloud_planner
+    ):
         raise ValueError(
             "computer_control.enabled requires privacy.allow_cloud_planner=true because "
             "voice commands leave the machine"
@@ -486,10 +610,34 @@ def _validate(settings: Settings) -> None:
         )
     if (
         settings.computer_control.enabled
+        and uses_cloud_desktop_planner
         and not settings.computer_control.allow_screen_context_to_cloud
     ):
         raise ValueError(
             "computer_control.enabled requires "
-            "computer_control.allow_screen_context_to_cloud=true because window metadata, "
-            "accessibility trees, and screenshots may leave the machine"
+            "computer_control.allow_screen_context_to_cloud=true because the completed task, "
+            "authorized app summary, and exactly named UI control labels may leave the machine"
+        )
+    uses_any_codex_cli = (settings.planner.enabled and settings.planner.backend == "codex") or (
+        settings.computer_control.enabled
+        and (
+            settings.computer_control.backend == "legacy_codex_cli"
+            or settings.computer_control.planner_backend == "codex_cli_best_effort"
+        )
+    )
+    if uses_any_codex_cli and not settings.computer_control.allow_codex_cli_host_read:
+        raise ValueError(
+            "Codex CLI has no complete no-tools mode; set "
+            "computer_control.allow_codex_cli_host_read=true only after accepting that the "
+            "subscription CLI may read other files visible to the current Windows account"
+        )
+    if (
+        settings.computer_control.enabled
+        and settings.computer_control.backend == "legacy_codex_cli"
+        and not settings.computer_control.allow_legacy_codex_computer_use
+    ):
+        raise ValueError(
+            "legacy_codex_cli lets a Codex agent use broader computer tools without the 0.3 "
+            "local verifier; set computer_control.allow_legacy_codex_computer_use=true only "
+            "after separately accepting that compatibility boundary"
         )

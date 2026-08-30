@@ -17,7 +17,29 @@ from typing import IO, Any, Protocol, runtime_checkable
 
 import psutil
 
-_SECRET_ENV_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+_ENV_ALLOWLIST = {
+    "APPDATA",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "WINDIR",
+}
 
 _FIRST_TURN_INSTRUCTIONS = """\
 You are the dedicated Windows computer-control worker for HandsFreePC.
@@ -84,6 +106,8 @@ class ComputerControlResult:
     cancelled: bool = False
     timed_out: bool = False
     returncode: int | None = None
+    needs_confirmation: bool = False
+    confirmation_id: str | None = None
 
 
 @runtime_checkable
@@ -117,12 +141,10 @@ class _ProtocolError(RuntimeError):
 
 
 def _sanitized_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return only the bounded Windows runtime and locale environment."""
+
     values = os.environ if source is None else source
-    return {
-        key: value
-        for key, value in values.items()
-        if not any(marker in key.upper() for marker in _SECRET_ENV_MARKERS)
-    }
+    return {key: value for key, value in values.items() if key.upper() in _ENV_ALLOWLIST}
 
 
 def _creation_flags() -> int:

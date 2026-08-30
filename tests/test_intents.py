@@ -51,10 +51,88 @@ def test_parse_claude_mode_and_dictation() -> None:
     assert plan.actions[-1].type == ActionType.ENTER_DICTATION
 
 
+@pytest.mark.parametrize(
+    ("command", "app", "surface"),
+    [
+        ("打开 Claude 到 Chat 选项卡", "claude", "chat"),
+        ("切换 Codex 到 Code 选项卡", "codex", "code"),
+        ("打开 Claude 的 Cowork 标签页", "claude", "cowork"),
+    ],
+)
+def test_parse_explicit_app_surface_without_created_mode(
+    command: str, app: str, surface: str
+) -> None:
+    plan = DeterministicIntentParser().parse(command)
+
+    assert plan is not None
+    assert [action.type for action in plan.actions] == [
+        ActionType.ACTIVATE_APP,
+        ActionType.OPEN_MODE,
+    ]
+    assert plan.actions[1].app == app
+    assert plan.actions[1].tab is None
+    assert plan.actions[1].mode == surface
+
+
+def test_codex_name_is_not_mistaken_for_code_surface() -> None:
+    plan = DeterministicIntentParser().parse("打开 Codex")
+
+    assert plan is not None
+    assert [action.type for action in plan.actions] == [ActionType.ACTIVATE_APP]
+
+
 def test_native_voice_requires_explicit_phrase() -> None:
     plan = DeterministicIntentParser().parse("打开codex，使用应用内语音")
     assert plan is not None
     assert plan.actions[-1].type == ActionType.START_NATIVE_VOICE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "打开 Codex，然后最大化窗口",
+        "打开 Codex，然后保存当前文件",
+        "打开 Codex，然后把当前聊天归档",
+        "打开 Codex，然后退出账户",
+        "打开 Codex，然后创建新对话",
+    ],
+)
+def test_app_prefix_match_does_not_claim_full_text_coverage(command: str) -> None:
+    parser = DeterministicIntentParser()
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert [action.type for action in plan.actions] == [ActionType.ACTIVATE_APP]
+    assert parser.covers_full_text(command, plan) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "打开 Codex",
+        "打开 Claude 到 Chat 选项卡",
+        "切换到桌面上的codex app，打开其中的演示项目下的语音设计对话，打开语音输入",
+        "打开claude app，到chat选项卡里面，开启一个design，接下来我会语音输入",
+        "打开D盘的项目文件夹里的说明.txt",
+        "切换到屏幕反馈",
+    ],
+)
+def test_supported_deterministic_grammar_covers_complete_text(command: str) -> None:
+    parser = DeterministicIntentParser()
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert parser.covers_full_text(command, plan) is True
+
+
+def test_direct_path_prefix_does_not_consume_a_second_open_request() -> None:
+    parser = DeterministicIntentParser()
+    command = r"打开 D:\资料，打开这个文件"
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert [action.type for action in plan.actions] == [ActionType.OPEN_PATH]
+    assert parser.covers_full_text(command, plan) is False
 
 
 def test_send_prompt_requires_exact_control_command() -> None:

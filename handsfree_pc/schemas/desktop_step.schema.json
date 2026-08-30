@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HandsFreePC desktop step",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "kind": {"type": "string", "enum": ["observe", "action", "done", "fail"]},
+    "reason": {
+      "type": "string",
+      "maxLength": 300,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "app": {
+      "type": ["string", "null"],
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "action": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "click",
+            "perform_secondary_action",
+            "scroll",
+            "type_text",
+            "press_key",
+            "set_value"
+          ]
+        },
+        "element_index": {"type": "string", "pattern": "^[0-9]+$"},
+        "click_count": {"type": ["integer", "null"], "enum": [1, null]},
+        "mouse_button": {"type": ["string", "null"], "enum": ["left", null]},
+        "direction": {
+          "type": ["string", "null"],
+          "enum": ["up", "down", "left", "right", null]
+        },
+        "pages": {"type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 10},
+        "action_name": {
+          "type": ["string", "null"],
+          "enum": [
+            "invoke",
+            "toggle",
+            "select",
+            "expand",
+            "collapse",
+            "scrollintoview",
+            "setfocus",
+            null
+          ]
+        },
+        "text": {"type": ["string", "null"], "maxLength": 4000},
+        "key": {
+          "type": ["string", "null"],
+          "enum": [
+            "tab",
+            "shift+tab",
+            "enter",
+            "return",
+            "escape",
+            "space",
+            "pageup",
+            "pagedown",
+            "home",
+            "end",
+            "left",
+            "up",
+            "right",
+            "down",
+            null
+          ]
+        },
+        "value": {"type": ["string", "null"], "maxLength": 4000}
+      },
+      "required": [
+        "type",
+        "element_index",
+        "click_count",
+        "mouse_button",
+        "direction",
+        "pages",
+        "action_name",
+        "text",
+        "key",
+        "value"
+      ],
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"const": "click"}}},
+          "then": {
+            "properties": {
+              "direction": {"type": "null"},
+              "pages": {"type": "null"},
+              "action_name": {"type": "null"},
+              "text": {"type": "null"},
+              "key": {"type": "null"},
+              "value": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "perform_secondary_action"}}},
+          "then": {
+            "properties": {
+              "click_count": {"type": "null"},
+              "mouse_button": {"type": "null"},
+              "direction": {"type": "null"},
+              "pages": {"type": "null"},
+              "text": {"type": "null"},
+              "key": {"type": "null"},
+              "value": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "scroll"}}},
+          "then": {
+            "properties": {
+              "click_count": {"type": "null"},
+              "mouse_button": {"type": "null"},
+              "action_name": {"type": "null"},
+              "text": {"type": "null"},
+              "key": {"type": "null"},
+              "value": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "type_text"}}},
+          "then": {
+            "properties": {
+              "click_count": {"type": "null"},
+              "mouse_button": {"type": "null"},
+              "direction": {"type": "null"},
+              "pages": {"type": "null"},
+              "action_name": {"type": "null"},
+              "key": {"type": "null"},
+              "value": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "press_key"}}},
+          "then": {
+            "properties": {
+              "click_count": {"type": "null"},
+              "mouse_button": {"type": "null"},
+              "direction": {"type": "null"},
+              "pages": {"type": "null"},
+              "action_name": {"type": "null"},
+              "text": {"type": "null"},
+              "value": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "set_value"}}},
+          "then": {
+            "properties": {
+              "click_count": {"type": "null"},
+              "mouse_button": {"type": "null"},
+              "direction": {"type": "null"},
+              "pages": {"type": "null"},
+              "action_name": {"type": "null"},
+              "text": {"type": "null"},
+              "key": {"type": "null"}
+            }
+          }
+        }
+      ]
+    },
+    "expectation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "app_visible",
+            "text_present",
+            "text_absent",
+            "focused_contains",
+            "element_selected"
+          ]
+        },
+        "text": {"type": ["string", "null"], "maxLength": 500}
+      },
+      "required": ["kind", "text"]
+    }
+  },
+  "required": ["kind", "reason", "app", "action", "expectation"]
+}
