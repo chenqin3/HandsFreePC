@@ -1,0 +1,104 @@
+app:
+  language: zh-CN
+  wake_phrases:
+    - "现在开始语音操作"
+    - "电脑开始操作"
+  stop_phrases:
+    - "停止所有操作"
+    - "电脑停止"
+  control_prefixes:
+    - "电脑"
+  awake_timeout_seconds: 20
+  feedback_mode: overlay
+
+privacy:
+  save_audio: false
+  save_transcripts: false
+  redact_paths_in_logs: true
+  allow_cloud_planner: false
+
+speech:
+  sample_rate: 16000
+  input_device: null
+  pre_roll_seconds: 1.2
+  trailing_silence_seconds: 0.8
+  max_utterance_seconds: 25
+  min_speech_seconds: 0.25
+  energy_threshold: 0.012
+  noise_multiplier: 3.0
+  vad:
+    backend: silero
+    model_path: models/silero-vad-v6.2.1/silero_vad.onnx
+    threshold: 0.5
+    min_silence_duration: 0.5
+    min_speech_duration: 0.15
+    max_speech_duration: 30.0
+    window_size: 512
+  wake:
+    backend: vosk
+    model_path: models/vosk-model-small-cn-0.22
+    grammar:
+      - "现在 开始 语音 操作"
+      - "电脑 开始 操作"
+      - "停止 所有 操作"
+      - "电脑 停止"
+      - "恢复 语音 操作"
+      - "恢复 监听"
+  command:
+    backend: sensevoice
+    model_path: models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17
+    language: zh
+    use_itn: true
+    num_threads: 4
+    provider: cpu
+  fallback:
+    backend: none
+    model: large-v3-turbo
+    device: auto
+    compute_type: auto
+
+planner:
+  enabled: false
+  backend: codex
+  timeout_seconds: 90
+  model: null
+  codex_executable: codex
+  claude_executable: claude
+
+execution:
+  dry_run: true
+  ambiguity_threshold: 0.78
+  max_search_results: 5
+  confirmation_timeout_seconds: 15
+  confirmation_phrases:
+    - "确认执行"
+  cancellation_phrases:
+    - "取消操作"
+    - "不要执行"
+  blocked_keywords:
+    - "删除"
+    - "格式化"
+    - "付款"
+    - "转账"
+    - "输入密码"
+  path_aliases:
+    桌面: "%USERPROFILE%\\Desktop"
+    文档: "%USERPROFILE%\\Documents"
+    下载: "%USERPROFILE%\\Downloads"
+  search_roots: []
+
+apps:
+  codex:
+    process_names: ["ChatGPT.exe", "codex.exe"]
+    executable: null
+    title_patterns: ["ChatGPT", "Codex"]
+    search_hotkey: null
+    native_voice_hotkey: null
+    voice_button_names: []
+  claude:
+    process_names: ["claude.exe"]
+    executable: null
+    title_patterns: ["Claude"]
+    search_hotkey: null
+    native_voice_hotkey: null
+    voice_button_names: []

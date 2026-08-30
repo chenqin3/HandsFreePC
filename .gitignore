@@ -1,0 +1,41 @@
+# Local configuration and secrets
+config.local.yaml
+config*.local.yaml
+config*.local.yml
+*.local.yaml
+*.local.yml
+.env
+.env.*
+*.local.json
+
+# Audio, models, and runtime state
+models/
+recordings/
+runtime/
+*.wav
+*.mp3
+*.m4a
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest-tmp/
+.pytest-tmp*/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs can contain private window/path metadata
+*.log
+logs/

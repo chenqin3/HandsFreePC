@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HandsFreePC action plan",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "maxLength": 200,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "risk": {"type": "string", "enum": ["safe", "confirm", "blocked"]},
+    "actions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "open_path",
+              "activate_app",
+              "open_conversation",
+              "open_mode",
+              "enter_dictation",
+              "start_native_voice",
+              "set_feedback_mode",
+              "type_text",
+              "send_prompt",
+              "pause",
+              "resume",
+              "wait"
+            ]
+          },
+          "path": {"type": ["string", "null"], "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"},
+          "app": {"type": ["string", "null"], "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"},
+          "project": {"type": ["string", "null"], "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"},
+          "conversation": {"type": ["string", "null"], "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"},
+          "tab": {"type": ["string", "null"], "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"},
+          "mode": {"type": ["string", "null"], "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"},
+          "text": {
+            "type": ["string", "null"],
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+          },
+          "feedback_mode": {
+            "type": ["string", "null"],
+            "enum": ["overlay", "voice", "both", "silent", null]
+          },
+          "seconds": {"type": ["number", "null"], "minimum": 0, "maximum": 10}
+        },
+        "required": [
+          "type", "path", "app", "project", "conversation", "tab", "mode",
+          "text", "feedback_mode", "seconds"
+        ]
+      }
+    }
+  },
+  "required": ["summary", "risk", "actions"]
+}
