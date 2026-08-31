@@ -11,10 +11,10 @@ HandsFreePC 不应把“常开麦克风、理解命令、操控桌面、判断�
 1. 单一麦克风采集留在本机，由 Vosk 识别控制词，Silero VAD 与可配置的本地正文 ASR 处理命令；
 2. “开始语音操作”进入连续会话，正文中的独立 `over` 完成一条 prompt，并进入有界 FIFO；
 3. 完整命中的常见命令先走 `NativeSkillRouter`、确定性解析和本地白名单执行器；
-4. 只有确定性 miss、用户在原句中肯定且只指定一个应用、并显式允许转写与屏幕上下文离机时，默认 Claude CLI 才规划**下一步**；Codex CLI 只作额外同意主机读取风险后的 best-effort 备选；
+4. 只有确定性 miss 且显式允许转写与屏幕上下文离机时，默认 Claude CLI 才规划**下一步**；`strict` 要求原句肯定且只指定一个应用，`personal_trusted` 可继承同一控制器刚刚 fresh-verified 的窗口，显式本机 `local_unrestricted` 则无 `APP_SCOPE_REQUIRED` 并可在全部 fresh 可见普通顶层窗口间动态规划；Codex CLI 只作额外同意主机读取风险后的 best-effort 备选；
 5. planner 每次只能返回一个结构化决定，不持有鼠标键盘，也不能通过动作 Schema 请求 shell、坐标点击或任意脚本；
 6. 项目自有 `DesktopDriver` 对每个通用 planner 动作强制任务后置条件 false-before、执行一次、fresh observe 后 true-after，再由本地策略和 `DesktopVerifier` 验收；确定性 native skill 使用动作特定证据，并允许精确状态已成立时幂等成功；
-7. 通用文本输入一律使用绑定到确切动作与界面快照的随机四位一次性确认；点击/按键上下文被本地词形识别为发送、删除、安装、上传/分享、关闭等副作用时也确认，但词表不是完整语义证明，重要任务仍需监督；静态“确认执行”无效；
+7. `strict` 的通用文本输入使用绑定到确切动作与界面快照的随机四位一次性确认，`personal_trusted` 可豁免唯一聚焦非密码输入框中的未发送完整口述草稿；`local_unrestricted` 的普通低风险导航/切换/Toggle/通用无风险对话框不确认，但所有 profile 中被本地词形识别为发送、删除、安装、上传/分享、关闭等高影响副作用时仍确认。词表不是完整语义证明，重要任务仍需监督；静态“确认执行”无效；
 8. 只有本地验收通过才返回 `LOCAL_VERIFIED_COMPLETION`；planner 的 `done` 和 driver 的 `accepted` 都不是成功证据；
 9. 默认用不抢焦点的大字遮罩反馈，可切换为本机语音、两者同时或静默。
 
@@ -62,7 +62,7 @@ Voice Access 很适合作为系统级故障后备，但不作为本项目核心�
 
 ### 2026-09-01 本机中英命令 A/B
 
-在同一批 16 kHz Windows TTS 控制句上，SenseVoice 把“切换到 Claude，打开 Chat and Cowork”转成“切换到 cloud，打开 chat and cowork”，并把另一条 `Claude` 转成 `cloloud`；这会导致应用范围无法唯一绑定。`large-v3-turbo` 配合上述 prompt/hotwords 保留了目标长句中的 `Claude` 与 `Chat and Cowork`。本机 RTX 5000 Ada 在模型已缓存并载入后，短句约 0.16–0.25 秒；首次下载及载入明显更久。这只是合成语音回归，不代表抱娃距离、婴儿声、口音和真实麦克风已经通过。发布验收仍应采集授权的本机真人语音，分别统计应用名/mode 槽位正确率、整句可执行解析率、`APP_SCOPE_REQUIRED` 比率和 P50/P95 延迟。
+在同一批 16 kHz Windows TTS 控制句上，SenseVoice 把“切换到 Claude，打开 Chat and Cowork”转成“切换到 cloud，打开 chat and cowork”，并把另一条 `Claude` 转成 `cloloud`；这会导致应用范围无法唯一绑定。`large-v3-turbo` 配合上述 prompt/hotwords 保留了目标长句中的 `Claude` 与 `Chat and Cowork`。本机 RTX 5000 Ada 在模型已缓存并载入后，短句约 0.16–0.25 秒；首次下载及载入明显更久。这只是合成语音回归，不代表抱娃距离、婴儿声、口音和真实麦克风已经通过。发布验收仍应采集授权的本机真人语音，分别统计应用名/mode 槽位正确率、整句可执行解析率、`strict`/`personal_trusted` 的 `APP_SCOPE_REQUIRED` 比率和 P50/P95 延迟；`local_unrestricted` 应另断言该错误不出现。
 
 ### 历史验证记录（2026-08-30，早期运行时）
 
@@ -103,7 +103,7 @@ HandsFreePC 是登录用户会话中的普通常驻进程，不是系统服务�
 | UI Automation | UIA 可按语义读取元素并调用控件模式 | 0.3 默认 `windows_uia` driver 读取不可变 observation、绑定元素 index、执行一个语义动作并 fresh observe |
 | pywinauto | Python 的 Win32/UIA 自动化库，支持 `uia` 与 `win32` 后端。[pywinauto 文档](https://pywinauto.readthedocs.io/en/latest/) | 项目自有 Win32/UIA driver 的基础库；动作仍受本地 safety 和 verifier 约束 |
 | WinApp CLI | 微软工具可搜索、调用、设值、等待、截图并输出 JSON；官方页面仍标为 Public Preview，Electron 支持有限。[WinApp UI Automation](https://learn.microsoft.com/en-us/windows/apps/dev-tools/winapp-cli/ui-automation) | 调研中的后续候选；0.3 不把它作为默认或唯一依赖 |
-| 局部视觉 | Windows 可捕获单个窗口画面。[Windows Graphics Capture](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture) | 默认 driver 不依赖视觉；实验 MCP driver 可能在本地取得截图，但 safety 重建的 planner view 会移除截图，项目构造的云 prompt 不发送 PNG bytes 或真实截图可用性，也不允许纯坐标点击 |
+| 局部视觉 | Windows 可捕获单个窗口画面。[Windows Graphics Capture](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture) | `strict`/`personal_trusted` 不向 planner 发送截图；显式本机 `local_unrestricted/windows_uia` 会捕获 planner 选中的单个窗口，Codex 可通过临时 `--image` 接收 PNG。它仍不允许纯坐标点击，也不是全桌面截图 |
 
 `SetForegroundWindow` 受 Windows 防抢焦点规则限制，所以“请求激活”失败必须是正常错误分支；不能激活后仍盲目发按键。[SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow) `SendInput` 还受 UIPI 完整性级别限制；普通权限进程不能可靠地向更高权限窗口注入输入。[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)
 
@@ -117,12 +117,12 @@ Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/wi
 
 1. 路径、已配置应用或固定听写能被确定性 parser 完整覆盖时，由 `NativeSkillRouter` 先解析全部目标、完成风险分类并执行；parser 只匹配前半句时视为 miss，不能静默丢掉后半句；
 2. UNC / `//server`、URI 和 Win32 device namespace 在任何文件系统访问前阻断，只接受本地路径合同；模糊路径解析到最终目标后按最终扩展名重新判级；
-3. 确定性 miss 才进入通用 agent loop；用户原句必须肯定且只明确指定一个已配置应用。完整 observation 先在本地检查，再重建为只含本句肯定且精确点名控件的 task-authorized 子集，planner 只能从该子集选择一个 `observe`、`action`、`done` 或 `fail` 决定；
-4. 默认 driver 只接受配置过的应用 profile，按进程名和标题寻找唯一窗口；多窗口只有唯一前台匹配时接受，否则拒绝歧义；
+3. 确定性 miss 才进入通用 agent loop。`strict` 要求用户原句肯定且只明确指定一个已配置应用，`personal_trusted` 只可继承刚刚 fresh-verified 的窗口；显式本机 `local_unrestricted` 则把本轮所有 fresh 可见普通顶层窗口交给 planner，允许动态跨 app，不产生 `APP_SCOPE_REQUIRED`。没有点名 app 时 planner 可自选；一旦原句明确说出 app/window/field，完成对应用户步骤的 action 仍必须 exact bind。planner 每轮仍只能选择一个 `observe`、`action`、`done` 或 `fail` 决定；
+4. `strict`/`personal_trusted` driver 只接受配置过的应用 profile，按进程名和标题寻找唯一窗口；`local_unrestricted` 将每个可见 HWND/PID/process/title 绑定为独立候选，多 Chrome 窗口分别列出，observe 时激活并复核确切 HWND，并在后续规划步骤刷新 inventory；
 5. observation 的元素 index 绑定 `app + HWND + generation`。一次动作后旧 index 立即失效，必须 fresh observe；
 6. 动作只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。已被本地词形/属性识别的认证、密码、terminal/shell、UAC/Windows Security、付款、隐私/公开链接 surface，以及剪贴板和无语义目标的坐标操作 fail closed；
-7. 通用 `type_text`/`set_value` 全部需要确认；点击/按键上下文命中已知发送/提交、删除、安装/卸载、上传/共享、关闭词形时也先生成绑定参数、expectation 和 observation fingerprint 的 confirmation。副作用词表不是完整语义证明，未知词形可能漏分；确认前 fresh observe 并重绑定新 generation，再由 runtime 加上随机四位一次性码；
-8. 每个通用动作先 fresh observe，确认任务相关 expectation 此时为 false，再执行一次；driver `accepted` 只说明动作已发出。随后 `DesktopVerifier` 要求更高 generation、同一应用、状态 fingerprint 变化且同一 expectation 为 true；`type_text`/`set_value` 还必须在新 UIA 状态中看到精确文本；
+7. `strict` 的通用 `type_text`/`set_value` 需要确认，`personal_trusted` 仅豁免未发送的完整口述草稿；`local_unrestricted` 的普通切换/菜单/选项卡/Toggle/未命中风险分类的通用 OK/Continue 对话框不确认。所有 profile 的点击/按键上下文一旦命中已知发送/提交、删除、安装/卸载、上传/共享、关闭词形，仍先生成绑定参数、expectation 和 observation fingerprint 的 confirmation。副作用词表不是完整语义证明，未知词形可能漏分；确认前 fresh observe 并重绑定新 generation，再由 runtime 加上随机四位一次性码；
+8. 每个通用动作先 fresh observe，确认任务相关 expectation 此时为 false，再执行一次；driver `accepted` 只说明动作已发出。随后 `DesktopVerifier` 要求更高 generation、同一应用、状态 fingerprint 变化且同一 expectation 为 true；`type_text`/`set_value` 还必须在新 UIA 状态中看到精确文本。自然“搜索 X”进一步要求搜索/地址字段精确等于 `X`、按 Enter/Return，并出现 fresh `SEARCH_SUBMITTED` 结果语义 transition；
 9. planner 的 `done` 只能给出本地可检查的有限 expectation。只有 `DesktopVerifier` 通过才终止为 `LOCAL_VERIFIED_COMPLETION`。
 
 另有一个仅为兼容旧 `VoiceRuntime` 保留的顶层 `planner.enabled` one-shot fallback，不属于上述逐步 desktop planner。其云输出只可提出原句肯定、非引号/数据引用且精确授权的应用内导航（激活、项目/对话/tab/mode、听写、应用内语音）；反馈、暂停/恢复/等待、路径、文本和发送动作即使出现在云 plan 中也会被本地 safety 阻断。需要确认时，运行时绑定完整 plan/source、规范路径、stat 身份和普通文件 SHA-256，并在确认后重新 prepare、重新 safety、重新 binding；任何变化都取消。
@@ -152,11 +152,11 @@ Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/wi
 
 - 0.3 默认 desktop planner 为 Claude `-p`，因为当前 CLI 能显式使用空 tools、restricted/safe mode 与严格 MCP 配置。Codex `exec` 保留为 `codex_cli_best_effort`，只有 `allow_codex_cli_host_read: true` 后才启用；项目不承诺任一订阅覆盖所有调用、固定模型或额度。
 - 两个 planner 每次调用只能返回一个严格的 `observe`、`action`、`done` 或 `fail` 决定。一次 response 最多一个动作；多步任务由本地 agent loop 逐轮执行，并受 `max_steps` 与总 timeout 限制。最近最多 8 条**本地已验收历史**可进入上下文，这不是“一次返回 8 步计划”。
-- 0.3 桌面动作 Schema 只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。所有通用文本输入都需要本轮随机四位一次性确认；执行前还必须通过当前 observation 绑定、本地界面/动作风险分类、false-before 和动作后 exact true-after 验收。planner 不能请求 shell、坐标字段、密码读取、确认绕过或 UAC 同意。
+- 0.3 桌面动作 Schema 只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。`strict` 的通用文本输入需要本轮随机四位一次性确认，`personal_trusted` 只豁免未发送的完整口述草稿；`local_unrestricted` 允许普通低风险语义动作直通，但被识别的发送/删除/安装/上传/分享/关闭仍确认。执行前还必须通过当前 observation 绑定、本地界面/动作风险分类、false-before 和动作后 exact true-after 验收。planner 不能请求 shell、坐标字段、密码读取、确认绕过或 UAC 同意。
 - Claude adapter 使用独立 system policy、空 tools、safe/restricted 模式、严格 MCP 配置、非交互权限模式和无会话持久化。Codex adapter 使用 ephemeral 空临时目录、结构化输出 Schema、忽略用户配置/规则、过滤环境变量、read-only sandbox 并尽量禁用当前已知工具。两者都没有 HandsFreePC 的 `DesktopDriver`。
 - 启动、非零退出、超时、取消或不合 Schema 的输出全部失败关闭，并返回泛化错误，不回显原始 prompt 或 provider stderr。失败不会自动切换到 `legacy_codex_cli`。
 - Codex CLI 自身仍是当前用户进程；read-only sandbox、deny list、空目录、环境过滤和 prompt 禁令都不是 no-tools 或主机级秘密隔离保证。Claude 空 tools 提供更窄工具面，但认证、遥测和服务端保留仍由提供商与账户设置决定。
-- 云规划默认关闭。打开后，项目构造的 prompt 只包含：完成的一条命令转写、唯一明确授权的可见应用摘要、task-authorized observation generation、最近最多 8 条本地验收历史，以及**本句肯定且精确点名控件**的 index/name/control type/selected/focused/enabled 子集。原始窗口标题、进程 ID、未点名 UI/聊天正文、automation ID、element value、原始音频、截图字节和真实截图可用性不发送；完整 observation 留在本地做 freshness、重绑定与 after-state 验收。该范围只描述 HandsFreePC 主动组装的 prompt，CLI/provider 仍可能附加账户、网络、CLI/OS/runtime、临时工作目录、用量与诊断/遥测等自身元数据。详见根目录的 [PRIVACY.md](../PRIVACY.md)。
+- 云规划默认关闭。`strict`/`personal_trusted` 打开后仍只发送唯一授权 app 摘要和相应裁剪 UIA 子集，不发送真实窗口标题或截图。显式 `local_unrestricted` 则发送全部 fresh 可见顶层窗口的标题/进程摘要、选中窗口真实标题和可寻址 UIA context；Codex 还通过临时 `--image` 接收选中窗口 PNG，Claude CLI adapter 是 text-only，只收文本 inventory/title/UIA context。结构化 `CONTENT` 节点、automation ID、element value、原始音频仍不发送，但截图像素可能包含正文。该范围只描述 HandsFreePC 主动组装的输入，CLI/provider 仍可能附加账户、网络、CLI/OS/runtime、临时工作目录、用量与诊断/遥测等自身元数据。详见根目录的 [PRIVACY.md](../PRIVACY.md)。
 
 ### 历史验证记录（2026-08-30，早期 planner）
 
@@ -177,7 +177,7 @@ Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/wi
 
 反馈可能显示或朗读识别内容、队列状态、错误和确认摘要，因此口述路径/项目名可能被旁观或旁听。TTS 是半双工的：播放期间暂停识别/命令处理，全部播完后丢弃同期麦克风缓冲；用户必须等提示结束再说下一句，否则可能被丢弃。0.3 会检测确认播报失败并强制显示可见错误；但本机是否有可用的中文 SAPI 声音仍需人工听测，默认 `overlay` 更稳妥。
 
-持续会话中的普通任务按 FIFO 进入 `DesktopAgentLoopController`；通用文本输入，以及被本地已知词形/上下文识别为发送、删除等副作用的动作，会暂停队列等待与当前动作/界面绑定的随机四位一次性口令。词表不能穷举副作用语义，重要任务仍需人工看屏幕。用户必须说出提示中的完整“确认执行 + 四位码”；静态“确认执行”无效，runtime 也不会把确认作为新 prompt 交给模型重新解释。同一 `VoiceRuntime` 进程内，已签发码即使取消或超时也不回收，有界重抽耗尽时拒绝；该集合不跨重启持久化，所以随机码不是持久化防重放凭证或说话人认证，也无法阻止旁人、扬声器或实时转述/重放在本轮有效期内代说。急停可请求取消当前任务并清队列，但不能撤回已发生的点击、输入或外部副作用。
+持续会话中的普通任务按 FIFO 进入 `DesktopAgentLoopController`；`strict` 通用文本、`personal_trusted` 中未获草稿豁免的文本，以及所有 profile 中被本地已知词形/上下文识别为发送、删除等高影响副作用的动作，会暂停队列等待与当前动作/界面绑定的随机四位一次性口令。`local_unrestricted` 的普通低风险切换/导航/Toggle/通用无风险对话框不会因此停队。词表不能穷举副作用语义，重要任务仍需人工看屏幕。用户必须说出提示中的完整“确认执行 + 四位码”；静态“确认执行”无效，runtime 也不会把确认作为新 prompt 交给模型重新解释。同一 `VoiceRuntime` 进程内，已签发码即使取消或超时也不回收，有界重抽耗尽时拒绝；该集合不跨重启持久化，所以随机码不是持久化防重放凭证或说话人认证，也无法阻止旁人、扬声器或实时转述/重放在本轮有效期内代说。急停可请求取消当前任务并清队列，但不能撤回已发生的点击、输入或外部副作用。
 
 兼容的确定性听写/应用内语音路径来自早期版本：HandsFreePC 可进入已核验输入框，“电脑发送提示”由本地 parser 识别；`start_native_voice` 在一个计划中只能出现一次、必须位于最后，且不能和反馈模式切换组合。公开 Codex/Claude profile 没有经验证的原生语音 selector，因此这不是 0.3 通用 desktop agent 的成功证明，也不能替通用任务的 fresh-observation/LocalVerifier 验收背书。
 

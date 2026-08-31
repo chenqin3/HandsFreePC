@@ -17,6 +17,15 @@ _APP_ALIASES = {
     # are not global transcript rewrites.
     "cloud": "claude",
     "cloloud": "claude",
+    "chrome": "chrome",
+    "谷歌浏览器": "chrome",
+    "浏览器": "chrome",
+    "资源管理器": "explorer",
+    "文件资源管理器": "explorer",
+    "explorer": "explorer",
+    "微信": "wechat",
+    "wechat": "wechat",
+    "weixin": "wechat",
 }
 
 _APP_NAMES_BY_CANONICAL = {

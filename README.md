@@ -25,15 +25,16 @@ HandsFreePC 让 Windows 11 在双手被占用时继续接受语音操作：说�
 
 - 持续监听、独立 `over` 检测、执行期间继续收音、FIFO、结束后 drain 和急停均保留；公开配置在普通失败后暂停，本机 `failure_policy: continue` 可让后续已入队指令继续；
 - 确定性解析命中时，`NativeSkillRouter` 先解析目标并走本地白名单执行器，不调用模型；
-- 普通桌面任务必须在口述中明确且肯定地只指定一个目标应用，才进入单步 agent loop；零个、多个、仅否定提及或顺带提及应用都会拒绝；
+- 公开默认 `strict` 要求普通桌面任务在口述中明确且肯定地只指定一个目标应用；`personal_trusted` 只可沿用同一控制器中刚刚本地验收的窗口。只在本机忽略提交配置中显式启用的 `local_unrestricted` 会改为重新枚举全部可见顶层窗口，让 planner 自选窗口并跨应用导航，不再产生 `APP_SCOPE_REQUIRED`；
 - 通用 agent 的每个 planner 动作都执行 `fresh before -> 任务后置条件此时必须为 false -> 一个动作 -> fresh after -> 同一后置条件必须为 true`，再交给 LocalVerifier；确定性 native skill 使用各动作自己的本地证据，精确目标状态已成立时可幂等成功；
 - planner 没有鼠标键盘能力，也不能把 shell 命令放入动作 Schema；UI 文本一律按不可信数据处理；
-- 默认 `windows_uia` 驱动把元素索引绑定到应用、窗口和本次 observation generation；动作后旧索引立即失效；
-- 本地有限语法把动作类型、目标完整短语、完整口述输入 payload、按键、左右键/点击次数、secondary action、滚动方向/页数逐项绑定到当前用户步骤；`type/input` 只授权键入，`fill/write` 才授权直接设置字段值；不能把“Open settings”缩成当前唯一可见的“Open”，不能只输入口述文本的子串，也不能借用同句后续输入动作的 payload；若文本动作后还有独立、非空且肯定的 clause，payload 出现不能自证完成，必须验证用户给出的真实结果；条件句在没有本地条件求值器时整体拒绝，尚不支持的尾随桌面动作也会计入步骤数，不能被提前 `DONE` 掩盖；
-- 只有本地 verifier 通过才返回 `LOCAL_VERIFIED_COMPLETION`。驱动“已接受动作”或 planner “done”都不是证据；
+- 默认 `windows_uia` 驱动把元素索引绑定到应用、窗口和本次 observation generation；动作后旧索引立即失效。`local_unrestricted` 还把每个可见顶层 HWND（包括同一进程的多个 Chrome 窗口）作为独立候选，observe 时激活并复核 planner 选中的确切 HWND；
+- `strict`/`personal_trusted` 的本地有限语法把动作类型、目标完整短语、完整口述输入 payload、按键、左右键/点击次数、secondary action、滚动方向/页数逐项绑定到当前用户步骤；`type/input` 只授权键入，`fill/write` 才授权直接设置字段值；不能把“Open settings”缩成当前唯一可见的“Open”，不能只输入口述文本的子串，也不能借用同句后续输入动作的 payload；若文本动作后还有独立、非空且肯定的 clause，payload 出现不能自证完成，必须验证用户给出的真实结果；条件句在没有本地条件求值器时整体拒绝，尚不支持的尾随桌面动作也会计入步骤数，不能被提前 `DONE` 掩盖；
+- 只有本地 verifier 通过才返回 `LOCAL_VERIFIED_COMPLETION`。驱动“已接受动作”或 planner “done”都不是证据；`local_unrestricted` 的 `done` 还会重新观察并复核同一 HWND，多段明确动作必须按口述顺序全部完成，不能用中间结果提前结束；
 - 公开配置默认使用 `strict`：通用 agent 的 `type_text`/`set_value` 文本输入使用绑定到**确切动作与确切界面快照**的确认。仅在本机忽略提交的配置里显式使用 `personal_trusted` 时，才可免确认执行安全导航，以及把用户本句完整口述的草稿写入唯一、已聚焦、非密码输入框；它不会自动点击发送。两种模式下，被本地已知词形识别为发送/提交、删除、安装/卸载、上传/共享、关闭等副作用仍要求确认；认证、密码、付款、UAC 和 Windows Security 界面仍直接阻断。每次确认提示会生成新的随机四位口令；只说静态“确认执行”、口令不匹配、已使用、超时或界面变化都会拒绝；
+- `local_unrestricted` 会取消上述 `APP_SCOPE_REQUIRED`、普通导航目标必须由用户预先点名以及普通低风险导航确认限制，允许 planner 从全部 fresh 可见普通顶层窗口中选择并动态跨应用推断中间导航；普通切换、菜单/选项卡导航、Toggle，以及没有命中风险分类的通用 OK/Continue 对话框动作可直接进入本地验收。用户若明确说出 app/window/field，真正完成该口述步骤的动作仍必须精确绑定到所说窗口和字段，不能在其他窗口或近似输入框“完成”。自然“搜索 X”必须把搜索/地址字段设为精确 `X`、按 Enter/Return，并在 fresh observation 中看到与该查询对应的新结果状态；只写入文字不算搜索完成。识别到的发送/提交、删除、安装、上传/分享和关闭等高影响动作仍要求本轮确认。它仍不是任意电脑权限：终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款和隐私/账户设置继续硬阻断，动作 Schema 仍无任意 shell、文件系统 API 或纯坐标动作；
 - 风险词表和上下文规则不是完整语义证明：未知语言、同义词、自绘控件或伪装文案仍可能漏分。重要外发、删除、安装、分享或不可逆任务必须有人看屏幕监督；
-- 完整本地快照一旦被已知词形/元素属性识别为密码、凭据、付款/转账、认证、隐私/公开链接设置、终端/shell、UAC 或 Windows Security surface 就 fail closed；纯坐标点击默认阻断。未识别 surface 仍是残余风险；
+- 所有 profile 对被已知词形/元素属性识别为密码、凭据、付款/转账、认证、隐私/公开链接设置、终端/shell、Windows Run、UAC 或 Windows Security 的操作 fail closed；纯坐标点击默认阻断。`local_unrestricted` 的窗口 inventory/截图可能早于具体 action 风险分类离机，未识别 surface 也仍是残余风险；
 - 通用 UI 确认摘要若原文显示目标标签，只显示已由用户原句精确授权并再次验证的 exact target label；未授权 sibling/window 标签的原文和语义只在本地参与分类，不进入摘要，摘要中的不可逆短 digest 仅是绑定元数据；
 
 完整设计见 [架构说明](docs/ARCHITECTURE.md) 和 [安全模型](docs/SECURITY_MODEL.md)。
@@ -151,6 +152,18 @@ execution:
 
 公开仓库的 `config.example.yaml` 始终使用 `safety_profile: strict`。上面的 `personal_trusted` 只适合写入不会提交的 `config.local.yaml`，用于本人看着屏幕、目标应用和 Windows 会话都受信任的电脑：它允许 planner 逐步完成安全导航，并把**本句完整口述、未发送的草稿**写入唯一聚焦编辑框，减少抱娃场景下反复念确认码。它不是“关闭全部安全”；发送/提交、删除、上传/分享、安装/卸载、关闭等副作用仍要求本轮随机码，密码/令牌/认证/付款/UAC/Windows Security 仍阻断，纯坐标和 shell 仍不可用。
 
+若希望 planner 接受不点名应用的自然语言、在多个应用或多个 Chrome 顶层窗口之间自行选择并推断中间导航，可只在同一份本机配置中显式改为：
+
+```yaml
+computer_control:
+  driver: windows_uia
+  safety_profile: local_unrestricted
+```
+
+`local_unrestricted` 每条任务都会 fresh 枚举当前可见的全部普通顶层窗口；每个窗口都有独立动态 app ID，后续步骤还会刷新 inventory，planner 因此可以动态跨应用，也不会再因没有预先配置/点名应用而返回 `APP_SCOPE_REQUIRED`。planner 选择 `observe` 后，driver 会激活并复核确切 HWND/PID/process/title，再读取 UIA 和该窗口截图。窗口消失、HWND 被复用、身份变化或无法成为前台都会停止，而不是向近似窗口发送输入。没有点名 app 时 planner 可以自行选择；一旦用户明确说出 app、窗口或字段，完成相应口述步骤的 action 仍必须绑定该 exact window/field，中间跨 app bridge 不能把最终输入或搜索落到别处。
+
+这个模式还允许 planner 推断必要的菜单、选项卡、搜索框等中间步骤。普通切换、菜单/选项卡、Toggle 和未命中风险分类的通用 OK/Continue 对话框不要求确认，但每一步仍必须绑定 fresh semantic target。“搜索 X”无需额外说“输入”，却不是单纯的文本写入：若 UIA 已确认搜索/地址字段为空，可用精确 `type_text`；字段非空或旧值不明时必须用 `set_value` 精确替换为用户原文 `X`。随后还要按 Enter/Return，并用 fresh result transition 验收 `SEARCH_SUBMITTED`；已有 `X` 的较长字符串、追加输入或只看到字段值都不能冒充完成。识别到的发送/提交、删除、安装、上传/分享和关闭等高影响动作仍要求本轮确认。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、纯坐标和任意 shell 仍是硬边界；每个实际动作仍必须经过 fresh bind、执行后重新观察和本地后置条件验收。
+
 若要复现公开项目的最保守行为，改回：
 
 ```yaml
@@ -158,7 +171,9 @@ computer_control:
   safety_profile: strict
 ```
 
-这会把完成的语音 prompt、唯一明确授权的可见应用摘要、observation generation 和最近的本地验收摘要发送给选定的 planner。`strict` 只暴露本句肯定且精确点名的可寻址控件；`personal_trusted` 还可暴露已授权应用内的安全导航控件和当前输入框，但内容层节点始终不进入 planner。原始窗口标题、进程 ID、聊天正文、automation ID、元素 value、原始音频、截图字节和真实截图可用性不进入项目构造的单步 prompt；本地仍保留完整快照用于 freshness 与动作后验收。`allow_screen_context_to_cloud` 仍是必需的，因为可见控件标签和状态也属于屏幕上下文。先登录相应 CLI，再运行：
+`strict`/`personal_trusted` 会把完成的语音 prompt、唯一授权的可见应用摘要、observation generation、经裁剪的可寻址 UIA 控件和最近的本地验收摘要发送给选定 planner；原始窗口标题、截图字节和未授权控件不进入这两个 profile 的 planner view。`local_unrestricted` 的边界更宽：planner 先收到全部 fresh 可见顶层窗口的 display name、process name 和窗口标题；观察某个窗口后还会收到真实窗口标题和经凭据过滤的可寻址 UIA 控件。`CONTENT` 节点、元素 value/automation ID、原始音频和 PCM 仍不作为结构化 planner 字段发送。
+
+在 `local_unrestricted` 中使用 `codex_cli_best_effort` 时，当前窗口截图还会写入一次性临时目录并通过 `codex exec --image` 交给 Codex；它是选中窗口的截图，不是全桌面截图，但仍可能显示聊天、文件名或其他敏感画面。Claude adapter 当前只接收文本化窗口标题/UIA context，不接收这份 PNG。临时文件由本轮 planner 临时目录清理，但 Codex CLI/provider 已处理的数据受其自身政策约束。三种 profile 只要启用云 planner 都必须设置 `allow_screen_context_to_cloud: true`。先登录相应 CLI，再运行：
 
 ```powershell
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor --check-planner-auth --strict
@@ -174,6 +189,22 @@ Claude CLI 是默认规划器，使用独立 system policy、safe/restricted 模
 旧单句运行时若需要确认，`native-...` ID 会绑定完整 plan（含 source）及每个已解析路径的规范绝对路径与 stat 身份；普通文件还绑定 SHA-256。说出本轮随机码后会重新 prepare 目标、重新运行 safety 并重新计算 binding；计划、来源、路径身份或文件内容任一变化都会取消，不会执行替换后的目标。即使 `OPEN_PATH` 被判定为安全目录而无需口令，runtime 和 deterministic native router 也都会在 safety 前后重新绑定目标，并从最后绑定一直持有防替换句柄到本地执行返回。
 
 Electron 应用的可访问标签会随版本变化。`apps.*.mode_names` 同时是 native 模式 allowlist：只有显式 key 可执行，并映射到当前版本的精确 UIA 标签（如 Claude 的 `Chat and Cowork`）；缺少映射会在任何点击前拒绝。执行器只接受精确匹配，并在动作后验证 `selected`。单纯获得键盘焦点只证明点击到控件，不证明页面已经切换。若 Codex/Claude 应用只暴露一个空 Pane、没有可操作子元素，或模式控件不暴露可验证的选中状态，UIA 路径会失败关闭，不能靠模糊匹配或坐标猜测。
+
+### 可选的本地 WorkMap 精确别名
+
+如果本机已经有 WorkMap 导出的 `WORKMAP.md` 和 `projects/`，可以在不提交的 `config.local.yaml` 中为常用项目或项目内相对目录建立精确别名：
+
+```yaml
+workmap:
+  enabled: true
+  out_directory: "<local-workmap-out-directory>"
+  aliases:
+    资料库:
+      project: "<unique-project-title-or-id>"
+      relative_path: "<relative-folder>"
+```
+
+当前生产路由只接受完整、肯定、单一的精确打开请求，例如“打开资料库”；引号、否定、多分句、歧义、目标不存在或相对路径逃出项目根目录都会 miss，并继续走其他路由，而不会做模糊猜测。命中后生成确定性的本地 `OPEN_PATH`，仍走路径绑定、安全策略和本地后置验证。WorkMap 的搜索候选/`planner_hints` 目前**没有接入云 planner**；WorkMap 导出目录、别名和任何本机路径都应只留在 `config.local.yaml`，不要提交到公开仓库。
 
 ## 语音协议
 
@@ -264,8 +295,8 @@ computer_control:
 - 原始音频始终不由该功能落盘；转写默认不落盘，只有显式设置 `privacy.save_transcripts: true` 才写入独立的本机原文日志；
 - 云 planner、电脑控制、屏幕上下文许可和真实执行默认关闭；
 - 不允许任意 shell、PowerShell、Run 对话框或自定义脚本进入桌面动作 Schema；
-- 完整 UIA 名称、标题和页面文本只在本地观察/验收，但仍可能包含敏感信息；云 planner 只接收本句肯定且精确点名控件的最小子集。为降低本地旁观和规则漏检风险，首次验收仍应关闭无关窗口；
-- 上述“当前 prompt 不含音频/截图字节”等范围只描述 HandsFreePC 主动组装的输入；Codex/Claude CLI 及其提供商仍可能处理账户、网络、CLI/OS/runtime、临时工作目录和诊断/遥测等自身元数据，项目开关不能把这层变成零元数据；
+- `strict`/`personal_trusted` 仍只向云 planner 暴露裁剪后的控件子集；`local_unrestricted` 会发送所有 fresh 可见顶层窗口的标题/进程摘要，并在观察后发送真实窗口标题和可寻址 UIA 上下文，Codex 还可接收选中窗口截图。截图和窗口标题可能包含敏感信息；首次验收应关闭无关窗口并使用非敏感账户；
+- 上述数据范围只描述 HandsFreePC 主动组装的输入；Codex/Claude CLI 及其提供商仍可能处理账户、网络、CLI/OS/runtime、临时工作目录和诊断/遥测等自身元数据，项目开关不能把这层变成零元数据；
 - 确定性 `OPEN_PATH` 会要求后置条件先为 false、打开后为 true，且前台 HWND 必须发生变化。Explorer 目录再通过规范化路径精确验证；普通文件目前只能检查新前台窗口标题包含精确文件名，仍是 best-effort。同名文件、不显示文件名或复用同一窗口 HWND 的应用仍需人工检查；
 - 常开麦克风仍会在内存中处理房间声音，包括儿童、访客和远程通话；请遵守告知、同意和当地法律；
 - 随机四位口令在本次进程运行期内不复用，降低固定录音重放风险；但它不是持久凭证，没有说话人识别，重启后也不保证绝对不复用，更不能抵御旁人、扬声器或实时转述/重放听到本轮口令后代说；高风险动作必须有人看屏幕监督；
@@ -285,4 +316,4 @@ computer_control:
 
 ---
 
-**English summary:** HandsFreePC 0.3.1 keeps continuous local speech input, independent offline English-Vosk `over` detection, and FIFO execution, but replaces model-owned mouse/keyboard control with an owned Windows UIA driver. Claude CLI is the default strict step planner. Codex CLI is an explicit best-effort alternative that requires host-read consent and is not a guaranteed no-tools mode. Every generic planner action requires a false-before/true-after local postcondition; deterministic native skills use action-specific local evidence and may succeed idempotently when the exact target state already holds. The public `strict` profile requires a fresh random four-digit confirmation for generic text entry; an explicitly local `personal_trusted` profile may enter the user's exact spoken draft into one focused non-password field, but never auto-sends it and retains confirmation/blocking for side effects and sensitive surfaces. Cloud planning and live control remain disabled by default. The legacy Codex Computer Use controller and Qwen open-computer-use 0.2.3 adapter are explicit, non-default compatibility/experimental options.
+**English summary:** HandsFreePC 0.3.1 keeps continuous local speech input, independent offline English-Vosk `over` detection, and FIFO execution, but replaces model-owned mouse/keyboard control with an owned Windows UIA driver. Claude CLI is the default strict, text-only step planner. Codex CLI is an explicit best-effort alternative that requires host-read consent, can receive the selected-window screenshot in `local_unrestricted`, and is not a guaranteed no-tools mode. Every generic planner action requires a fresh binding and a false-before/true-after local postcondition; deterministic native skills use action-specific local evidence. Public defaults remain disabled and `strict`. An explicitly local, uncommitted `local_unrestricted` profile removes `APP_SCOPE_REQUIRED`, dynamically enumerates every visible ordinary top-level window, and permits inferred cross-app low-risk navigation without confirmation. An explicitly spoken app/window/field still binds the exact user step; natural search requires the exact query, Enter/Return, and a fresh result transition. Recognized send/delete/install/upload/share/close actions still require confirmation. Terminal/Run/UAC/authentication/password/credential/payment/privacy surfaces, coordinate-only actions, and arbitrary shell remain hard boundaries. WorkMap execution currently uses exact local aliases only; planner hints are not attached to cloud prompts.

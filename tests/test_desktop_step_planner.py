@@ -154,6 +154,45 @@ def test_codex_command_is_ephemeral_config_free_read_only_and_returns_one_step(m
     assert "打开 Claude 的 Chat" in process.inputs[0]
 
 
+def test_codex_planner_receives_the_fresh_local_window_screenshot(monkeypatch):
+    popen = RecordingPopen(_decision_payload())
+    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "codex-test.exe")
+    planner = CodexDesktopStepPlanner(
+        executable="codex",
+        model=None,
+        timeout_seconds=1,
+        safety_profile="local_unrestricted",
+        popen_factory=popen,
+    )
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text='0 name="Chat" control_type="TabItem"',
+        screenshot_png=b"\x89PNG\r\n\x1a\nfixture",
+        window_title="Claude",
+    )
+
+    planner.decide(
+        "打开 Claude 的 Chat",
+        apps='[{"app":"claude"}]',
+        observation=observation,
+        history=(),
+    )
+
+    args = popen.processes[0].args
+    assert "--image" in args
+    assert Path(args[args.index("--image") + 1]).name == "observation.png"
+
+
+def test_local_unrestricted_policy_supports_unscoped_cross_app_search():
+    policy = step_planner._planner_policy("local_unrestricted")
+
+    assert "choose any application" in policy
+    assert "across listed applications" in policy
+    assert "search for X" in policy
+    assert "return done with app_visible" in policy
+
+
 def test_claude_command_explicitly_disables_all_tools_and_session_persistence(monkeypatch):
     popen = RecordingPopen(_decision_payload(), claude=True)
     monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "claude-test.exe")
@@ -199,6 +238,35 @@ def test_claude_command_explicitly_disables_all_tools_and_session_persistence(mo
     assert data_prompt["observation"]["app"] == "claude"
 
 
+def test_claude_text_only_prompt_does_not_claim_a_local_screenshot_was_supplied(monkeypatch):
+    popen = RecordingPopen(_decision_payload(), claude=True)
+    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "claude-test.exe")
+    planner = ClaudeDesktopStepPlanner(
+        executable="claude",
+        model=None,
+        timeout_seconds=1,
+        safety_profile="local_unrestricted",
+        popen_factory=popen,
+    )
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text='0 name="Chat" control_type="TabItem"',
+        screenshot_png=b"local-window-png",
+        window_title="Claude",
+    )
+
+    planner.decide(
+        "打开 Chat",
+        apps='[{"app":"claude"}]',
+        observation=observation,
+        history=(),
+    )
+
+    data_prompt = json.loads(popen.processes[0].inputs[0])
+    assert data_prompt["observation"]["screenshot_available"] is False
+
+
 def test_personal_trusted_planner_policy_allows_only_safe_navigation_bridges(monkeypatch):
     popen = RecordingPopen(_decision_payload(), claude=True)
     monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "claude-test.exe")
@@ -239,10 +307,33 @@ def test_strict_and_personal_navigation_policies_are_mutually_exclusive():
     assert "Strict navigation mode is enabled" not in personal
 
 
-def test_desktop_step_schema_avoids_top_level_combinators_rejected_by_claude_cli():
+def test_desktop_step_schema_avoids_combinators_rejected_by_cli_structured_output():
     schema = json.loads(step_planner.desktop_step_schema_path().read_text(encoding="utf-8"))
 
-    assert {"allOf", "anyOf", "oneOf"}.isdisjoint(schema)
+    def mappings(value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from mappings(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from mappings(child)
+
+    assert all(
+        {"allOf", "anyOf", "oneOf", "if", "then", "else"}.isdisjoint(mapping)
+        for mapping in mappings(schema)
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [r"C:\Users\Example\secret.txt", "C:/Users/Example/secret.txt"],
+)
+def test_bounded_cli_error_redacts_both_windows_path_separator_styles(path: str):
+    value = step_planner._bounded_cli_error(f'error: could not read "{path}"')
+
+    assert "[LOCAL_PATH]" in value
+    assert "Users" not in value
 
 
 class NeverCompletesProcess:

@@ -32,6 +32,7 @@ class DesktopSafetyDisposition(StrEnum):
 class DesktopSafetyProfile(StrEnum):
     STRICT = "strict"
     PERSONAL_TRUSTED = "personal_trusted"
+    LOCAL_UNRESTRICTED = "local_unrestricted"
 
 
 class DesktopActionBinding(StrEnum):
@@ -639,6 +640,7 @@ def _mask_navigation_pin(context: str) -> str:
         context,
     )
 
+
 _CLAUSE_BOUNDARY_RE = re.compile(
     r"[，。；,;.!！？?\n]|但是|不过|然后|并且|而且|以及|但|\b(?:but|then|and)\b",
     re.IGNORECASE,
@@ -664,15 +666,17 @@ _PURE_NEGATED_TEXT_SIDE_CLAUSE_RE = re.compile(
 )
 _POLITE_TAIL_RE = re.compile(r"\s*(?:please|kindly|请|谢谢)\s*", re.IGNORECASE)
 _AFFIRMATIVE_ACTION_RE = re.compile(
-    r"(?:点击|点开|打开|开启|选择|切换到|切换至|进入|查看|按下|滚动|"
+    r"(?:点击|点开|打开|开启|选择|切换到|切换至|进入|查看|按(?:下|一下)?|滚动|"
     r"输入|填写|写入|激活|执行|操作|使用|删除|关闭|验证|核验|检查|看到|显示|"
+    r"搜索|查找|检索|搜一下|搜一搜|"
     r"\b(?:click|open|choose|select|switch|enter|view|show|press|scroll|"
-    r"type|input|fill|write|activate|execute|operate|use|delete|close|verify|check|focus)\b|"
+    r"type|input|fill|write|search|find|look\s+up|activate|execute|operate|use|delete|"
+    r"close|verify|check|focus)\b|"
     r"聚焦)",
     re.IGNORECASE,
 )
 _ACTIVATION_TARGET_RE = re.compile(
-    r"(?:点击|点开|打开|开启|选择|切换到|切换至|进入|按下(?:tab|制表|回车|空格|退出|方向键)?|激活|执行|操作|使用|"
+    r"(?:点击|点开|打开|开启|选择|切换到|切换至|进入|按(?:下|一下)?(?:tab|制表|回车|空格|退出|方向键)?|激活|执行|操作|使用|"
     r"删除|关闭|展开|折叠|"
     r"\b(?:click|open|choose|select|switch|enter|press(?:\s+(?:tab|shift\+tab|enter|"
     r"return|escape|space|pageup|pagedown|home|end|left|up|right|down))?|"
@@ -682,7 +686,8 @@ _ACTIVATION_TARGET_RE = re.compile(
 )
 _APP_CONTROL_TARGET_RE = re.compile(
     rf"(?:{_ACTIVATION_TARGET_RE.pattern}|(?:查看|检查|核验|验证|聚焦|"
-    r"\b(?:view|check|verify|focus|inspect)\b))",
+    r"搜索|查找|检索|搜一下|搜一搜|"
+    r"\b(?:view|check|verify|focus|inspect|search|find|look\s+up)\b))",
     re.IGNORECASE,
 )
 _SCROLL_TARGET_RE = re.compile(r"(?:滚动|\bscroll\b)", re.IGNORECASE)
@@ -701,6 +706,27 @@ _TEXT_PAYLOAD_ACTION_RE = re.compile(
     rf"(?:{_TYPE_TEXT_ACTION_RE.pattern}|{_SET_VALUE_ACTION_RE.pattern})",
     re.IGNORECASE,
 )
+_NATURAL_SEARCH_ACTION_RE = re.compile(
+    r"(?:搜索|查找|检索|搜一下|搜一搜|\b(?:search|find|look\s+up)\b)",
+    re.IGNORECASE,
+)
+_PREPOSED_APP_FIELD_ACTION_RE = re.compile(
+    rf"[^，。；,;.!！？?\n]{{1,96}}?(?:{_TEXT_PAYLOAD_ACTION_RE.pattern}|"
+    rf"{_NATURAL_SEARCH_ACTION_RE.pattern})",
+    re.IGNORECASE,
+)
+_WINDOW_ACTIVATION_ACTION_RE = re.compile(
+    r"(?:切换到|切换至|切到|转到|打开|启动|进入|激活|显示|"
+    r"\b(?:switch(?:\s+to)?|go\s+to|navigate\s+to|open|launch|activate|focus|show)\b)",
+    re.IGNORECASE,
+)
+_NATURAL_SEARCH_FILLER_RE = re.compile(
+    r"\s*(?:(?:for|the|一下|一搜|内容|关键词)\s+)*",
+    re.IGNORECASE,
+)
+_SEARCH_INPUT_IDENTITY_RE = re.compile(
+    r"(?i)\b(?:search|find|address\s+and\s+search)\b|搜索|查找|地址栏"
+)
 _EDITABLE_CONTROL_TYPES = frozenset({"edit", "document", "combobox", "spinner"})
 _UNSUPPORTED_DESKTOP_ACTION_RE = re.compile(
     r"(?:拖动|拖拽|悬停|移动|调整大小|缩放|双击|右键(?:点击)?|下载|复制|重命名|"
@@ -708,8 +734,8 @@ _UNSUPPORTED_DESKTOP_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _USER_ACTION_VERB_RE = re.compile(
-    rf"(?:{_UNSUPPORTED_DESKTOP_ACTION_RE.pattern}|{_ACTIVATION_TARGET_RE.pattern}|"
-    rf"{_TEXT_PAYLOAD_ACTION_RE.pattern}|"
+    rf"(?:{_UNSUPPORTED_DESKTOP_ACTION_RE.pattern}|{_NATURAL_SEARCH_ACTION_RE.pattern}|"
+    rf"{_ACTIVATION_TARGET_RE.pattern}|{_TEXT_PAYLOAD_ACTION_RE.pattern}|"
     rf"{_SCROLL_TARGET_RE.pattern})",
     re.IGNORECASE,
 )
@@ -811,17 +837,20 @@ _PREPOSED_TEXT_TARGET_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _POLITE_IMPERATIVE_PREFIX_RE = re.compile(
-    r"\s*(?:(?:please|kindly)\s+|(?:请|麻烦|帮我)\s*)*"
+    r"\s*(?:(?:first|then|next)\s+|(?:先|再|接着|随后|然后)\s*)*"
+    r"(?:(?:please|kindly)\s+|(?:请|麻烦|帮我)\s*)*"
     r"(?:(?:only)\s+|(?:只|仅|仅仅)\s*)?",
     re.IGNORECASE,
 )
 _ENGLISH_APP_LOCATION_PREFIX_RE = re.compile(
-    r"\s*(?:(?:please|kindly)\s+)*(?:in|inside|within|on)\s+(?:the\s+)?"
+    r"\s*(?:(?:first|then|next)\s+)*(?:(?:please|kindly)\s+)*"
+    r"(?:in|inside|within|on)\s+(?:the\s+)?"
     r"[a-z0-9_.+ -]{1,128}(?:\s+(?:app|application))?\s*",
     re.IGNORECASE,
 )
 _CHINESE_APP_LOCATION_PREFIX_RE = re.compile(
-    r"\s*(?:(?:请|麻烦|帮我)\s*)*(?:在|于)\s*"
+    r"\s*(?:(?:先|再|接着|随后|然后)\s*)*(?:(?:请|麻烦|帮我)\s*)*"
+    r"(?:在|于|用|使用)\s*"
     r"(?!(?:我|如果|若|当|因为|由于|之后|之前))"
     r"(?:[a-z0-9_.+-]+(?:\s+[a-z0-9_.+-]+){0,5}|[\u3400-\u9fff]{2,32})"
     r"(?:\s*(?:app|应用|程序|窗口))?(?:\s*(?:里|中|内|里面|上))?"
@@ -1498,7 +1527,7 @@ def _verb_matches_action_type(verb: re.Match[str], action_type: DesktopActionTyp
         return _SCROLL_TARGET_RE.fullmatch(verb.group()) is not None
     is_key_press = (
         re.fullmatch(
-            r"(?:按下(?:tab|制表|回车|空格|退出|方向键)?|"
+            r"(?:按(?:下|一下)?(?:tab|制表|回车|空格|退出|方向键)?|"
             r"press(?:\s+(?:tab|shift\+tab|enter|return|escape|space|pageup|pagedown|"
             r"home|end|left|up|right|down))?)",
             verb.group(),
@@ -1528,9 +1557,7 @@ def _target_spans_for_verb(
         # (for example Claude's "Chat and Cowork"). Boundaries inside that
         # exact target span are label data, not a second user action.
         target_boundaries = tuple(
-            match
-            for match in boundaries
-            if not (start <= match.start() and match.end() <= end)
+            match for match in boundaries if not (start <= match.start() and match.end() <= end)
         )
         clause_start = max(
             (match.end() for match in target_boundaries if match.end() <= verb.start()),
@@ -1619,6 +1646,81 @@ def _payload_belongs_to_verb(
         if payload_value == spoken_payload:
             return True
     return False
+
+
+def _natural_search_payload_for_verb(
+    user_text: str,
+    verb: re.Match[str],
+) -> str | None:
+    source = _normalized(user_text)
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    quote_ranges = _quoted_ranges(source)
+    if any(start <= verb.start() and verb.end() <= end for start, end in quote_ranges):
+        return None
+    clause_start = max(
+        (match.end() for match in boundaries if match.end() <= verb.start()),
+        default=0,
+    )
+    clause_end = min(
+        (match.start() for match in boundaries if match.start() >= verb.end()),
+        default=len(source),
+    )
+    clause = _mask_quoted_text(source, clause_start, clause_end)
+    if _NEGATED_ACTION_RE.search(clause):
+        return None
+    prefix = source[clause_start : verb.start()]
+    if not _imperative_prefix(prefix):
+        return None
+    payload_start = verb.end()
+    filler = _NATURAL_SEARCH_FILLER_RE.match(source, payload_start)
+    if filler is not None:
+        payload_start = filler.end()
+    spoken_payload = source[payload_start:clause_end].strip()
+    for opening, closing in _PAIRED_QUOTES:
+        if (
+            spoken_payload.startswith(opening)
+            and spoken_payload.endswith(closing)
+            and len(spoken_payload) >= len(opening) + len(closing)
+        ):
+            spoken_payload = spoken_payload[len(opening) : -len(closing)].strip()
+            break
+    if not spoken_payload or _has_negated_candidate_occurrence(spoken_payload, user_text):
+        return None
+    return spoken_payload
+
+
+def _positive_natural_search_payloads(user_text: str) -> tuple[str, ...]:
+    """Return exact affirmative natural-search payloads outside quoted instructions."""
+
+    source = _normalized(user_text)
+    payloads: list[str] = []
+    for verb in _NATURAL_SEARCH_ACTION_RE.finditer(source):
+        spoken_payload = _natural_search_payload_for_verb(user_text, verb)
+        if spoken_payload is None:
+            continue
+        if spoken_payload not in payloads:
+            payloads.append(spoken_payload)
+    return tuple(payloads)
+
+
+def _natural_search_payload_authorized(payload: str, user_text: str) -> bool:
+    normalized = _normalized(payload)
+    return bool(normalized) and normalized in _positive_natural_search_payloads(user_text)
+
+
+def natural_search_step_count(user_text: str) -> int:
+    return sum(
+        1
+        for verb in _positive_user_action_verbs(user_text)
+        if _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is not None
+    )
+
+
+def _is_search_input(target: DesktopElement | None) -> bool:
+    if target is None or element_plane(target) != ElementPlane.INPUT:
+        return False
+    identity = "\n".join((target.name, target.automation_id or ""))
+    return _SEARCH_INPUT_IDENTITY_RE.search(identity) is not None
 
 
 def _step_has_explicit_outcome(
@@ -1732,6 +1834,14 @@ def action_matches_next_user_step(
     if completed_steps < 0 or completed_steps >= len(verbs):
         return False
     verb = verbs[completed_steps]
+    if _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is not None:
+        key = _normalized(action.key or "").replace(" ", "")
+        return bool(
+            action.type == DesktopActionType.PRESS_KEY
+            and key in {"enter", "return"}
+            and _SEARCH_INPUT_IDENTITY_RE.search(target_label)
+            and _natural_search_payload_for_verb(user_text, verb)
+        )
     if not _verb_matches_action_type(verb, action.type):
         return False
     target_spans = _target_spans_for_verb(
@@ -1841,6 +1951,19 @@ def expectation_matches_user_step(
     if completed_steps < 0 or completed_steps >= len(verbs):
         return False
     verb = verbs[completed_steps]
+    if _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is not None:
+        payload = _natural_search_payload_for_verb(user_text, verb)
+        return bool(
+            payload
+            and expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED
+            and _normalized(expectation.text or "") == _normalized(payload)
+            and action_matches_next_user_step(
+                action,
+                target_label,
+                user_text,
+                completed_steps=completed_steps,
+            )
+        )
     target_spans = _target_spans_for_verb(target_label, user_text, verb, action.type)
     if not target_spans:
         return False
@@ -1889,18 +2012,15 @@ def expectation_matches_user_step(
             ):
                 continue
             if start == target_start and end == target_end:
-                return (
-                    expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
-                    and (
-                        _SELECTION_ACTION_RE.fullmatch(verb.group()) is not None
-                        or (
-                            action.type
-                            in {
-                                DesktopActionType.CLICK,
-                                DesktopActionType.PERFORM_SECONDARY_ACTION,
-                            }
-                            and _ACTIVATION_TARGET_RE.fullmatch(verb.group()) is not None
-                        )
+                return expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED and (
+                    _SELECTION_ACTION_RE.fullmatch(verb.group()) is not None
+                    or (
+                        action.type
+                        in {
+                            DesktopActionType.CLICK,
+                            DesktopActionType.PERFORM_SECONDARY_ACTION,
+                        }
+                        and _ACTIVATION_TARGET_RE.fullmatch(verb.group()) is not None
                     )
                 )
             if start < target_end:
@@ -1918,6 +2038,131 @@ def expectation_matches_user_step(
 
 def user_action_step_count(user_text: str) -> int:
     return len(_positive_user_action_verbs(user_text))
+
+
+def user_action_step_clause(user_text: str, *, step: int) -> str | None:
+    """Return same-sentence context through one parsed user step.
+
+    App locations are commonly spoken before a pause (``In Claude, type`` or
+    ``在 Chrome，搜索``).  A comma/``then`` therefore ends the current action but
+    must not erase the most recent app location.  Hard sentence boundaries do
+    end that inherited location.
+    """
+
+    source = _normalized(user_text)
+    verbs = _positive_user_action_verbs(user_text)
+    if step < 0 or step >= len(verbs):
+        return None
+    verb = verbs[step]
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    hard_boundaries = tuple(re.finditer(r"[。；;.!！？?\n]", source))
+    clause_start = max(
+        (match.end() for match in hard_boundaries if match.end() <= verb.start()),
+        default=0,
+    )
+    clause_end = min(
+        (match.start() for match in boundaries if match.start() >= verb.end()),
+        default=len(source),
+    )
+    clause = source[clause_start:clause_end].strip()
+    return clause or None
+
+
+def text_step_has_explicit_target(user_text: str, *, step: int) -> bool:
+    verbs = _positive_user_action_verbs(user_text)
+    if step < 0 or step >= len(verbs):
+        return False
+    verb = verbs[step]
+    if not (
+        _TYPE_TEXT_ACTION_RE.fullmatch(verb.group())
+        or _SET_VALUE_ACTION_RE.fullmatch(verb.group())
+    ):
+        return False
+    source = _normalized(user_text)
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    clause_start = max(
+        (match.end() for match in boundaries if match.end() <= verb.start()),
+        default=0,
+    )
+    clause_end = min(
+        (match.start() for match in boundaries if match.start() >= verb.end()),
+        default=len(source),
+    )
+    prefix = source[clause_start : verb.start()]
+    if re.search(r"(?:的|['’]s)\s*[^\s，。；,;.!！？?]+\s*$", prefix, re.IGNORECASE):
+        return True
+    if re.search(r"(?:输入框|字段|\b(?:field|box|editor|composer)\b)\s*$", prefix, re.IGNORECASE):
+        return True
+    payload_end = max(
+        (
+            end
+            for start, end in _text_payload_ranges(source)
+            if verb.end() <= start and end <= clause_end
+        ),
+        default=verb.end(),
+    )
+    suffix = source[payload_end:clause_end]
+    return bool(
+        re.fullmatch(
+            r"\s*(?:(?:into|in|to)\b|(?:到|至|进))\s*\S[^，。；,;.!！？?]*\s*",
+            suffix,
+            re.IGNORECASE,
+        )
+    )
+
+
+def target_matches_explicit_text_step(
+    target_label: str,
+    user_text: str,
+    *,
+    step: int,
+) -> bool:
+    verbs = _positive_user_action_verbs(user_text)
+    if step < 0 or step >= len(verbs) or not target_label.strip():
+        return False
+    verb = verbs[step]
+    action_type = (
+        DesktopActionType.TYPE_TEXT
+        if _TYPE_TEXT_ACTION_RE.fullmatch(verb.group()) is not None
+        else DesktopActionType.SET_VALUE
+        if _SET_VALUE_ACTION_RE.fullmatch(verb.group()) is not None
+        else None
+    )
+    return bool(
+        action_type is not None
+        and _target_spans_for_verb(
+            target_label,
+            user_text,
+            verb,
+            action_type,
+        )
+    )
+
+
+def window_activation_matches_next_user_step(
+    target_labels: tuple[str, ...],
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Bind a fresh exact-window activation to the next explicit spoken step."""
+
+    verbs = _positive_user_action_verbs(user_text)
+    if completed_steps < 0 or completed_steps >= len(verbs):
+        return False
+    verb = verbs[completed_steps]
+    if _WINDOW_ACTIVATION_ACTION_RE.fullmatch(verb.group()) is None:
+        return False
+    return any(
+        label.strip()
+        and _target_spans_for_verb(
+            label,
+            user_text,
+            verb,
+            DesktopActionType.CLICK,
+        )
+        for label in target_labels
+    )
 
 
 def affirmatively_authorized_action_reference(candidate: str, user_text: str) -> bool:
@@ -2001,10 +2246,12 @@ def affirmatively_authorized_app_scope(candidate: str, user_text: str) -> bool:
         scope_anchor = english_scope if english_scope is not None else chinese_scope
         assert scope_anchor is not None
         preposed_prefix = prefix[: scope_anchor.start()]
-        if _POLITE_IMPERATIVE_PREFIX_RE.fullmatch(
-            preposed_prefix
-        ) is not None and _AFFIRMATIVE_ACTION_RE.match(scoped_suffix.lstrip()):
-            return True
+        if _POLITE_IMPERATIVE_PREFIX_RE.fullmatch(preposed_prefix) is not None:
+            scoped_action = scoped_suffix.lstrip()
+            if _AFFIRMATIVE_ACTION_RE.match(scoped_action) or (
+                _PREPOSED_APP_FIELD_ACTION_RE.match(scoped_action)
+            ):
+                return True
         trailing_outcome = _APP_TRAILING_OUTCOME_RE.fullmatch(scoped_suffix) is not None
         if (not scoped_suffix.strip() or trailing_outcome) and scope_anchor is not None:
             prior_scope = prefix[: scope_anchor.start()]
@@ -2049,9 +2296,9 @@ def affirmatively_authorized_app_scope(candidate: str, user_text: str) -> bool:
                     preceding_start,
                     preceding_delimiter.start(),
                 )
-                if not _NEGATED_ACTION_RE.search(
+                if not _NEGATED_ACTION_RE.search(preceding) and _AFFIRMATIVE_ACTION_RE.search(
                     preceding
-                ) and _AFFIRMATIVE_ACTION_RE.search(preceding):
+                ):
                     return True
         delimiter = next(
             (match for match in boundaries if match.start() == clause_end),
@@ -2411,11 +2658,10 @@ def _is_named_dynamic_navigation_target(
 ) -> bool:
     """Treat an explicitly named chat/project title as data, not an action verb."""
 
-    if (
-        target is None
-        or action.type
-        not in {DesktopActionType.CLICK, DesktopActionType.PERFORM_SECONDARY_ACTION}
-    ):
+    if target is None or action.type not in {
+        DesktopActionType.CLICK,
+        DesktopActionType.PERFORM_SECONDARY_ACTION,
+    }:
         return False
     control_type = _normalized(target.control_type)
     normalized_name = _normalized(target.name)
@@ -2430,12 +2676,8 @@ def _is_named_dynamic_navigation_target(
         or (
             target.automation_id
             and (
-                _DIRECT_SIDE_EFFECT_CONTROL_RE.fullmatch(
-                    _normalized(target.automation_id)
-                )
-                or _DYNAMIC_SENSITIVE_CONTROL_RE.fullmatch(
-                    _normalized(target.automation_id)
-                )
+                _DIRECT_SIDE_EFFECT_CONTROL_RE.fullmatch(_normalized(target.automation_id))
+                or _DYNAMIC_SENSITIVE_CONTROL_RE.fullmatch(_normalized(target.automation_id))
             )
         )
     ):
@@ -2626,7 +2868,11 @@ class DesktopSafetyPolicy:
         target: DesktopElement | None,
     ) -> bool:
         return bool(
-            self.profile == DesktopSafetyProfile.PERSONAL_TRUSTED
+            self.profile
+            in {
+                DesktopSafetyProfile.PERSONAL_TRUSTED,
+                DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+            }
             and action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
             and target is not None
             and target.enabled
@@ -2646,7 +2892,11 @@ class DesktopSafetyPolicy:
         target: DesktopElement | None,
     ) -> bool:
         if (
-            self.profile != DesktopSafetyProfile.PERSONAL_TRUSTED
+            self.profile
+            not in {
+                DesktopSafetyProfile.PERSONAL_TRUSTED,
+                DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+            }
             or target is None
             or not target.enabled
             or not target.addressable
@@ -2700,6 +2950,12 @@ class DesktopSafetyPolicy:
     ) -> DesktopActionBinding | None:
         """Bind trusted local navigation without pretending it was user-spoken."""
 
+        if self.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED:
+            return (
+                DesktopActionBinding.USER_STEP
+                if target is not None and expectation is not None
+                else None
+            )
         if self.profile != DesktopSafetyProfile.PERSONAL_TRUSTED or target is None:
             return None
         if expectation is None:
@@ -2722,9 +2978,7 @@ class DesktopSafetyPolicy:
             if 0 <= completed_steps < len(verbs):
                 verb = verbs[completed_steps]
                 payload = (
-                    action.text
-                    if action.type == DesktopActionType.TYPE_TEXT
-                    else action.value
+                    action.text if action.type == DesktopActionType.TYPE_TEXT else action.value
                 )
                 expected = _normalized(expectation.text or "")
                 if (
@@ -2767,7 +3021,11 @@ class DesktopSafetyPolicy:
         last_action: DesktopAction | None,
     ) -> bool:
         if (
-            self.profile != DesktopSafetyProfile.PERSONAL_TRUSTED
+            self.profile
+            not in {
+                DesktopSafetyProfile.PERSONAL_TRUSTED,
+                DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+            }
             or expectation is None
             or last_action is None
             or last_action.type not in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
@@ -2789,6 +3047,38 @@ class DesktopSafetyPolicy:
                 _normalized(expectation.text or "") == _normalized(payload)
                 or _expectation_semantically_authorized(expectation, user_text)
             )
+        )
+
+    def accepts_unrestricted_terminal_condition(
+        self,
+        expectation: DesktopExpectation | None,
+        *,
+        user_text: str,
+    ) -> bool:
+        """Bind unrestricted DONE to an affirmative user-authored observable goal."""
+
+        if (
+            self.profile != DesktopSafetyProfile.LOCAL_UNRESTRICTED
+            or expectation is None
+            or not expectation.text
+            or user_action_step_count(user_text) > 1
+        ):
+            return False
+        if _expectation_semantically_authorized(expectation, user_text):
+            return True
+        if expectation.kind in {
+            DesktopExpectationKind.TEXT_PRESENT,
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+        } and _affirmatively_authorized_span(expectation.text, user_text):
+            return True
+        return bool(
+            expectation.kind
+            in {
+                DesktopExpectationKind.TEXT_PRESENT,
+                DesktopExpectationKind.FOCUSED_CONTAINS,
+            }
+            and _natural_search_payload_authorized(expectation.text, user_text)
         )
 
     def planner_observation(
@@ -2828,6 +3118,7 @@ class DesktopSafetyPolicy:
         competing_labels = tuple(
             element.name for element in addressable_elements if element.name.strip()
         )
+        unrestricted = self.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
         for element in addressable_elements:
             normalized_name = _normalized(element.name.strip())
             plane = element_plane(element)
@@ -2836,12 +3127,23 @@ class DesktopSafetyPolicy:
                 user_text,
                 competing_labels=competing_labels,
             )
-            safe_personal_navigation = self.profile == DesktopSafetyProfile.PERSONAL_TRUSTED and (
+            safe_personal_navigation = self.profile in {
+                DesktopSafetyProfile.PERSONAL_TRUSTED,
+                DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+            } and (
                 (plane == ElementPlane.CONTROL and element.enabled)
-                or (plane == ElementPlane.INPUT and element.focused is True and element.enabled)
+                or (
+                    plane == ElementPlane.INPUT
+                    and element.enabled
+                    and (unrestricted or element.focused is True)
+                )
             )
             unnamed_trusted_composer = bool(
-                self.profile == DesktopSafetyProfile.PERSONAL_TRUSTED
+                self.profile
+                in {
+                    DesktopSafetyProfile.PERSONAL_TRUSTED,
+                    DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+                }
                 and not normalized_name
                 and element.composer
                 and unique_focused_input == [element.index]
@@ -2849,16 +3151,20 @@ class DesktopSafetyPolicy:
             if (
                 element.password
                 or (not normalized_name and not unnamed_trusted_composer)
-                or (normalized_name and name_counts.get(normalized_name) != 1)
+                or (not unrestricted and normalized_name and name_counts.get(normalized_name) != 1)
             ):
                 continue
             # Both high-confidence credentials and low-confidence opaque IDs
             # stay local. Low findings are privacy redactions, never a reason
             # to block the whole application.
-            if element.high_credential or element.low_credential or credential_findings(
-                element.name,
-                field="name",
-                element_index=element.index,
+            if (
+                element.high_credential
+                or element.low_credential
+                or credential_findings(
+                    element.name,
+                    field="name",
+                    element_index=element.index,
+                )
             ):
                 continue
             if not named_by_user and not safe_personal_navigation:
@@ -2894,8 +3200,16 @@ class DesktopSafetyPolicy:
             app=observation.app,
             generation=observation.generation,
             accessibility_text="\n".join(lines),
-            screenshot_png=None,
-            window_title=f"{observation.app} task-authorized UI subset",
+            screenshot_png=(
+                observation.screenshot_png
+                if self.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
+                else None
+            ),
+            window_title=(
+                observation.window_title
+                if unrestricted
+                else f"{observation.app} task-authorized UI subset"
+            ),
             elements=tuple(authorized),
             captured_at=observation.captured_at,
             total_element_count=observation.total_element_count,
@@ -2923,6 +3237,17 @@ class DesktopSafetyPolicy:
             return _block("UAC and operating-system security prompts cannot be automated")
         if _looks_like_auth_surface(identity):
             return _block("authentication windows cannot be sent to the desktop planner")
+        if self.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED:
+            if _focused_secret_field(observation):
+                return _block("the focused input is a credential or secret-entry field")
+            planner_view = self.planner_observation(observation, user_text=user_text)
+            planner_context = _full_observation_context(planner_view)
+            if any(
+                finding.confidence == CredentialConfidence.HIGH
+                for finding in credential_findings(planner_context, include_low=False)
+            ):
+                return _block("credential-like value cannot be sent to the desktop planner")
+            return _allow("local unrestricted navigation observation is available")
         if any(element.password for element in observation.elements):
             return _block("password-entry surfaces cannot be sent to the desktop planner")
         if _focused_secret_field(observation):
@@ -3004,6 +3329,7 @@ class DesktopSafetyPolicy:
         user_text: str = "",
         expectation: DesktopExpectation | None = None,
     ) -> DesktopSafetyResult:
+        unrestricted = self.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
         action_is_bound = _same_app(action.app, observation.app) and (
             action.generation == observation.generation
         )
@@ -3012,7 +3338,7 @@ class DesktopSafetyPolicy:
         if "\ufffd" in observation.accessibility_text:
             return _block("accessibility state contains damaged Unicode")
         normalized_task = _normalized(user_text)
-        if _UNSUPPORTED_CONTROL_CONDITION_RE.search(
+        if not unrestricted and _UNSUPPORTED_CONTROL_CONDITION_RE.search(
             _mask_text_payloads(normalized_task, 0, len(normalized_task))
         ):
             return _block(
@@ -3062,8 +3388,7 @@ class DesktopSafetyPolicy:
         if (
             target is not None
             and element_plane(target) == ElementPlane.CONTENT
-            and action.type
-            in {DesktopActionType.CLICK, DesktopActionType.PERFORM_SECONDARY_ACTION}
+            and action.type in {DesktopActionType.CLICK, DesktopActionType.PERFORM_SECONDARY_ACTION}
         ):
             return _block("chat and document content is not an addressable control target")
 
@@ -3086,11 +3411,32 @@ class DesktopSafetyPolicy:
             else ""
         )
         if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}:
-            payload_is_exact = bool(action_payload) and any(
-                _verb_matches_action_type(verb, action.type)
-                and _payload_belongs_to_verb(action_payload, user_text, verb)
-                for verb in _positive_user_action_verbs(user_text)
-            )
+            if unrestricted:
+                payload_is_exact = bool(action_payload) and (
+                    any(
+                        _verb_matches_action_type(verb, action.type)
+                        and _payload_belongs_to_verb(action_payload, user_text, verb)
+                        for verb in _positive_user_action_verbs(user_text)
+                    )
+                    or (
+                        _is_search_input(target)
+                        and _natural_search_payload_authorized(action_payload, user_text)
+                        and (
+                            action.type == DesktopActionType.SET_VALUE
+                            or (
+                                action.type == DesktopActionType.TYPE_TEXT
+                                and target is not None
+                                and target.value == ""
+                            )
+                        )
+                    )
+                )
+            else:
+                payload_is_exact = bool(action_payload) and any(
+                    _verb_matches_action_type(verb, action.type)
+                    and _payload_belongs_to_verb(action_payload, user_text, verb)
+                    for verb in _positive_user_action_verbs(user_text)
+                )
             if not payload_is_exact:
                 return _block("text payload is not the complete user-authored payload")
 
@@ -3111,9 +3457,7 @@ class DesktopSafetyPolicy:
         include_user_intent = action.type not in {
             DesktopActionType.TYPE_TEXT,
             DesktopActionType.SET_VALUE,
-        } and (
-            target is None or _normalized(target.name) in generic_confirmation_labels
-        )
+        } and (target is None or _normalized(target.name) in generic_confirmation_labels)
         named_dynamic_navigation = _is_named_dynamic_navigation_target(
             action,
             target,
@@ -3168,6 +3512,7 @@ class DesktopSafetyPolicy:
         )
         if (
             target is not None
+            and not unrestricted
             and not action_bound_to_user_step
             and not personal_text_target
             and not personal_navigation_target
@@ -3191,9 +3536,8 @@ class DesktopSafetyPolicy:
                     or _normalized(element.control_type) in _EDITABLE_CONTROL_TYPES
                 )
             ]
-            if (
-                (not target_name and not personal_text_target)
-                or len(same_name_targets) != 1
+            if not unrestricted and (
+                (not target_name and not personal_text_target) or len(same_name_targets) != 1
             ):
                 return _block(
                     "semantic target label is absent or ambiguous in the current observation"
@@ -3206,9 +3550,10 @@ class DesktopSafetyPolicy:
             # explicitly negated (for example, "不要输入 X").
             if (
                 target is None
-                or (not target.name.strip() and not personal_text_target)
+                or (not unrestricted and not target.name.strip() and not personal_text_target)
                 or (
-                    not personal_text_target
+                    not unrestricted
+                    and not personal_text_target
                     and not _affirmatively_authorized_action_target(
                         target.name,
                         user_text,
@@ -3220,24 +3565,31 @@ class DesktopSafetyPolicy:
                 return _block("text target label is not affirmatively named in the user task")
             text_confirmation_target = target.name or "focused composer"
 
-        if action.type in {
-            DesktopActionType.CLICK,
-            DesktopActionType.PERFORM_SECONDARY_ACTION,
-            DesktopActionType.SCROLL,
-        } and not personal_navigation_target and (
-            target is None
-            or not target.name.strip()
-            or not _affirmatively_authorized_action_target(
-                target.name,
-                user_text,
-                action.type,
-                competing_labels=competing_labels,
+        if (
+            action.type
+            in {
+                DesktopActionType.CLICK,
+                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                DesktopActionType.SCROLL,
+            }
+            and not personal_navigation_target
+            and not unrestricted
+            and (
+                target is None
+                or not target.name.strip()
+                or not _affirmatively_authorized_action_target(
+                    target.name,
+                    user_text,
+                    action.type,
+                    competing_labels=competing_labels,
+                )
             )
         ):
             return _block("UI target label is not affirmatively named in the user task")
         if (
             action.type == DesktopActionType.PRESS_KEY
             and key in {"enter", "return", "space"}
+            and not unrestricted
             and (
                 target is None
                 or not target.name.strip()
@@ -3253,6 +3605,7 @@ class DesktopSafetyPolicy:
         if (
             action.type == DesktopActionType.PRESS_KEY
             and key == "escape"
+            and not unrestricted
             and (
                 target is None
                 or not target.name.strip()
@@ -3279,6 +3632,7 @@ class DesktopSafetyPolicy:
         if (
             action.type == DesktopActionType.PRESS_KEY
             and key in mutating_navigation_keys
+            and not unrestricted
             and (
                 target is None
                 or not target.name.strip()
@@ -3292,6 +3646,27 @@ class DesktopSafetyPolicy:
         ):
             return _block("state-changing navigation target is not named in the user task")
 
+        local_input_focus_bridge = bool(
+            unrestricted
+            and target is not None
+            and target.addressable
+            and target.enabled
+            and not target.password
+            and not target.secret_labeled
+            and element_plane(target) == ElementPlane.INPUT
+            and target.editable is not False
+            and expectation is not None
+            and expectation.kind == DesktopExpectationKind.FOCUSED_CONTAINS
+            and _normalized(expectation.text or "") == _normalized(target.name)
+            and (
+                _positive_natural_search_payloads(user_text)
+                or any(
+                    _verb_matches_action_type(verb, DesktopActionType.TYPE_TEXT)
+                    or _verb_matches_action_type(verb, DesktopActionType.SET_VALUE)
+                    for verb in _positive_user_action_verbs(user_text)
+                )
+            )
+        )
         if expectation is not None and expectation.text:
             expected = _normalized(expectation.text)
             payload_exact = {
@@ -3311,6 +3686,22 @@ class DesktopSafetyPolicy:
                 DesktopExpectationKind.FOCUSED_CONTAINS,
             }:
                 expected_is_authorized = True
+            if unrestricted:
+                if action.type in {
+                    DesktopActionType.TYPE_TEXT,
+                    DesktopActionType.SET_VALUE,
+                }:
+                    expected_is_authorized = bool(
+                        expected in payload_exact
+                        or _expectation_semantically_authorized(expectation, user_text)
+                    )
+                else:
+                    expected_is_authorized = bool(
+                        expected
+                        and not _contains_term(expectation.text or "", _SECRET_TERMS)
+                        and not _looks_like_payment_surface(expectation.text or "")
+                        and not _looks_like_privacy_surface(expectation.text or "")
+                    )
             if (
                 named_dynamic_navigation
                 and target is not None
@@ -3341,31 +3732,35 @@ class DesktopSafetyPolicy:
                 and expected == _normalized(target.name)
             ):
                 expected_is_authorized = True
-            elif not expectation_bound_to_user_step:
-                expected_is_authorized = bool(
-                    personal_text_target
-                    and expected in payload_exact
-                    and expectation.kind
-                    in {
-                        DesktopExpectationKind.TEXT_PRESENT,
-                        DesktopExpectationKind.FOCUSED_CONTAINS,
-                    }
-                ) or bool(
-                    personal_navigation_target
-                    and expectation.text
-                    and expectation.kind
-                    in {
-                        DesktopExpectationKind.TEXT_PRESENT,
-                        DesktopExpectationKind.ELEMENT_SELECTED,
-                    }
-                    and not _contains_term(expectation.text, _SECRET_TERMS)
-                    and not _looks_like_payment_surface(expectation.text)
-                    and not _looks_like_privacy_surface(expectation.text)
-                ) or bool(
-                    named_dynamic_navigation
-                    and target is not None
-                    and expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
-                    and expected == _normalized(target.name)
+            elif not expectation_bound_to_user_step and not unrestricted:
+                expected_is_authorized = (
+                    bool(
+                        personal_text_target
+                        and expected in payload_exact
+                        and expectation.kind
+                        in {
+                            DesktopExpectationKind.TEXT_PRESENT,
+                            DesktopExpectationKind.FOCUSED_CONTAINS,
+                        }
+                    )
+                    or bool(
+                        personal_navigation_target
+                        and expectation.text
+                        and expectation.kind
+                        in {
+                            DesktopExpectationKind.TEXT_PRESENT,
+                            DesktopExpectationKind.ELEMENT_SELECTED,
+                        }
+                        and not _contains_term(expectation.text, _SECRET_TERMS)
+                        and not _looks_like_payment_surface(expectation.text)
+                        and not _looks_like_privacy_surface(expectation.text)
+                    )
+                    or bool(
+                        named_dynamic_navigation
+                        and target is not None
+                        and expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
+                        and expected == _normalized(target.name)
+                    )
                 )
             if not expected_is_authorized:
                 return _block("postcondition text is not bound to the user task or target")
@@ -3385,7 +3780,10 @@ class DesktopSafetyPolicy:
                     and expected != target_name
                 ):
                     return _block("click selection/focus postcondition must name its exact target")
-                if expectation.kind == DesktopExpectationKind.FOCUSED_CONTAINS:
+                if (
+                    expectation.kind == DesktopExpectationKind.FOCUSED_CONTAINS
+                    and not local_input_focus_bridge
+                ):
                     return _block("click focus alone cannot prove the requested navigation result")
                 if expectation.kind == DesktopExpectationKind.TEXT_PRESENT and (
                     not expected_is_authorized or expected == target_name
@@ -3421,6 +3819,10 @@ class DesktopSafetyPolicy:
         if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}:
             if expectation is None or not expectation.text:
                 return _block("text input needs an exact local text-presence postcondition")
+            if unrestricted:
+                return _allow(
+                    "local unrestricted profile allows exact affirmative user-authored text"
+                )
             if personal_text_target:
                 return _allow("personal trusted profile allows exact user-spoken draft text")
             return _confirm(
@@ -3466,6 +3868,24 @@ class DesktopSafetyPolicy:
             and target_control_type in {"edit", "document"}
         ):
             assert target is not None
+            if unrestricted and _is_search_input(target) and _positive_natural_search_payloads(
+                user_text
+            ):
+                exact_query = expectation.text if expectation is not None else None
+                if (
+                    expectation is not None
+                    and expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED
+                    and exact_query
+                    and _natural_search_payload_authorized(exact_query, user_text)
+                    and target.value is not None
+                    and _normalized(target.value) == _normalized(exact_query)
+                ):
+                    return _allow(
+                        "local unrestricted profile allows an exact affirmative search submit"
+                    )
+                return _block(
+                    "search submit is not bound to the exact spoken query already in the field"
+                )
             return _confirm(
                 "submit or change editable content with Enter",
                 action,
@@ -3473,7 +3893,11 @@ class DesktopSafetyPolicy:
                 expectation,
                 trusted_target_label=target.name,
             )
-        if action.type == DesktopActionType.PRESS_KEY and key == "escape":
+        if (
+            action.type == DesktopActionType.PRESS_KEY
+            and key == "escape"
+            and not unrestricted
+        ):
             assert target is not None
             return _confirm(
                 "dismiss or close the focused application state",
@@ -3483,7 +3907,11 @@ class DesktopSafetyPolicy:
                 trusted_target_label=target.name,
             )
 
-        if action.type == DesktopActionType.PRESS_KEY and key in mutating_navigation_keys:
+        if (
+            action.type == DesktopActionType.PRESS_KEY
+            and key in mutating_navigation_keys
+            and not unrestricted
+        ):
             assert target is not None
             return _confirm(
                 "change a focused control with a navigation key",
@@ -3505,12 +3933,12 @@ class DesktopSafetyPolicy:
             DesktopActionType.PERFORM_SECONDARY_ACTION,
             DesktopActionType.PRESS_KEY,
         }:
-            if target is not None and _normalized(target.control_type) in {
-                "checkbox",
-                "radiobutton",
-                "switch",
-                "togglebutton",
-            }:
+            if (
+                not unrestricted
+                and target is not None
+                and _normalized(target.control_type)
+                in {"checkbox", "radiobutton", "switch", "togglebutton"}
+            ):
                 return _confirm(
                     "change a persistent selectable control",
                     action,
@@ -3528,7 +3956,8 @@ class DesktopSafetyPolicy:
                     ),
                 )
             if (
-                target is not None
+                not unrestricted
+                and target is not None
                 and _normalized(target.name) in generic_confirmation_labels
                 and any(
                     element_plane(element) == ElementPlane.DIALOG

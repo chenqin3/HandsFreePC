@@ -139,6 +139,29 @@ def test_codex_name_is_not_mistaken_for_code_surface() -> None:
     assert [action.type for action in plan.actions] == [ActionType.ACTIVATE_APP]
 
 
+@pytest.mark.parametrize(
+    ("command", "app"),
+    [
+        ("切换到 Chrome", "chrome"),
+        ("打开资源管理器", "explorer"),
+        ("切换到微信", "wechat"),
+    ],
+)
+def test_common_windows_apps_have_complete_deterministic_activation_commands(
+    command: str,
+    app: str,
+) -> None:
+    parser = DeterministicIntentParser()
+
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert [(action.type, action.app) for action in plan.actions] == [
+        (ActionType.ACTIVATE_APP, app)
+    ]
+    assert parser.covers_full_text(command, plan) is True
+
+
 def test_native_voice_requires_explicit_phrase() -> None:
     plan = DeterministicIntentParser().parse("打开codex，使用应用内语音")
     assert plan is not None

@@ -58,6 +58,7 @@ _FEEDBACK_MODE_PHRASES: dict[FeedbackMode, tuple[str, ...]] = {
 }
 _CHINESE_DIGITS = "零一二三四五六七八九"
 _CONFIRMATION_CHALLENGE_ATTEMPTS = 32
+_END_SESSION_ASR_ALIASES = ("接触语音操作",)
 
 
 def _new_confirmation_code() -> str:
@@ -65,7 +66,13 @@ def _new_confirmation_code() -> str:
 
 
 def _merge_control_phrase_transcript(matched: str, transcript: str) -> str:
-    """Join Vosk's phrase with short SenseVoice pre-roll without duplicating its tail."""
+    """Join a detector phrase only with a transcript that overlaps that phrase.
+
+    The wake detector and the command ASR inspect the same pre-roll.  A command
+    model can hallucinate an unrelated short phrase from wake-only audio.  Such
+    a transcript is not evidence of a suffix and must never become the first
+    fragment of the new continuous session.
+    """
 
     phrase_compact = compact_text(matched)
     transcript_compact = compact_text(transcript)
@@ -85,7 +92,39 @@ def _merge_control_phrase_transcript(matched: str, transcript: str) -> str:
                         remainder = transcript[index + 1 :].lstrip(" \t\r\n,，.。;；!！?？:：、")
                     break
             return f"{matched} {remainder}".strip()
-    return f"{matched} {transcript.strip()}".strip()
+    return matched
+
+
+def _looks_like_repetitive_asr_tail(value: str) -> bool:
+    """Detect a repeated-token decoder loop after a sample-bound ``over`` marker."""
+
+    tokens = re.findall(r"[a-z]+|\d+|[\u4e00-\u9fff]+", value.casefold())
+    if len(tokens) >= 4:
+        counts = {token: tokens.count(token) for token in set(tokens)}
+        if max(counts.values(), default=0) >= 3 and len(counts) / len(tokens) <= 0.5:
+            return True
+    compact = re.sub(r"[\s,，.。;；!?！？:：、]+", "", value.casefold())
+    repeated = re.search(r"(.{2,16}?)(?:\1){2,}", compact)
+    return bool(repeated and len(repeated.group(0)) >= max(6, int(len(compact) * 0.6)))
+
+
+def _strip_sample_bound_delimiter(value: str, delimiters: list[str]) -> str:
+    """Remove ASR leakage of the already sample-bound marker from one prefix."""
+
+    result = value.rstrip()
+    for delimiter in sorted(delimiters, key=len, reverse=True):
+        escaped = re.escape(delimiter.strip())
+        if not escaped:
+            continue
+        boundary = r"(?<![A-Za-z0-9])" if delimiter.isascii() else ""
+        match = re.search(
+            rf"{boundary}{escaped}\s*[,，.。;；!?！？:：、]*$",
+            result,
+            re.IGNORECASE,
+        )
+        if match is not None:
+            return result[: match.start()].rstrip(" \t\r\n,，.。;；!！?？:：、")
+    return result
 
 
 @dataclass(slots=True)
@@ -244,7 +283,11 @@ class VoiceRuntime:
     def _build_computer_controller(self) -> Controller:
         from .desktop.factory import build_computer_controller
 
-        return build_computer_controller(self.settings, self.executor)
+        return build_computer_controller(
+            self.settings,
+            self.executor,
+            diagnostics=self.diagnostics,
+        )
 
     def _ensure_computer_controller(self, session_id: str | None) -> Controller | None:
         with self._session_lock:
@@ -546,7 +589,10 @@ class VoiceRuntime:
                 return outcome
             value = suffix
 
-        if phrase_equals(value, self.settings.app.end_session_phrases):
+        if phrase_equals(
+            value,
+            [*self.settings.app.end_session_phrases, *_END_SESSION_ASR_ALIASES],
+        ):
             return self._end_continuous_input()
 
         with self._session_lock:
@@ -676,6 +722,20 @@ class VoiceRuntime:
         first_failure: TurnOutcome | None = None
         for index, transcript in enumerate(transcripts):
             value = transcript.strip()
+            if index == marker_count and value and _looks_like_repetitive_asr_tail(value):
+                self._record_diagnostic(
+                    stage="transcribe",
+                    error_code="ASR_REPETITIVE_MARKER_TAIL_IGNORED",
+                    safe_message="A repetitive ASR tail after the prompt marker was ignored",
+                    session_id=self._voice_session_id,
+                    level="warning",
+                )
+                continue
+            if index < marker_count and value:
+                value = _strip_sample_bound_delimiter(
+                    value,
+                    self.settings.app.prompt_delimiters,
+                )
             if value:
                 last_outcome = self.handle_session_text(value)
                 if self.session_state != SessionState.ACTIVE:

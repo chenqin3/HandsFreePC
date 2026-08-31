@@ -42,6 +42,14 @@ class FixedParser:
         return True
 
 
+class FixedWorkMapIndex:
+    def __init__(self, target) -> None:
+        self.target = target
+
+    def resolve_open_request(self, text: str):
+        return self.target if text == "打开示例数据库" else None
+
+
 def test_route_miss_never_prepares_or_executes(settings) -> None:
     executor = RecordingExecutor()
     router = NativeSkillRouter(settings, executor=executor)
@@ -52,6 +60,45 @@ def test_route_miss_never_prepares_or_executes(settings) -> None:
     assert result.matched is False
     assert result.message.startswith("NATIVE_ROUTE_MISS")
     assert executor.prepared == []
+    assert executor.executed == []
+
+
+def test_exact_workmap_alias_routes_before_generic_app_scope_and_is_verified(
+    settings,
+    tmp_path,
+) -> None:
+    target = tmp_path / "processed_data"
+    target.mkdir()
+    executor = RecordingExecutor()
+    router = NativeSkillRouter(
+        settings,
+        executor=executor,
+        workmap_index=FixedWorkMapIndex(target),
+    )
+
+    result = router.route("打开示例数据库")
+
+    assert result.status == NativeRouteStatus.SUCCEEDED
+    assert router.can_route("打开示例数据库") is True
+    assert executor.executed[0].source == "workmap"
+    assert executor.executed[0].actions == [
+        Action(ActionType.OPEN_PATH, path=str(target.resolve()))
+    ]
+
+
+def test_workmap_never_partially_consumes_a_multi_clause_request(settings, tmp_path) -> None:
+    target = tmp_path / "processed_data"
+    target.mkdir()
+    executor = RecordingExecutor()
+    router = NativeSkillRouter(
+        settings,
+        executor=executor,
+        workmap_index=FixedWorkMapIndex(target),
+    )
+
+    result = router.route("打开示例数据库，然后删除文件")
+
+    assert result.status == NativeRouteStatus.MISS
     assert executor.executed == []
 
 

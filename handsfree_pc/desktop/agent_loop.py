@@ -13,10 +13,14 @@ from ..path_binding import bind_plan_paths, guard_plan_paths
 from .native_skills import NativeRouteStatus, NativeSkillRouter
 from .protocol import (
     DesktopAction,
+    DesktopActionType,
     DesktopDecisionKind,
     DesktopDriver,
     DesktopExpectation,
+    DesktopExpectationKind,
     DesktopObservation,
+    ElementPlane,
+    element_plane,
     redact_credential_like_text,
 )
 from .safety import (
@@ -29,7 +33,12 @@ from .safety import (
     affirmatively_authorized_app_scope,
     expectation_is_terminal_user_condition,
     expectation_matches_user_step,
+    natural_search_step_count,
+    target_matches_explicit_text_step,
+    text_step_has_explicit_target,
+    user_action_step_clause,
     user_action_step_count,
+    window_activation_matches_next_user_step,
 )
 from .step_planner import DesktopPlannerError, DesktopStepPlanner
 from .verifier import DesktopVerifier, VerificationResult
@@ -48,6 +57,7 @@ class _TaskState:
     last_action_target: str | None
     steps: int
     verified_action_count: int
+    verified_user_step_count: int
     remaining_seconds: float
     stale_replans: int = 0
 
@@ -61,6 +71,7 @@ class _PendingConfirmation:
     action: DesktopAction | None = None
     binding: DesktopConfirmation | None = None
     action_expectation: DesktopExpectation | None = None
+    counts_as_user_step: bool = True
     native_plan: Plan | None = None
     native_user_text: str | None = None
     native_binding_digest: str | None = None
@@ -71,6 +82,9 @@ _APP_ALIASES: dict[str, tuple[str, ...]] = {
     # Scoped aliases for common SenseVoice renderings of ``Claude``.  They are
     # still subject to the affirmative app-scope gate below.
     "claude": ("claude", "克劳德", "cloud", "cloloud"),
+    "chrome": ("chrome", "google chrome", "谷歌浏览器", "浏览器"),
+    "explorer": ("explorer", "file explorer", "资源管理器", "文件资源管理器"),
+    "wechat": ("wechat", "weixin", "微信"),
 }
 
 _EXPLICIT_APP_SCOPE_SLOT_PATTERNS = (
@@ -196,7 +210,7 @@ def _visible_apps(payload: str) -> tuple[str, ...]:
         value = json.loads(payload)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("desktop driver returned a non-JSON app inventory") from exc
-    if not isinstance(value, list) or len(value) > 64:
+    if not isinstance(value, list) or len(value) > 256:
         raise ValueError("desktop driver returned an invalid app inventory")
     names: list[str] = []
     for item in value:
@@ -208,6 +222,189 @@ def _visible_apps(payload: str) -> tuple[str, ...]:
         if name not in names:
             names.append(name)
     return tuple(names)
+
+
+def _window_entry_labels(
+    entry: dict[str, object],
+    *,
+    observed_title: str | None = None,
+    include_window_titles: bool = True,
+) -> tuple[str, ...]:
+    """Return trusted app identity labels plus optional untrusted window titles.
+
+    Process/profile identity may expand a canonical alias.  A page-controlled
+    window title never does: a Chrome tab titled ``Claude`` must not become a
+    Claude application merely because its title contains that word.
+    """
+
+    labels: list[str] = []
+    for key, value in (
+        ("app", entry.get("app")),
+        ("display_name", entry.get("display_name")),
+        ("process_name", entry.get("process_name")),
+    ):
+        if not isinstance(value, str):
+            continue
+        label = value.strip()
+        if key == "process_name" and label.casefold().endswith(".exe"):
+            label = label[:-4].strip()
+        if (
+            label
+            and len(label) <= 256
+            and label.casefold() not in {item.casefold() for item in labels}
+        ):
+            labels.append(label)
+    for canonical, aliases in _APP_ALIASES.items():
+        if any(
+            label.casefold() == canonical
+            or label.casefold() in {alias.casefold() for alias in aliases}
+            for label in labels
+        ):
+            labels.extend(
+                alias
+                for alias in aliases
+                if alias.casefold() not in {item.casefold() for item in labels}
+            )
+    if include_window_titles:
+        for value in (entry.get("window_title"), observed_title):
+            if not isinstance(value, str):
+                continue
+            label = value.strip()
+            if (
+                label
+                and len(label) <= 256
+                and label.casefold() not in {item.casefold() for item in labels}
+            ):
+                labels.append(label)
+    return tuple(labels)
+
+
+def _window_candidate_labels(
+    inventory: str,
+    observation: DesktopObservation,
+) -> tuple[str, ...]:
+    try:
+        entries = json.loads(inventory)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(entries, list):
+        return ()
+    selected = next(
+        (
+            item
+            for item in entries
+            if isinstance(item, dict)
+            and isinstance(item.get("app"), str)
+            and item["app"].strip().casefold() == observation.app.strip().casefold()
+        ),
+        None,
+    )
+    if selected is None:
+        return ()
+    return _window_entry_labels(selected, observed_title=observation.window_title)
+
+
+def _explicit_step_window_scope(
+    task: str,
+    *,
+    inventory: str,
+    completed_steps: int,
+) -> tuple[bool, frozenset[str]]:
+    """Resolve an explicitly named app/window for the current spoken step."""
+
+    clause = user_action_step_clause(task, step=completed_steps)
+    if clause is None:
+        return False, frozenset()
+    try:
+        entries = json.loads(inventory)
+    except (TypeError, json.JSONDecodeError):
+        return False, frozenset()
+    if not isinstance(entries, list):
+        return False, frozenset()
+    known_scope_labels = {
+        alias.casefold()
+        for canonical, aliases in _APP_ALIASES.items()
+        for alias in (canonical, *aliases)
+        if _app_scope_is_affirmative(alias, clause)
+    }
+    scored_matches: list[tuple[tuple[int, int, int], str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("app"), str):
+            continue
+        trusted_labels = _window_entry_labels(entry, include_window_titles=False)
+        all_labels = _window_entry_labels(entry)
+        trusted_keys = {label.casefold() for label in trusted_labels}
+        for label in all_labels:
+            if not _app_scope_is_affirmative(label, clause):
+                continue
+            is_trusted_identity = label.casefold() in trusted_keys
+            if not is_trusted_identity and label.casefold() in known_scope_labels:
+                # A web page can choose its own title.  It cannot impersonate
+                # a known application identity such as Claude or Chrome.
+                continue
+            position = clause.casefold().rfind(label.casefold())
+            if position < 0:
+                continue
+            # The latest explicit scope wins.  At the same textual endpoint,
+            # a longer exact window title beats a contained process name, and
+            # trusted process/profile identity beats an equally named title.
+            score = (
+                position + len(label),
+                len(label),
+                int(is_trusted_identity),
+            )
+            scored_matches.append((score, entry["app"].strip().casefold()))
+    matched: set[str] = set()
+    if scored_matches:
+        best_score = max(score for score, _app in scored_matches)
+        matched = {app for score, app in scored_matches if score == best_score}
+    known_scope = bool(known_scope_labels)
+    return bool(matched or known_scope), frozenset(matched)
+
+
+def _switch_only_window_request(
+    task: str,
+    *,
+    inventory: str,
+    observation: DesktopObservation,
+) -> bool:
+    """Accept zero-action completion only for one explicit pure window switch."""
+
+    explicit_scope, scoped_apps = _explicit_step_window_scope(
+        task,
+        inventory=inventory,
+        completed_steps=0,
+    )
+    if (
+        not explicit_scope
+        or observation.app.strip().casefold() not in scoped_apps
+    ):
+        return False
+
+    labels = _window_candidate_labels(inventory, observation)
+    if not labels:
+        return False
+    source = re.sub(r"切换道", "切换到", task.strip(), flags=re.IGNORECASE)
+    for label in labels:
+        escaped = re.escape(label)
+        chinese = re.compile(
+            rf"\s*(?:请|麻烦)?\s*(?:帮我)?\s*"
+            rf"(?:切换到|切换至|切到|转到|打开|进入|激活|显示)\s*"
+            rf"(?:桌面(?:上)?的?\s*)?{escaped}\s*(?:app|应用|程序|窗口)?\s*[。.!！?？]*\s*",
+            re.IGNORECASE,
+        )
+        english = re.compile(
+            rf"\s*(?:please\s+)?(?:switch\s+to|go\s+to|navigate\s+to|open|activate|"
+            rf"focus|show)\s+(?:the\s+)?{escaped}\s*"
+            rf"(?:app|application|program|window)?\s*[.!?]*\s*",
+            re.IGNORECASE,
+        )
+        if (chinese.fullmatch(source) or english.fullmatch(source)) and _app_scope_is_affirmative(
+            label,
+            source,
+        ):
+            return True
+    return False
 
 
 def _app_scope_is_affirmative(candidate: str, task: str) -> bool:
@@ -261,12 +458,119 @@ def _app_scope_is_affirmative(candidate: str, task: str) -> bool:
             task,
             flags=re.IGNORECASE,
         ),
+        re.sub(
+            rf"\b(?:in|inside|within|on)\s+(?:the\s+)?{escaped}"
+            rf"(?:\s+(?:app|application))?(?:['’]s|\s+)"
+            rf"[^,，。；;.!！？?\n]{{1,96}}?(?:\s*[,，:：]\s*|\s+)"
+            rf"(?=(?:type|input|fill|write|set(?:\s+the)?\s+value)\b)",
+            f"in {candidate}, ",
+            task,
+            flags=re.IGNORECASE,
+        ),
     )
     return any(
-        rewritten != task
-        and affirmatively_authorized_app_scope(candidate, rewritten)
+        rewritten != task and affirmatively_authorized_app_scope(candidate, rewritten)
         for rewritten in rewrites
     )
+
+
+def _normalized_field_label(value: str) -> str:
+    label = re.sub(r"\s+", " ", value.strip(" \t\r\n,，:：'\"“”‘’")).casefold()
+    label = re.sub(r"^(?:the\s+)", "", label, flags=re.IGNORECASE)
+    label = re.sub(
+        r"\s*(?:input\s+box|text\s+box|field|box|editor|composer|输入框|字段)\s*$",
+        "",
+        label,
+        flags=re.IGNORECASE,
+    )
+    return label.strip()
+
+
+def _explicit_preposed_text_fields(
+    task: str,
+    *,
+    inventory: str,
+    completed_steps: int,
+    scoped_apps: frozenset[str],
+) -> tuple[str, ...]:
+    """Extract a field named between an app location and a text-entry verb."""
+
+    clause = user_action_step_clause(task, step=completed_steps)
+    if clause is None:
+        return ()
+    try:
+        entries = json.loads(inventory)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(entries, list):
+        return ()
+    fields: list[str] = []
+    app_identity_keys: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, dict):
+            app_identity_keys.update(
+                _normalized_field_label(label)
+                for label in _window_entry_labels(entry, include_window_titles=False)
+                if label.strip()
+            )
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("app"), str)
+            or (
+                scoped_apps
+                and entry["app"].strip().casefold() not in scoped_apps
+            )
+        ):
+            continue
+        labels = sorted(
+            _window_entry_labels(entry, include_window_titles=False),
+            key=len,
+            reverse=True,
+        )
+        for label in labels:
+            escaped = re.escape(label)
+            patterns = (
+                re.compile(
+                    rf"\b(?:in|inside|within|on)\s+(?:the\s+)?{escaped}"
+                    rf"(?:\s+(?:app|application))?(?:['’]s|\s+)"
+                    rf"(?P<field>[^,，。；;.!！？?\n]{{1,96}}?)"
+                    rf"(?:\s*[,，:：]\s*|\s+)"
+                    rf"(?=(?:type|input|fill|write|set(?:\s+the)?\s+value)\b)",
+                    re.IGNORECASE,
+                ),
+                re.compile(
+                    rf"(?:在|于)\s*{escaped}(?:\s*(?:app|应用))?(?:的|\s+)"
+                    rf"(?P<field>[^，。；,;.!！？?\n]{{1,96}}?)"
+                    rf"(?=(?:输入|填写|写入|设置值|设值))",
+                    re.IGNORECASE,
+                ),
+            )
+            for pattern in patterns:
+                for match in pattern.finditer(clause):
+                    field = _normalized_field_label(match.group("field"))
+                    if field and field not in fields:
+                        fields.append(field)
+    generic_patterns = (
+        re.compile(
+            r"(?:在|于)\s*(?P<field>[^，。；,;.!！？?\n]{1,96}?)\s*"
+            r"(?=(?:输入|填写|写入|设置值|设值))",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:in|inside|within|on)\s+(?:the\s+)?"
+            r"(?P<field>[^,，。；;.!！？?\n]{1,96}?)"
+            r"(?:\s*[,，:：]\s*|\s+)"
+            r"(?=(?:type|input|fill|write|set(?:\s+the)?\s+value)\b)",
+            re.IGNORECASE,
+        ),
+    )
+    for pattern in generic_patterns:
+        for match in pattern.finditer(clause):
+            field = _normalized_field_label(match.group("field"))
+            if field and field not in app_identity_keys and field not in fields:
+                fields.append(field)
+    return tuple(fields)
 
 
 def _explicitly_named_apps(task: str, visible_apps: tuple[str, ...]) -> frozenset[str]:
@@ -306,9 +610,7 @@ def _unsupported_explicit_app_scopes(
     """
 
     known_aliases = {
-        alias.casefold()
-        for app in known_apps
-        for alias in _APP_ALIASES.get(app, (app,))
+        alias.casefold() for app in known_apps for alias in _APP_ALIASES.get(app, (app,))
     }
     unknown: list[str] = []
     anaphoric_references = frozenset(
@@ -350,6 +652,7 @@ class DesktopAgentLoopController:
         max_steps: int = 20,
         monotonic: object = time.monotonic,
         sleeper: object = time.sleep,
+        diagnostics: object | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -367,6 +670,7 @@ class DesktopAgentLoopController:
         self.max_steps = int(max_steps)
         self._monotonic = monotonic
         self._sleep = sleeper
+        self.diagnostics = diagnostics
         self._session_id = str(uuid.uuid4())
         self._execution_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
@@ -391,6 +695,32 @@ class DesktopAgentLoopController:
             (current is not None and current.is_set())
             or (external is not None and external.is_set())
         )
+
+    def _trace(
+        self,
+        *,
+        stage: str,
+        error_code: str,
+        safe_message: str,
+        app: str | None = None,
+        generation: int | None = None,
+        level: str = "info",
+    ) -> None:
+        event = getattr(self.diagnostics, "event", None)
+        if not callable(event):
+            return
+        try:
+            event(
+                stage=stage,
+                error_code=error_code,
+                safe_message=safe_message,
+                level=level,
+                session_id=self._session_id,
+                app=app,
+                generation=generation,
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _failure(
@@ -618,7 +948,10 @@ class DesktopAgentLoopController:
         return max(0.0, self.timeout_seconds - (float(self._monotonic()) - started_at))
 
     def _trusted_context(self) -> tuple[str, str] | None:
-        if self.safety.profile != DesktopSafetyProfile.PERSONAL_TRUSTED:
+        if self.safety.profile not in {
+            DesktopSafetyProfile.PERSONAL_TRUSTED,
+            DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+        }:
             return None
         with self._lifecycle_lock:
             if self._trusted_app_context is None or self._trusted_window_id is None:
@@ -637,15 +970,17 @@ class DesktopAgentLoopController:
     ) -> None:
         if (
             not result.success
-            or self.safety.profile != DesktopSafetyProfile.PERSONAL_TRUSTED
+            or self.safety.profile
+            not in {
+                DesktopSafetyProfile.PERSONAL_TRUSTED,
+                DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+            }
             or state.observation is None
             or not state.observation.local_window_id
         ):
             return
         with self._lifecycle_lock:
-            if self._closed or (
-                self._current_cancel is not None and self._current_cancel.is_set()
-            ):
+            if self._closed or (self._current_cancel is not None and self._current_cancel.is_set()):
                 return
             self._trusted_app_context = state.observation.app.strip().casefold()
             self._trusted_window_id = state.observation.local_window_id
@@ -668,7 +1003,11 @@ class DesktopAgentLoopController:
         if (
             plan is None
             or self.driver is None
-            or self.safety.profile != DesktopSafetyProfile.PERSONAL_TRUSTED
+            or self.safety.profile
+            not in {
+                DesktopSafetyProfile.PERSONAL_TRUSTED,
+                DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+            }
             or self._cancelled(cancel_event)
         ):
             return False
@@ -715,6 +1054,7 @@ class DesktopAgentLoopController:
         cancel_event: threading.Event | None,
     ) -> ComputerControlResult:
         assert self.driver is not None and self.planner is not None
+        unrestricted = self.safety.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
         deadline = float(self._monotonic()) + state.remaining_seconds
         while state.steps < self.max_steps:
             if self._cancelled(cancel_event):
@@ -728,6 +1068,36 @@ class DesktopAgentLoopController:
                     timed_out=True,
                 )
             state.remaining_seconds = remaining
+            if unrestricted and state.steps > 0:
+                try:
+                    inventory = self.driver.list_apps(cancel_event=self._current_cancel)
+                    visible_apps = _visible_apps(inventory)
+                except Exception as exc:
+                    return self._failure(
+                        f"刷新可见窗口失败：{_safe_exception_message(exc)}",
+                        stage="list_apps",
+                        error_code="APP_INVENTORY_REFRESH_FAILED",
+                        exception_type=type(exc).__name__,
+                    )
+                if not visible_apps:
+                    return self._failure(
+                        "刷新后没有可供桌面规划器观察的可见窗口",
+                        stage="list_apps",
+                        error_code="NO_VISIBLE_WINDOWS",
+                    )
+                state.apps = inventory
+                state.allowed_apps = frozenset(visible_apps)
+                if (
+                    state.observation is not None
+                    and state.observation.app.strip().casefold() not in state.allowed_apps
+                ):
+                    state.history.append("the previously observed window is no longer visible")
+                    state.observation = None
+                self._trace(
+                    stage="list_apps",
+                    error_code="APP_INVENTORY_REFRESHED",
+                    safe_message="The unrestricted visible-window inventory was refreshed",
+                )
             try:
                 planner_observation = (
                     self.safety.planner_observation(
@@ -759,6 +1129,15 @@ class DesktopAgentLoopController:
                     exception_type=type(exc).__name__,
                 )
             state.steps += 1
+            self._trace(
+                stage="plan",
+                error_code=f"PLANNER_DECISION_{decision.kind.value.upper()}",
+                safe_message="The desktop planner returned one structured decision",
+                app=decision.app,
+                generation=(
+                    state.observation.generation if state.observation is not None else None
+                ),
+            )
 
             if decision.kind == DesktopDecisionKind.FAIL:
                 return self._failure(
@@ -809,6 +1188,31 @@ class DesktopAgentLoopController:
                         generation=observation.generation,
                     )
                 state.observation = observation
+                if unrestricted:
+                    explicit_scope, scoped_apps = _explicit_step_window_scope(
+                        state.task,
+                        inventory=state.apps,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                    if (
+                        (not explicit_scope or observation.app.strip().casefold() in scoped_apps)
+                        and window_activation_matches_next_user_step(
+                            _window_candidate_labels(state.apps, observation),
+                            state.task,
+                            completed_steps=state.verified_user_step_count,
+                        )
+                    ):
+                        state.verified_user_step_count += 1
+                        state.history.append(
+                            "locally verified the next explicit exact-window activation"
+                        )
+                self._trace(
+                    stage="observe_driver",
+                    error_code="WINDOW_OBSERVED",
+                    safe_message="A fresh local application-window observation is available",
+                    app=observation.app,
+                    generation=observation.generation,
+                )
                 state.history.append(
                     f"observed {observation.app} generation {observation.generation}"
                 )
@@ -837,11 +1241,80 @@ class DesktopAgentLoopController:
                     None,
                 )
                 target_label = target.name if target is not None else ""
+                if unrestricted:
+                    explicit_scope, scoped_apps = _explicit_step_window_scope(
+                        state.task,
+                        inventory=state.apps,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                    input_bound_action = bool(
+                        action.type
+                        in {
+                            DesktopActionType.TYPE_TEXT,
+                            DesktopActionType.SET_VALUE,
+                        }
+                        or (
+                            target is not None
+                            and element_plane(target) == ElementPlane.INPUT
+                            and action.type
+                            in {
+                                DesktopActionType.CLICK,
+                                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                                DesktopActionType.PRESS_KEY,
+                            }
+                        )
+                    )
+                    explicit_text_target = text_step_has_explicit_target(
+                        state.task,
+                        step=state.verified_user_step_count,
+                    )
+                    preposed_text_fields = _explicit_preposed_text_fields(
+                        state.task,
+                        inventory=state.apps,
+                        completed_steps=state.verified_user_step_count,
+                        scoped_apps=scoped_apps,
+                    )
+                    target_matches_text_field = bool(
+                        target_matches_explicit_text_step(
+                            target_label,
+                            state.task,
+                            step=state.verified_user_step_count,
+                        )
+                        or (
+                            target_label
+                            and _normalized_field_label(target_label)
+                            in preposed_text_fields
+                        )
+                    )
+                    if (
+                        explicit_scope
+                        and input_bound_action
+                        and action.app.strip().casefold() not in scoped_apps
+                    ):
+                        return self._failure(
+                            "输入或搜索动作没有绑定到本句明确指定的窗口",
+                            stage="action_safety",
+                            error_code="EXPLICIT_STEP_WINDOW_MISMATCH",
+                            app=state.observation.app,
+                            generation=state.observation.generation,
+                        )
+                    if (
+                        input_bound_action
+                        and (explicit_text_target or preposed_text_fields)
+                        and not target_matches_text_field
+                    ):
+                        return self._failure(
+                            "输入动作没有绑定到本句明确指定的字段",
+                            stage="action_safety",
+                            error_code="EXPLICIT_TEXT_TARGET_MISMATCH",
+                            app=state.observation.app,
+                            generation=state.observation.generation,
+                        )
                 direct_action_match = action_matches_next_user_step(
                     action,
                     target_label,
                     state.task,
-                    completed_steps=state.verified_action_count,
+                    completed_steps=state.verified_user_step_count,
                 )
                 direct_expectation_match = bool(
                     decision.expectation is not None
@@ -850,25 +1323,50 @@ class DesktopAgentLoopController:
                         target_label,
                         decision.expectation,
                         state.task,
-                        completed_steps=state.verified_action_count,
+                        completed_steps=state.verified_user_step_count,
                     )
                 )
-                binding = (
-                    DesktopActionBinding.USER_STEP
-                    if direct_action_match and direct_expectation_match
-                    else self.safety.classify_personal_action_binding(
-                        action,
-                        target,
-                        decision.expectation,
-                        user_text=state.task,
-                        completed_steps=state.verified_action_count,
+                if unrestricted:
+                    # The private-machine profile may infer as many locally
+                    # verified navigation bridges as necessary, but only an
+                    # exact match for the next spoken action advances the
+                    # explicit user-step counter.  This prevents a completed
+                    # intermediate action from standing in for a later step.
+                    binding = (
+                        DesktopActionBinding.USER_STEP
+                        if direct_action_match and direct_expectation_match
+                        else DesktopActionBinding.NAVIGATION_BRIDGE
                     )
-                )
+                else:
+                    binding = (
+                        DesktopActionBinding.USER_STEP
+                        if direct_action_match and direct_expectation_match
+                        else self.safety.classify_personal_action_binding(
+                            action,
+                            target,
+                            decision.expectation,
+                            user_text=state.task,
+                            completed_steps=state.verified_user_step_count,
+                        )
+                    )
                 if binding is None:
                     return self._failure(
                         "规划器动作未对应用户要求或可信本机导航步骤",
                         stage="action_safety",
                         error_code="ACTION_NOT_BOUND_TO_TASK",
+                        app=state.observation.app,
+                        generation=state.observation.generation,
+                    )
+                if (
+                    unrestricted
+                    and explicit_scope
+                    and binding == DesktopActionBinding.USER_STEP
+                    and action.app.strip().casefold() not in scoped_apps
+                ):
+                    return self._failure(
+                        "最终用户步骤没有在本句明确指定的窗口中执行",
+                        stage="action_safety",
+                        error_code="EXPLICIT_STEP_WINDOW_MISMATCH",
                         app=state.observation.app,
                         generation=state.observation.generation,
                     )
@@ -902,8 +1400,16 @@ class DesktopAgentLoopController:
                         action=action,
                         binding=safety_result.confirmation,
                         action_expectation=decision.expectation,
+                        counts_as_user_step=binding == DesktopActionBinding.USER_STEP,
                     )
                     return self._confirmation_result(pending, cancel_event=cancel_event)
+                self._trace(
+                    stage="execute",
+                    error_code="ACTION_DISPATCHED",
+                    safe_message="One observation-bound desktop action is ready for dispatch",
+                    app=state.observation.app,
+                    generation=state.observation.generation,
+                )
                 action_result = self._perform_action(
                     state,
                     action,
@@ -922,13 +1428,111 @@ class DesktopAgentLoopController:
                         stage="verify_completion",
                         error_code="COMPLETION_OBSERVATION_MISSING",
                     )
-                if state.verified_action_count == 0:
+                if unrestricted:
+                    stale_completion_app = state.observation.app
+                    stale_completion_window = state.observation.local_window_id
+                    try:
+                        completion_observation = self.driver.observe(
+                            stale_completion_app,
+                            cancel_event=self._current_cancel,
+                        )
+                    except Exception as exc:
+                        return self._failure(
+                            f"完成验收前重新观察失败：{_safe_exception_message(exc)}",
+                            stage="observe_driver",
+                            error_code="COMPLETION_REOBSERVE_FAILED",
+                            exception_type=type(exc).__name__,
+                            app=stale_completion_app,
+                        )
+                    if (
+                        completion_observation.app.strip().casefold()
+                        not in state.allowed_apps
+                        or completion_observation.app.strip().casefold()
+                        != stale_completion_app.strip().casefold()
+                        or not stale_completion_window
+                        or not completion_observation.local_window_id
+                        or completion_observation.local_window_id != stale_completion_window
+                    ):
+                        return self._failure(
+                            "完成验收前可见窗口绑定已经变化",
+                            stage="observe_driver",
+                            error_code="COMPLETION_WINDOW_CHANGED",
+                            app=completion_observation.app,
+                            generation=completion_observation.generation,
+                        )
+                    if (
+                        completion_observation.generation <= state.observation.generation
+                        or completion_observation.captured_at < state.observation.captured_at
+                    ):
+                        return self._failure(
+                            "完成验收前没有取得更新一代的窗口观察",
+                            stage="observe_driver",
+                            error_code="COMPLETION_OBSERVATION_NOT_FRESH",
+                            app=completion_observation.app,
+                            generation=completion_observation.generation,
+                        )
+                    completion_inspection = self.safety.inspect_observation(
+                        completion_observation,
+                        user_text=state.task,
+                    )
+                    if completion_inspection.disposition == DesktopSafetyDisposition.BLOCK:
+                        return self._failure(
+                            f"完成验收前本地安全策略阻止读取界面：{completion_inspection.reason}",
+                            stage="observe_safety",
+                            error_code="COMPLETION_OBSERVATION_BLOCKED",
+                            app=completion_observation.app,
+                            generation=completion_observation.generation,
+                    )
+                    state.observation = completion_observation
+                spoken_step_count = user_action_step_count(state.task)
+                if unrestricted and spoken_step_count > 0:
+                    terminal_step = min(
+                        state.verified_user_step_count,
+                        spoken_step_count - 1,
+                    )
+                    explicit_scope, scoped_apps = _explicit_step_window_scope(
+                        state.task,
+                        inventory=state.apps,
+                        completed_steps=terminal_step,
+                    )
+                    if (
+                        explicit_scope
+                        and state.observation.app.strip().casefold() not in scoped_apps
+                    ):
+                        return self._failure(
+                            "完成条件不在用户明确指定的窗口中",
+                            stage="verify_completion",
+                            error_code="COMPLETION_EXPLICIT_WINDOW_MISMATCH",
+                            app=state.observation.app,
+                            generation=state.observation.generation,
+                        )
+                zero_action_switch = bool(
+                    unrestricted
+                    and decision.expectation is not None
+                    and decision.expectation.kind == DesktopExpectationKind.APP_VISIBLE
+                    and decision.app is not None
+                    and decision.app.strip().casefold() == state.observation.app.strip().casefold()
+                    and bool(state.observation.local_window_id)
+                    and _switch_only_window_request(
+                        state.task,
+                        inventory=state.apps,
+                        observation=state.observation,
+                    )
+                )
+                if state.verified_action_count == 0 and not zero_action_switch:
                     return self._failure(
                         "通用桌面任务尚无任何经过本地验收的动作",
                         stage="verify_completion",
                         error_code="NO_VERIFIED_ACTIONS",
                     )
-                if state.verified_action_count != user_action_step_count(state.task):
+                if (
+                    (
+                        not unrestricted
+                        or spoken_step_count > 1
+                        or natural_search_step_count(state.task) > 0
+                    )
+                    and state.verified_user_step_count != spoken_step_count
+                ):
                     return self._failure(
                         "尚未按顺序完成用户明确要求的全部桌面步骤",
                         stage="verify_completion",
@@ -951,16 +1555,27 @@ class DesktopAgentLoopController:
                         stage="verify_completion",
                         error_code="COMPLETION_CONDITION_CHANGED",
                     )
-                terminal_condition_is_bound = expectation_is_terminal_user_condition(
+                exact_terminal_condition = expectation_is_terminal_user_condition(
                     decision.expectation,
                     state.task,
                     last_action=state.last_action,
                     last_action_target=state.last_action_target,
-                ) or self.safety.accepts_personal_terminal_condition(
-                    decision.expectation,
-                    user_text=state.task,
-                    last_action=state.last_action,
                 )
+                if unrestricted and spoken_step_count > 1:
+                    terminal_condition_is_bound = zero_action_switch or exact_terminal_condition
+                else:
+                    terminal_condition_is_bound = zero_action_switch or (
+                        exact_terminal_condition
+                        or self.safety.accepts_personal_terminal_condition(
+                            decision.expectation,
+                            user_text=state.task,
+                            last_action=state.last_action,
+                        )
+                        or self.safety.accepts_unrestricted_terminal_condition(
+                            decision.expectation,
+                            user_text=state.task,
+                        )
+                    )
                 if not terminal_condition_is_bound:
                     return self._failure(
                         "完成条件没有绑定到用户要求的最后一个正向动作",
@@ -1100,10 +1715,14 @@ class DesktopAgentLoopController:
                     app=before.app,
                     generation=before.generation,
                 )
-        already_true = self.verifier.verify_expectation(
-            expectation,
-            before,
-            last_action_result=None,
+        already_true = (
+            VerificationResult(False, "search submission requires an action transition")
+            if expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED
+            else self.verifier.verify_expectation(
+                expectation,
+                before,
+                last_action_result=None,
+            )
         )
         if already_true.verified:
             return self._failure(
@@ -1167,10 +1786,19 @@ class DesktopAgentLoopController:
                 app=after.app,
                 generation=after.generation,
             )
-        expected_result = self.verifier.verify_expectation(
-            expectation,
-            after,
-            last_action_result=verified,
+        expected_result = (
+            self.verifier.verify_search_submission(
+                rebound,
+                expectation,
+                before,
+                after,
+            )
+            if expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED
+            else self.verifier.verify_expectation(
+                expectation,
+                after,
+                last_action_result=verified,
+            )
         )
         if not expected_result.verified:
             return self._failure(
@@ -1199,9 +1827,17 @@ class DesktopAgentLoopController:
         )
         state.last_action_target = target.name if target is not None else None
         if counts_as_user_step:
-            state.verified_action_count += 1
+            state.verified_user_step_count += 1
+        state.verified_action_count += 1
         state.stale_replans = 0
         state.history.append(f"locally verified {rebound.type.value}: {expected_result.reason}")
+        self._trace(
+            stage="verify_action",
+            error_code="ACTION_VERIFIED",
+            safe_message="A dispatched desktop action passed its local postcondition",
+            app=after.app,
+            generation=after.generation,
+        )
         return None
 
     def run(
@@ -1264,114 +1900,128 @@ class DesktopAgentLoopController:
                     )
                 configured_profiles = getattr(self.driver, "profiles", {})
                 configured_apps = (
-                    tuple(configured_profiles)
-                    if isinstance(configured_profiles, dict)
-                    else ()
+                    tuple(configured_profiles) if isinstance(configured_profiles, dict) else ()
                 )
-                known_apps = tuple(
-                    dict.fromkeys((*visible_apps, *configured_apps, *_APP_ALIASES))
-                )
-                explicit_apps = _explicitly_named_apps(instruction, known_apps)
-                unsupported_scopes = _unsupported_explicit_app_scopes(
-                    instruction,
-                    known_apps,
-                )
-                if explicit_apps or unsupported_scopes:
-                    # A newly spoken explicit scope must never fall back to a
-                    # previously verified application after this command fails.
-                    self._clear_trusted_context()
-                if unsupported_scopes:
-                    return self._failure(
-                        "本次口述明确指定了未配置的应用，不能继承上一应用",
-                        stage="list_apps",
-                        error_code="APP_SCOPE_UNSUPPORTED",
-                    )
-                allowed_apps = explicit_apps.intersection(visible_apps)
+                known_apps = tuple(dict.fromkeys((*visible_apps, *configured_apps, *_APP_ALIASES)))
                 observation: DesktopObservation | None = None
                 history: list[str] = []
-                if len(explicit_apps) > 1:
-                    return self._failure(
-                        "通用桌面任务必须指定唯一一个当前可见应用",
-                        stage="list_apps",
-                        error_code="APP_SCOPE_AMBIGUOUS",
-                    )
-                if explicit_apps and not allowed_apps:
-                    return self._failure(
-                        "本次口述明确指定的应用当前不可见，不能继承上一应用",
-                        stage="list_apps",
-                        error_code="APP_SCOPE_NOT_VISIBLE",
-                        app=next(iter(explicit_apps)),
-                    )
-                if not allowed_apps:
-                    trusted_context = self._trusted_context()
-                    if trusted_context is None:
+                unrestricted = self.safety.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
+                if unrestricted:
+                    # This is an explicit opt-in for one private machine.  The
+                    # complete locally enumerated window set is the planner's
+                    # scope; the user no longer needs to name a preconfigured
+                    # application before each natural-language instruction.
+                    if not visible_apps:
                         return self._failure(
-                            "通用桌面任务必须在本次口述中明确且肯定地指定唯一一个当前可见应用",
+                            "当前没有可供桌面规划器观察的可见窗口",
                             stage="list_apps",
-                            error_code="APP_SCOPE_REQUIRED",
+                            error_code="NO_VISIBLE_WINDOWS",
                         )
-                    trusted_app, trusted_window_id = trusted_context
-                    if trusted_app not in visible_apps:
-                        self._clear_trusted_context()
-                        return self._failure(
-                            "上一条已验证应用当前不可见，不能继承控制范围",
-                            stage="list_apps",
-                            error_code="SESSION_APP_NOT_VISIBLE",
-                            app=trusted_app,
-                        )
-                    try:
-                        observation = self.driver.observe(
-                            trusted_app,
-                            cancel_event=self._current_cancel,
-                        )
-                    except Exception as exc:
-                        return self._failure(
-                            f"继承应用前桌面观察失败：{_safe_exception_message(exc)}",
-                            stage="observe_driver",
-                            error_code="SESSION_CONTEXT_OBSERVE_FAILED",
-                            exception_type=type(exc).__name__,
-                            app=trusted_app,
-                        )
-                    if observation.app.strip().casefold() != trusted_app:
-                        self._clear_trusted_context()
-                        return self._failure(
-                            "桌面驱动返回了与上一条已验证应用不同的应用",
-                            stage="observe_driver",
-                            error_code="SESSION_APP_CHANGED",
-                            app=observation.app,
-                            generation=observation.generation,
-                        )
-                    if (
-                        not observation.local_window_id
-                        or observation.local_window_id != trusted_window_id
-                    ):
-                        self._clear_trusted_context()
-                        return self._failure(
-                            "上一条已验证应用窗口已经变化，不能继承控制范围",
-                            stage="observe_driver",
-                            error_code="SESSION_WINDOW_CHANGED",
-                            app=observation.app,
-                            generation=observation.generation,
-                        )
-                    inspection = self.safety.inspect_observation(
-                        observation,
-                        user_text=instruction,
+                    allowed_apps = frozenset(visible_apps)
+                    apps = inventory
+                    history.append(
+                        "local unrestricted mode exposes every freshly enumerated visible window"
                     )
-                    if inspection.disposition == DesktopSafetyDisposition.BLOCK:
+                else:
+                    explicit_apps = _explicitly_named_apps(instruction, known_apps)
+                    unsupported_scopes = _unsupported_explicit_app_scopes(
+                        instruction,
+                        known_apps,
+                    )
+                    if explicit_apps or unsupported_scopes:
+                        # A newly spoken explicit scope must never fall back to a
+                        # previously verified application after this command fails.
+                        self._clear_trusted_context()
+                    if unsupported_scopes:
                         return self._failure(
-                            f"本地安全策略阻止继承该界面：{inspection.reason}",
-                            stage="observe_safety",
-                            error_code="SESSION_OBSERVATION_BLOCKED",
-                            app=observation.app,
-                            generation=observation.generation,
+                            "本次口述明确指定了未配置的应用，不能继承上一应用",
+                            stage="list_apps",
+                            error_code="APP_SCOPE_UNSUPPORTED",
                         )
-                    allowed_apps = frozenset({trusted_app})
-                    history.append("resumed the same locally verified app window")
-                apps = json.dumps(
-                    [{"app": app, "visible_window_count": 1} for app in sorted(allowed_apps)],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
+                    allowed_apps = explicit_apps.intersection(visible_apps)
+                    if len(explicit_apps) > 1:
+                        return self._failure(
+                            "通用桌面任务必须指定唯一一个当前可见应用",
+                            stage="list_apps",
+                            error_code="APP_SCOPE_AMBIGUOUS",
+                        )
+                    if explicit_apps and not allowed_apps:
+                        return self._failure(
+                            "本次口述明确指定的应用当前不可见，不能继承上一应用",
+                            stage="list_apps",
+                            error_code="APP_SCOPE_NOT_VISIBLE",
+                            app=next(iter(explicit_apps)),
+                        )
+                    if not allowed_apps:
+                        trusted_context = self._trusted_context()
+                        if trusted_context is None:
+                            return self._failure(
+                                "通用桌面任务必须在本次口述中明确且肯定地指定唯一一个当前可见应用",
+                                stage="list_apps",
+                                error_code="APP_SCOPE_REQUIRED",
+                            )
+                        trusted_app, trusted_window_id = trusted_context
+                        if trusted_app not in visible_apps:
+                            self._clear_trusted_context()
+                            return self._failure(
+                                "上一条已验证应用当前不可见，不能继承控制范围",
+                                stage="list_apps",
+                                error_code="SESSION_APP_NOT_VISIBLE",
+                                app=trusted_app,
+                            )
+                        try:
+                            observation = self.driver.observe(
+                                trusted_app,
+                                cancel_event=self._current_cancel,
+                            )
+                        except Exception as exc:
+                            return self._failure(
+                                f"继承应用前桌面观察失败：{_safe_exception_message(exc)}",
+                                stage="observe_driver",
+                                error_code="SESSION_CONTEXT_OBSERVE_FAILED",
+                                exception_type=type(exc).__name__,
+                                app=trusted_app,
+                            )
+                        if observation.app.strip().casefold() != trusted_app:
+                            self._clear_trusted_context()
+                            return self._failure(
+                                "桌面驱动返回了与上一条已验证应用不同的应用",
+                                stage="observe_driver",
+                                error_code="SESSION_APP_CHANGED",
+                                app=observation.app,
+                                generation=observation.generation,
+                            )
+                        if (
+                            not observation.local_window_id
+                            or observation.local_window_id != trusted_window_id
+                        ):
+                            self._clear_trusted_context()
+                            return self._failure(
+                                "上一条已验证应用窗口已经变化，不能继承控制范围",
+                                stage="observe_driver",
+                                error_code="SESSION_WINDOW_CHANGED",
+                                app=observation.app,
+                                generation=observation.generation,
+                            )
+                        inspection = self.safety.inspect_observation(
+                            observation,
+                            user_text=instruction,
+                        )
+                        if inspection.disposition == DesktopSafetyDisposition.BLOCK:
+                            return self._failure(
+                                f"本地安全策略阻止继承该界面：{inspection.reason}",
+                                stage="observe_safety",
+                                error_code="SESSION_OBSERVATION_BLOCKED",
+                                app=observation.app,
+                                generation=observation.generation,
+                            )
+                        allowed_apps = frozenset({trusted_app})
+                        history.append("resumed the same locally verified app window")
+                    apps = json.dumps(
+                        [{"app": app, "visible_window_count": 1} for app in sorted(allowed_apps)],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
                 state = _TaskState(
                     task=instruction.strip(),
                     apps=apps,
@@ -1384,7 +2034,17 @@ class DesktopAgentLoopController:
                     last_action_target=None,
                     steps=0,
                     verified_action_count=0,
+                    verified_user_step_count=0,
                     remaining_seconds=self._remaining(started_at),
+                )
+                self._trace(
+                    stage="list_apps",
+                    error_code="APP_SCOPE_RESOLVED",
+                    safe_message=(
+                        "Every freshly enumerated visible window is available to the planner"
+                        if unrestricted
+                        else "The desktop application scope was resolved locally"
+                    ),
                 )
                 result = self._drive(state, cancel_event=cancel_event)
                 self._remember_trusted_context(state, result)
@@ -1529,6 +2189,7 @@ class DesktopAgentLoopController:
             state,
             pending.action,
             expectation=pending.action_expectation,
+            counts_as_user_step=pending.counts_as_user_step,
             confirmed_binding=pending.binding,
             cancel_event=cancel_event,
         )

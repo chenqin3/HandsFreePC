@@ -22,6 +22,9 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.computer_control.allow_codex_cli_host_read is False
     assert settings.computer_control.allow_legacy_codex_computer_use is False
     assert settings.computer_control.failure_policy == "pause"
+    assert settings.workmap.enabled is False
+    assert settings.workmap.out_directory is None
+    assert settings.workmap.aliases == {}
     assert settings.execution.dry_run is True
     assert settings.speech.fallback["backend"] == "none"
     assert settings.speech.command["backend"] == "sensevoice"
@@ -31,9 +34,7 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.speech.vad["backend"] == "silero"
     assert settings.speech.delimiter["backend"] == "vosk"
     assert settings.speech.delimiter["grammar"] == ["over"]
-    assert settings.speech.delimiter["model_path"].endswith(
-        "vosk-model-small-en-us-0.15"
-    )
+    assert settings.speech.delimiter["model_path"].endswith("vosk-model-small-en-us-0.15")
     assert settings.apps["codex"].voice_button_names == []
     assert settings.apps["claude"].voice_button_names == []
     assert settings.apps["codex"].mode_names["chat"] == ["Chat"]
@@ -78,6 +79,40 @@ def test_personal_runtime_can_continue_fifo_after_an_ordinary_failure(tmp_path: 
     assert settings.computer_control.failure_policy == "continue"
 
 
+def test_workmap_read_only_index_and_aliases_are_explicit_local_configuration(
+    tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "workmap" / "out"
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "workmap:\n"
+        "  enabled: true\n"
+        f"  out_directory: {out_dir.as_posix()}\n"
+        "  aliases:\n"
+        "    示例数据库:\n"
+        "      project: 示例数据项目-462365\n"
+        "      relative_path: processed_data\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.workmap.enabled is True
+    assert settings.workmap.out_directory == out_dir
+    assert settings.workmap.aliases["示例数据库"] == {
+        "project": "示例数据项目-462365",
+        "relative_path": "processed_data",
+    }
+
+
+def test_enabled_workmap_requires_an_out_directory(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("workmap:\n  enabled: true\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="workmap.out_directory"):
+        load_settings(config)
+
+
 def test_legacy_config_without_delimiter_section_uses_safe_defaults(tmp_path: Path) -> None:
     config = tmp_path / "config.yaml"
     config.write_text(
@@ -90,9 +125,7 @@ def test_legacy_config_without_delimiter_section_uses_safe_defaults(tmp_path: Pa
     assert settings.speech.wake["phrase_window_seconds"] == 4
     assert settings.speech.delimiter["backend"] == "vosk"
     assert settings.speech.delimiter["grammar"] == ["over"]
-    assert settings.speech.delimiter["model_path"].endswith(
-        "vosk-model-small-en-us-0.15"
-    )
+    assert settings.speech.delimiter["model_path"].endswith("vosk-model-small-en-us-0.15")
 
 
 def test_cloud_planner_requires_explicit_privacy_opt_in(tmp_path: Path) -> None:

@@ -26,6 +26,8 @@ class VerificationResult:
     reason: str
     app: str | None = None
     generation: int | None = None
+    expectation_kind: DesktopExpectationKind | None = None
+    expectation_text: str | None = None
 
 
 def _same_app(left: str, right: str) -> bool:
@@ -36,12 +38,16 @@ def _result(
     verified: bool,
     reason: str,
     observation: DesktopObservation | None = None,
+    *,
+    expectation: DesktopExpectation | None = None,
 ) -> VerificationResult:
     return VerificationResult(
         verified=verified,
         reason=reason,
         app=observation.app if observation is not None else None,
         generation=observation.generation if observation is not None else None,
+        expectation_kind=expectation.kind if expectation is not None else None,
+        expectation_text=expectation.text if expectation is not None else None,
     )
 
 
@@ -133,6 +139,37 @@ def _observation_contains_text(observation: DesktopObservation, expected: str) -
     return _contains_bounded_text(observation.accessibility_text, expected)
 
 
+_SEARCH_INPUT_RE = re.compile(r"(?i)\b(?:search|find|address\s+and\s+search)\b|搜索|查找|地址栏")
+
+
+def _is_search_input(element) -> bool:
+    if element is None or element_plane(element) != ElementPlane.INPUT:
+        return False
+    identity = "\n".join((element.name, element.automation_id or ""))
+    return _SEARCH_INPUT_RE.search(identity) is not None
+
+
+def _search_result_semantics(observation: DesktopObservation) -> tuple[object, ...]:
+    """Return stable local result evidence while ignoring focus-only changes."""
+
+    return (
+        observation.window_title or "",
+        tuple(
+            (
+                element.local_identity,
+                element.automation_id,
+                element.name,
+                element.control_type,
+                element.value,
+                element.selected,
+                element.enabled,
+                element.addressable,
+            )
+            for element in observation.elements
+        ),
+    )
+
+
 class DesktopVerifier:
     """Fail-closed checks over immutable before/after desktop observations."""
 
@@ -211,6 +248,56 @@ class DesktopVerifier:
 
         return _result(True, "fresh local state verifies the action result", after)
 
+    def verify_search_submission(
+        self,
+        action: DesktopAction,
+        expectation: DesktopExpectation,
+        before: DesktopObservation,
+        after: DesktopObservation,
+    ) -> VerificationResult:
+        """Verify Enter submitted an exact query and produced non-focus result state."""
+
+        query = expectation.text or ""
+        key = (action.key or "").strip().casefold()
+        before_target = _element_by_index(before, action.element_index)
+        after_target = _matching_element_after(before_target, after)
+        if (
+            expectation.kind != DesktopExpectationKind.SEARCH_SUBMITTED
+            or action.type != DesktopActionType.PRESS_KEY
+            or key not in {"enter", "return"}
+            or not query
+            or not _is_search_input(before_target)
+            or before_target.focused is not True
+            or before_target.value is None
+            or not any(
+                candidate == before_target.value
+                for candidate in _rendered_text_candidates(query)
+            )
+        ):
+            return _result(
+                False,
+                "search submission is not bound to the focused exact query",
+                after,
+            )
+        target_value_changed = bool(
+            after_target is not None and after_target.value != before_target.value
+        )
+        if (
+            not target_value_changed
+            and _search_result_semantics(after) == _search_result_semantics(before)
+        ):
+            return _result(
+                False,
+                "search Enter produced no non-focus title, address, or UI result change",
+                after,
+            )
+        return _result(
+            True,
+            "fresh local state verifies the exact search submission",
+            after,
+            expectation=expectation,
+        )
+
     def verify_expectation(
         self,
         expectation: DesktopExpectation,
@@ -238,6 +325,30 @@ class DesktopVerifier:
                     observation,
                 )
             return _result(True, "the last action has matching local verification", observation)
+
+        if expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED:
+            if (
+                last_action_result is None
+                or not last_action_result.verified
+                or last_action_result.expectation_kind != DesktopExpectationKind.SEARCH_SUBMITTED
+                or _normalized_text(last_action_result.expectation_text or "")
+                != _normalized_text(expectation.text or "")
+                or last_action_result.app is None
+                or not _same_app(last_action_result.app, observation.app)
+                or last_action_result.generation is None
+                or last_action_result.generation > observation.generation
+            ):
+                return _result(
+                    False,
+                    "no locally verified exact search submission is bound to this observation",
+                    observation,
+                )
+            return _result(
+                True,
+                "the exact search submission has matching local transition evidence",
+                observation,
+                expectation=expectation,
+            )
 
         expected = expectation.text
         if expected is None:

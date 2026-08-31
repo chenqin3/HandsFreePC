@@ -29,8 +29,8 @@ $testTemp = Join-Path $PWD ('.pytest-tmp\run-' + [guid]::NewGuid().ToString('N')
 - observation/action generation binding 与 stale index 拒绝；
 - StepPlanner 单步 JSON Schema、默认 Claude 严格 argv、Codex best-effort 显式门禁和输出拒绝；
 - 旧 `planner.enabled` one-shot fallback 只接受原句肯定、非引号/数据引用、精确授权的应用 UI 导航；云输出不能决定 feedback/pause/resume/wait/path/text/send；
-- 零/多/否定/顺带提及应用时拒绝，只接受用户肯定且唯一明确指定的应用；
-- 已识别的 terminal/UAC/认证/密码/支付/隐私/公开链接 surface fail closed；全部通用文本输入，以及命中本地已知词形/上下文的发送/删除/安装/上传/分享/关闭动作确认；同时记录未知词形不能由该词表证明安全；
+- `strict`/`personal_trusted` 在零/多/否定/顺带提及应用且无可信继承窗口时拒绝；`local_unrestricted` 则 fresh 枚举全部可见顶层 HWND、区分多 Chrome 窗口、允许跨 app 且不返回 `APP_SCOPE_REQUIRED`；
+- 已识别的 terminal/Run/UAC/认证/密码/凭据/支付/隐私 surface 在所有 profile 中 fail closed；`strict`/`personal_trusted` 另覆盖通用文本和已知副作用确认，`local_unrestricted` 另覆盖普通低风险导航/切换/Toggle/通用无风险对话框直通、显式 app/window/field exact binding、自然搜索完整提交，以及已知高影响副作用仍确认；纯坐标/任意 shell 始终阻断；
 - confirmation ID、随机四位挑战码、静态前缀拒绝、超时、重放、界面变化与再次分类；同一 `VoiceRuntime` 进程内已签发码在成功、取消或超时后都不回收，重复抽样有界耗尽时拒绝；
 - 通用 UI 确认摘要只原文显示用户原句中已验证的 exact target label；未授权 sibling/window label 的原文/语义只影响本地分类，不进入摘要，短 digest 仅是不可逆绑定元数据；
 - 每个通用 planner 动作的 expectation false-before/true-after、fresh observation、fingerprint change、精确 Unicode 输入和本地 completion expectation；
@@ -39,6 +39,7 @@ $testTemp = Join-Path $PWD ('.pytest-tmp\run-' + [guid]::NewGuid().ToString('N')
 - Qwen adapter 的 Unicode damage、edge-whitespace、tool 缺失、unknown mutation outcome；
 - 静态 `doctor` 永不声称 live-ready；
 - live doctor 使用自有 fixture，而不是用户应用。
+- WorkMap 精确 alias、否定/引号/多分句/歧义拒绝、相对路径 containment，以及 `planner_hints` 未进入云 context。
 
 涉及真实窗口、前台或麦克风的测试必须标注 `@pytest.mark.live`，默认命令排除它们。
 
@@ -185,6 +186,7 @@ computer_control:
   backend: local_agent
   driver: windows_uia
   planner_backend: claude
+  safety_profile: strict
   allow_screen_context_to_cloud: true
   allow_codex_cli_host_read: false
   allow_legacy_codex_computer_use: false
@@ -211,14 +213,51 @@ planner 测试的最低断言：
 - 一个 response 最多一个 action；
 - action 不含坐标、shell 或未知字段；
 - UIA 文本里的指令没有被当作用户任务；
-- 用户原句未唯一肯定指定 app 时，planner 根本不被调用；
+- `strict`/`personal_trusted` 下，用户原句未唯一肯定指定 app 且没有可继承的 fresh-verified window 时，planner 根本不被调用；`local_unrestricted` 则必须调用 planner，且候选范围恰为本轮 fresh 枚举的可见顶层窗口；
 - 每个 action 的任务后置条件在 fresh before 为 false，在 fresh after 为 true；
-- planner 的 `done` 会再由 LocalVerifier 检查；
+- planner 的 `done` 会再由 LocalVerifier 检查；`local_unrestricted` 还必须在 `done` 前 fresh observe 同一 HWND；
 - planner 退出或不合 Schema 时停止，不 fallback 到 legacy controller。
+
+### `local_unrestricted` 专项
+
+只在 Git 忽略的本机测试配置中设置：
+
+```yaml
+computer_control:
+  backend: local_agent
+  driver: windows_uia
+  safety_profile: local_unrestricted
+```
+
+自动化和受控 live test 至少覆盖：
+
+1. 未点名应用的自然任务不返回 `APP_SCOPE_REQUIRED`，而是把本轮 `list_apps()` 的所有可见顶层窗口作为 `allowed_apps`；
+2. 同一 Chrome 进程的两个可见顶层 HWND 具有不同动态 app ID，planner 可选择其中任意一个；inventory 包含 display name、foreground、process name 和 window title；
+3. `observe` 激活并复核确切 HWND/PID/process/title；窗口消失、HWND 复用、标题在非本项目动作后变化或 foreground 激活失败都拒绝；
+4. planner 可从一个窗口 `observe` 到另一个窗口，推断未逐字口述的菜单/选项卡/搜索框中间导航；普通切换、菜单、Toggle 和未命中风险分类的通用 OK/Continue 对话框不触发 confirmation，每个实际 action 仍绑定当前 app/generation/element；
+5. 未点名 app 的任务可由 planner 自选窗口；一旦用户明确说出 app/window/field，完成该口述步骤的 action 必须绑定 exact window/field。至少回归“在 Claude 的 Message 输入……”不能写入其他 app/editor，以及“In Chrome, search …”不能在非 Chrome 搜索框完成；
+6. “搜索 X”只允许把 UIA 识别的搜索/地址输入字段精确设为用户原文 `X`，再按 Enter/Return，并要求 fresh `SEARCH_SUBMITTED` 结果语义 transition；写入聊天/普通编辑框、补写、改写、字段只包含 `X`、只填文字不按回车，或从 UI 内容发明文本都必须拒绝；
+7. planner view 保留真实窗口标题、重复名称控件、未聚焦但可寻址的输入框，并移除 element value、automation ID、凭据样式标签和结构化 `CONTENT` 节点；
+8. `windows_uia` 只捕获选中窗口而不是全桌面。Codex argv 包含临时 `--image`，临时文件在调用结束后清理；Claude CLI adapter 是 text-only，argv 不包含图片，但两者都收到文本 title/UIA context；
+9. 识别到的发送/提交、删除、安装、上传/分享和关闭仍触发本轮 typed confirmation；终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、纯坐标和任意 shell 仍阻断；key 仍受固定 allowlist；
+10. 每个允许动作都需要 fresh bind、receipt、generation 增长、fingerprint 变化和同一后置条件 true-after；只切换窗口的零动作完成也只能由已 observe 的同一 app/HWND 的 `APP_VISIBLE` 验证。
+
+受控 live 记录必须注明屏幕上下文实际离机范围。若使用 Codex，记录选中窗口 PNG 已进入 provider context；不要用包含真实聊天、通知、病历、学生/客户资料或凭据的桌面做截图测试。
+
+### WorkMap 精确路由专项
+
+WorkMap 测试使用临时、无私人信息的假索引，不把真实导出路径或 alias 写入仓库。最低断言：
+
+- 公开默认 `enabled: false`；启用时 `out_directory` 必填；
+- 唯一项目标题、字符串 alias 和 `{project, relative_path}` alias 只对完整、肯定、单一的精确“打开/进入/查看”请求命中；
+- 否定、引号、多分句、未知/歧义 alias、缺失目标、绝对/上跳相对路径都 miss 或配置失败；
+- 命中生成 `source: workmap` 的确定性 `OPEN_PATH`，并继续走路径 binding、安全策略、执行和本地验证；
+- WorkMap 缺失/重建中不会阻止 runtime 启动，任务可 fall through；
+- 生产 agent loop 没有把 `planner_hints` 或本机绝对路径附加到 Codex/Claude context。
 
 ## 7. 第三方应用受控验收
 
-fixture PASS 后，才在非敏感测试账户和可回滚数据上验证 Codex、Claude 或其他 app。应用 profile 必须显式配置并人工检查唯一窗口：
+fixture PASS 后，才在非敏感测试账户和可回滚数据上验证 Codex、Claude 或其他 app。`strict`/`personal_trusted` 的应用 profile 必须显式配置并人工检查唯一窗口；`local_unrestricted` 不要求静态 profile，而要检查 fresh inventory 中的 exact HWND/PID/process/title binding：
 
 ```yaml
 apps:
@@ -246,12 +285,12 @@ apps:
 
 建议顺序：
 
-1. **最小观察**：`strict` 下用户原句只肯定命名一个 app 和目标控件；验证未命名、两个 app、否定提及和顺带提及都会拒绝。`personal_trusted` 另验同一控制器可继承上一条 fresh-verified app/window，而新控制器、窗口变化和 strict 不继承。断言 `CONTENT` 永不进入 planner；strict 只含被点名控件，personal_trusted 最多再含安全导航控件与当前输入框；两者都不含原始窗口标题、进程 ID、value/automation ID、截图 bytes 或真实截图可用性；
+1. **最小观察**：`strict` 下用户原句只肯定命名一个 app 和目标控件；验证未命名、两个 app、否定提及和顺带提及都会拒绝。`personal_trusted` 另验同一控制器可继承上一条 fresh-verified app/window，而新控制器、窗口变化和 strict 不继承。断言 `CONTENT` 永不作为结构化元素进入 planner；strict 只含被点名控件，personal_trusted 最多再含安全导航控件与当前输入框；两者都不含原始窗口标题、进程 ID、value/automation ID、截图 bytes 或真实截图可用性。`local_unrestricted` 则按上一节单独验全部 fresh 顶层窗口、真实标题/UIA context 与 Codex 选中窗口截图，并断言未点名 app 不返回 `APP_SCOPE_REQUIRED`、明确点名的 app/window/field 仍 exact bind；
 2. **无副作用导航**：切换一个已知 tab，要求 after UIA 中出现选中状态或特定文本；
-3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；`strict` 必须等待随机四位码，静态“确认执行”无效；`personal_trusted` 只有本句完整口述、唯一聚焦非密码输入框可免确认。两种模式都要求 exact round-trip，且不能点击发送；
-4. **多步任务**：每步后核对 generation 增加、fingerprint 变化，并记录同一任务 expectation 的 false-before 和 true-after；
-5. **typed confirmation**：用测试草稿的“发送”按钮触发确认，但先取消；验证错 ID、错误/旧四位码、过期、重放和确认前界面变化都拒绝；
-6. **一次确认执行**：只在测试账户发送无害内容，说出本轮随机四位码，确认仅执行原动作一次；
+3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；`strict` 必须等待随机四位码，静态“确认执行”无效；`personal_trusted` 只有本句完整口述、唯一聚焦非密码输入框可免确认。这两种模式都要求 exact round-trip，且不能点击发送。`local_unrestricted` 另验自然“搜索 X”精确替换查询字段、按 Enter/Return，并以 fresh result transition 而非字段回显验收；
+4. **多步任务**：每步后核对 generation 增加、fingerprint 变化，并记录同一任务 expectation 的 false-before 和 true-after；另断言推断的中间导航不冒充口述步骤，只完成第一段后返回 `done` 必须失败；
+5. **typed confirmation（所有 profile 的已识别高影响动作）**：用测试草稿的“发送”按钮触发确认，但先取消；验证错 ID、错误/旧四位码、过期、重放和确认前界面变化都拒绝。`local_unrestricted` 的普通低风险切换/导航/Toggle/通用无风险对话框应不确认，但发送/提交、删除、安装、上传/分享和关闭仍必须确认；
+6. **一次确认执行（所有 profile 的已识别高影响动作）**：只在测试账户发送无害内容，说出本轮随机四位码，确认仅执行原动作一次；不得因 `local_unrestricted` 跳过或伪造高影响 confirmation PASS；
 7. **阻断表面**：验证真实密码、聚焦 secret/API-key 输入、认证、付款和 UAC 不会进入 planner/action；同时验证聊天正文提到 password/terminal/payment、已知凭据示例或普通长 ID 不会阻断无关安全标签，正文与凭据原文也不会进入 planner；
 8. **急停**：在可重复任务中急停，记录当前动作是否已发生和后续队列是否清空。
 

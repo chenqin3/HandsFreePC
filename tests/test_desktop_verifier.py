@@ -417,3 +417,42 @@ def test_selected_expectation_requires_one_exact_locally_selected_element() -> N
 def test_damaged_unicode_cannot_verify_action_or_completion() -> None:
     with pytest.raises(ValueError, match="damaged Unicode"):
         _observation("changed \ufffd", generation=2)
+
+
+def test_search_submission_requires_the_entire_field_value_to_equal_the_query() -> None:
+    verifier = DesktopVerifier()
+    target = DesktopElement(
+        "2",
+        "Address and search bar",
+        "Edit",
+        value="OpenAI pricing",
+        focused=True,
+    )
+    before = _observation(
+        "search input",
+        app="chrome",
+        generation=1,
+        elements=(target,),
+    )
+    after = _observation(
+        "search results changed",
+        app="chrome",
+        generation=2,
+        elements=(target, DesktopElement("3", "Results", "Text")),
+    )
+    action = DesktopAction(
+        DesktopActionType.PRESS_KEY,
+        app="chrome",
+        generation=1,
+        element_index="2",
+        key="enter",
+    )
+
+    result = verifier.verify_search_submission(
+        action,
+        DesktopExpectation(DesktopExpectationKind.SEARCH_SUBMITTED, "OpenAI"),
+        before,
+        after,
+    )
+
+    assert not result.verified

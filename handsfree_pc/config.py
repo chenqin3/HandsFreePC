@@ -90,9 +90,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "beam_size": 5,
             "initial_prompt": (
                 "语音控制命令可能包含 "
-                "Claude、Codex、Chat and Cowork、Design 和 over。"
+                "Claude、Codex、Chrome、资源管理器、微信、"
+                "Chat and Cowork、Design 和 over。"
             ),
-            "hotwords": "Claude Codex Chat and Cowork Design over",
+            "hotwords": (
+                "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat "
+                "Chat and Cowork Design over"
+            ),
         },
         "fallback": {
             "backend": "none",
@@ -103,9 +107,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "beam_size": 5,
             "initial_prompt": (
                 "语音控制命令可能包含 "
-                "Claude、Codex、Chat and Cowork、Design 和 over。"
+                "Claude、Codex、Chrome、资源管理器、微信、"
+                "Chat and Cowork、Design 和 over。"
             ),
-            "hotwords": "Claude Codex Chat and Cowork Design over",
+            "hotwords": (
+                "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat "
+                "Chat and Cowork Design over"
+            ),
         },
     },
     "planner": {
@@ -140,6 +148,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "open_computer_use_args": ["mcp"],
         "allow_experimental_driver": False,
         "allow_coordinate_actions": False,
+    },
+    "workmap": {
+        "enabled": False,
+        "out_directory": None,
+        "aliases": {},
     },
     "execution": {
         "dry_run": True,
@@ -231,6 +244,91 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "输入消息",
                 "询问 Claude",
             ],
+        },
+        "chrome": {
+            "process_names": ["chrome.exe"],
+            "executable": None,
+            "title_patterns": ["Chrome"],
+            "search_hotkey": None,
+            "native_voice_hotkey": None,
+            "voice_button_names": [],
+            "mode_names": {},
+            "include_control_types": [
+                "Button",
+                "TabItem",
+                "MenuItem",
+                "ListItem",
+                "TreeItem",
+                "Edit",
+                "ComboBox",
+                "CheckBox",
+                "RadioButton",
+                "Dialog",
+                "Window",
+            ],
+            "content_control_types": ["Text", "Document", "Pane", "Group"],
+            "drop_long_content": True,
+            "max_control_name_chars": 500,
+            "max_content_chars": 1000,
+            "max_content_nodes": 120,
+            "composer_names": ["Address and search bar", "Search"],
+        },
+        "explorer": {
+            "process_names": ["explorer.exe"],
+            "executable": None,
+            "title_patterns": ["File Explorer", "资源管理器", "此电脑"],
+            "search_hotkey": None,
+            "native_voice_hotkey": None,
+            "voice_button_names": [],
+            "mode_names": {},
+            "include_control_types": [
+                "Button",
+                "TabItem",
+                "MenuItem",
+                "ListItem",
+                "TreeItem",
+                "Edit",
+                "ComboBox",
+                "CheckBox",
+                "RadioButton",
+                "DataItem",
+                "Dialog",
+                "Window",
+            ],
+            "content_control_types": ["Text", "Document", "Pane", "Group"],
+            "drop_long_content": True,
+            "max_control_name_chars": 500,
+            "max_content_chars": 1000,
+            "max_content_nodes": 160,
+            "composer_names": ["Address", "Search"],
+        },
+        "wechat": {
+            "process_names": ["Weixin.exe", "WeChat.exe"],
+            "executable": None,
+            "title_patterns": ["微信", "WeChat"],
+            "search_hotkey": None,
+            "native_voice_hotkey": None,
+            "voice_button_names": [],
+            "mode_names": {},
+            "include_control_types": [
+                "Button",
+                "TabItem",
+                "MenuItem",
+                "ListItem",
+                "TreeItem",
+                "Edit",
+                "ComboBox",
+                "CheckBox",
+                "RadioButton",
+                "Dialog",
+                "Window",
+            ],
+            "content_control_types": ["Text", "Document", "Pane", "Group"],
+            "drop_long_content": True,
+            "max_control_name_chars": 500,
+            "max_content_chars": 1000,
+            "max_content_nodes": 120,
+            "composer_names": ["输入", "消息", "Type a message"],
         },
     },
 }
@@ -416,6 +514,13 @@ class ExecutionSettings:
 
 
 @dataclass(slots=True)
+class WorkMapSettings:
+    enabled: bool
+    out_directory: Path | None
+    aliases: dict[str, Any]
+
+
+@dataclass(slots=True)
 class AppProfile:
     name: str
     process_names: list[str]
@@ -446,6 +551,7 @@ class Settings:
     planner: PlannerSettings
     computer_control: ComputerControlSettings
     execution: ExecutionSettings
+    workmap: WorkMapSettings
     apps: dict[str, AppProfile] = field(default_factory=dict)
 
 
@@ -481,6 +587,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
     speech_raw = raw["speech"]
     planner_raw = raw["planner"]
     computer_control_raw = raw["computer_control"]
+    workmap_raw = raw["workmap"]
     execution_raw = raw["execution"]
 
     privacy_values = {
@@ -522,6 +629,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
         section="computer_control",
     )
     execution_dry_run = _require_bool(execution_raw, "dry_run", section="execution")
+    workmap_enabled = _require_bool(workmap_raw, "enabled", section="workmap")
     _require_bool(speech_raw["command"], "use_itn", section="speech.command")
 
     wake_phrases = _require_string_list(app_raw, "wake_phrases", section="app")
@@ -550,6 +658,38 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
         for name, value in execution_raw["path_aliases"].items()
     }
     roots = [_expand_path(str(value), base_dir=base_dir) for value in execution_raw["search_roots"]]
+    workmap_directory_value = workmap_raw.get("out_directory")
+    if workmap_directory_value is not None and not isinstance(workmap_directory_value, str):
+        raise ValueError("workmap.out_directory must be a string or null")
+    workmap_directory = (
+        _expand_path(workmap_directory_value, base_dir=base_dir)
+        if workmap_directory_value
+        else None
+    )
+    workmap_aliases_raw = workmap_raw.get("aliases")
+    if not isinstance(workmap_aliases_raw, dict):
+        raise ValueError("workmap.aliases must be a mapping")
+    workmap_aliases: dict[str, Any] = {}
+    for alias_name, alias_target in workmap_aliases_raw.items():
+        if not isinstance(alias_name, str) or not alias_name.strip():
+            raise ValueError("workmap.aliases keys must be non-empty strings")
+        if isinstance(alias_target, str):
+            if not alias_target.strip():
+                raise ValueError(f"workmap.aliases.{alias_name} must not be empty")
+            workmap_aliases[alias_name] = alias_target
+            continue
+        if not isinstance(alias_target, dict) or set(alias_target) - {
+            "project",
+            "relative_path",
+        }:
+            raise ValueError(f"workmap.aliases.{alias_name} must be a project string or mapping")
+        project = alias_target.get("project")
+        relative_path = alias_target.get("relative_path")
+        if not isinstance(project, str) or not project.strip():
+            raise ValueError(f"workmap.aliases.{alias_name}.project must be non-empty")
+        if relative_path is not None and not isinstance(relative_path, str):
+            raise ValueError(f"workmap.aliases.{alias_name}.relative_path must be a string or null")
+        workmap_aliases[alias_name] = copy.deepcopy(alias_target)
     profiles: dict[str, AppProfile] = {}
     for name, value in raw["apps"].items():
         if not isinstance(value, dict):
@@ -695,6 +835,11 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             path_aliases=aliases,
             search_roots=roots,
         ),
+        workmap=WorkMapSettings(
+            enabled=workmap_enabled,
+            out_directory=workmap_directory,
+            aliases=workmap_aliases,
+        ),
         apps=profiles,
     )
     _validate(settings)
@@ -702,6 +847,8 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
 
 
 def _validate(settings: Settings) -> None:
+    if settings.workmap.enabled and settings.workmap.out_directory is None:
+        raise ValueError("workmap.out_directory is required when workmap.enabled is true")
     phrase_groups = {
         "wake phrase": settings.app.wake_phrases,
         "end-session phrase": settings.app.end_session_phrases,
@@ -754,9 +901,14 @@ def _validate(settings: Settings) -> None:
         raise ValueError(
             "computer_control.planner_backend must be codex_cli_best_effort, claude, or none"
         )
-    if settings.computer_control.safety_profile not in {"strict", "personal_trusted"}:
+    if settings.computer_control.safety_profile not in {
+        "strict",
+        "personal_trusted",
+        "local_unrestricted",
+    }:
         raise ValueError(
-            "computer_control.safety_profile must be strict or personal_trusted"
+            "computer_control.safety_profile must be strict, personal_trusted, "
+            "or local_unrestricted"
         )
     if (
         settings.computer_control.driver == "open_computer_use"
@@ -806,7 +958,8 @@ def _validate(settings: Settings) -> None:
         raise ValueError(
             "computer_control.enabled requires "
             "computer_control.allow_screen_context_to_cloud=true because the completed task, "
-            "authorized app summary, and exactly named UI control labels may leave the machine"
+            "profile-dependent app/window metadata and UI control labels may leave the machine; "
+            "local_unrestricted Codex planning may also send the selected-window screenshot"
         )
     uses_any_codex_cli = (settings.planner.enabled and settings.planner.backend == "codex") or (
         settings.computer_control.enabled

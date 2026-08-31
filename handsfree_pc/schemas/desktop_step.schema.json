@@ -85,90 +85,6 @@
         "text",
         "key",
         "value"
-      ],
-      "allOf": [
-        {
-          "if": {"properties": {"type": {"const": "click"}}},
-          "then": {
-            "properties": {
-              "direction": {"type": "null"},
-              "pages": {"type": "null"},
-              "action_name": {"type": "null"},
-              "text": {"type": "null"},
-              "key": {"type": "null"},
-              "value": {"type": "null"}
-            }
-          }
-        },
-        {
-          "if": {"properties": {"type": {"const": "perform_secondary_action"}}},
-          "then": {
-            "properties": {
-              "click_count": {"type": "null"},
-              "mouse_button": {"type": "null"},
-              "direction": {"type": "null"},
-              "pages": {"type": "null"},
-              "text": {"type": "null"},
-              "key": {"type": "null"},
-              "value": {"type": "null"}
-            }
-          }
-        },
-        {
-          "if": {"properties": {"type": {"const": "scroll"}}},
-          "then": {
-            "properties": {
-              "click_count": {"type": "null"},
-              "mouse_button": {"type": "null"},
-              "action_name": {"type": "null"},
-              "text": {"type": "null"},
-              "key": {"type": "null"},
-              "value": {"type": "null"}
-            }
-          }
-        },
-        {
-          "if": {"properties": {"type": {"const": "type_text"}}},
-          "then": {
-            "properties": {
-              "click_count": {"type": "null"},
-              "mouse_button": {"type": "null"},
-              "direction": {"type": "null"},
-              "pages": {"type": "null"},
-              "action_name": {"type": "null"},
-              "key": {"type": "null"},
-              "value": {"type": "null"}
-            }
-          }
-        },
-        {
-          "if": {"properties": {"type": {"const": "press_key"}}},
-          "then": {
-            "properties": {
-              "click_count": {"type": "null"},
-              "mouse_button": {"type": "null"},
-              "direction": {"type": "null"},
-              "pages": {"type": "null"},
-              "action_name": {"type": "null"},
-              "text": {"type": "null"},
-              "value": {"type": "null"}
-            }
-          }
-        },
-        {
-          "if": {"properties": {"type": {"const": "set_value"}}},
-          "then": {
-            "properties": {
-              "click_count": {"type": "null"},
-              "mouse_button": {"type": "null"},
-              "direction": {"type": "null"},
-              "pages": {"type": "null"},
-              "action_name": {"type": "null"},
-              "text": {"type": "null"},
-              "key": {"type": "null"}
-            }
-          }
-        }
       ]
     },
     "expectation": {
@@ -182,7 +98,8 @@
             "text_present",
             "text_absent",
             "focused_contains",
-            "element_selected"
+            "element_selected",
+            "search_submitted"
           ]
         },
         "text": {"type": ["string", "null"], "maxLength": 500}

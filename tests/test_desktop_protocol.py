@@ -241,6 +241,27 @@ def test_local_window_identity_changes_fingerprint_but_never_planner_context():
     assert "hwnd:100" not in json.dumps(context, ensure_ascii=False)
 
 
+def test_volatile_screenshot_bytes_do_not_change_semantic_freshness_fingerprint():
+    first = DesktopObservation(
+        app="chrome",
+        generation=1,
+        accessibility_text='0 name="Search" control_type="Edit" focused=true',
+        screenshot_png=b"first-frame",
+        window_title="Chrome",
+        local_window_id="window-a",
+    )
+    second = DesktopObservation(
+        app="chrome",
+        generation=2,
+        accessibility_text=first.accessibility_text,
+        screenshot_png=b"cursor-blink-frame",
+        window_title="Chrome",
+        local_window_id="window-a",
+    )
+
+    assert first.fingerprint == second.fingerprint
+
+
 @pytest.mark.parametrize("invalid", ["bad\ufffdtext", "bad\ud800text", "bad\x00text"])
 def test_observation_and_element_reject_lossy_or_control_unicode(invalid: str):
     with pytest.raises(ValueError, match="Unicode|UTF-8|control"):

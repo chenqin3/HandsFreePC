@@ -266,6 +266,30 @@ def test_textual_and_sample_bound_marker_never_enqueue_the_same_prompt_twice(set
         runtime.stop()
 
 
+def test_repetitive_asr_tail_after_over_never_pollutes_the_next_prompt(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+
+        runtime._handle_marked_session_segments(
+            ["切换到 Claude", "Codex, Codex, Codex, Codex, Codex.com"],
+            marker_count=1,
+        )
+
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["切换到 Claude"]
+        assert not runtime.prompt_assembler.has_pending
+    finally:
+        runtime.stop()
+
+
 def test_sample_bound_marker_does_not_mask_an_oversized_prefix_error(settings) -> None:
     enable_computer_control(settings)
     settings.computer_control.max_prompt_chars = 4
@@ -748,10 +772,46 @@ def test_control_phrase_transcript_overlap_preserves_real_command_text() -> None
         ("确认执行", "执行", "确认执行"),
         ("取消所有操作", "所有操作", "取消所有操作"),
         ("结束语音操作", "语音操作", "结束语音操作"),
+        ("开始语音操作", "包子。", "开始语音操作"),
     ]
 
     for matched, transcript, expected in cases:
         assert _merge_control_phrase_transcript(matched, transcript) == expected
+
+
+def test_wake_only_asr_hallucination_does_not_pollute_first_queued_prompt(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text(_merge_control_phrase_transcript("开始语音操作", "包子。"))
+        runtime.handle_session_text("切换到 Claude over")
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["切换到 Claude"]
+    finally:
+        runtime.stop()
+
+
+def test_observed_end_session_homophone_ends_continuous_input(settings) -> None:
+    enable_computer_control(settings)
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=FakeController(),
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+        outcome = runtime.handle_session_text("接触语音操作。")
+        assert outcome.success is True
+        assert runtime.session_state == SessionState.ARMED
+    finally:
+        runtime.stop()
 
 
 def test_slow_wake_preserves_exact_path_in_queued_controller_prompt(settings) -> None:

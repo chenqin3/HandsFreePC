@@ -29,7 +29,7 @@ Windows 与目标应用            外部依赖，状态可并发变化
 1. **确定性能力优先。** 命中 `NativeSkillRouter` 的完整请求不调用 LLM；确定性动作先解析最终目标并运行本地安全策略。
 2. **planner 不拥有电脑。** 默认 Claude（或显式 best-effort Codex）只能返回一个严格结构化步骤，不能调用项目的鼠标键盘 driver。
 3. **动作词表有限。** Schema 不含 shell、PowerShell、Run、任意脚本或任意文件系统命令。
-4. **单一明确应用。** 用户原句必须肯定且只授权一个已配置应用；零个、多个、否定或顺带提及都不交给 planner 自行扩大范围。
+4. **按 profile 约束应用范围。** `strict` 要求原句肯定且只授权一个已配置应用，`personal_trusted` 只可继承同一控制器刚刚 fresh-verified 的窗口；显式本机 `local_unrestricted` 则无 `APP_SCOPE_REQUIRED`，把本轮 fresh 枚举并在步骤间动态刷新的全部可见普通顶层窗口交给 planner，允许跨 app。用户若明确说出 app/window/field，完成对应口述步骤的 action 仍须精确绑定该 window/field。
 5. **一观察一动作。** action 必须绑定 `app + generation`；执行一次后旧 observation 失效。
 6. **先核目标再输入。** 默认 driver 要求唯一目标窗口、interactive desktop、预期 HWND 前台和可用 UIA 元素。
 7. **通用步骤 false-before/true-after。** 每个通用 planner 动作必须带任务相关后置条件，fresh before 时为 false，动作后的 fresh state 中为 true；确定性 native skill 使用动作特定证据，精确目标状态已成立时可幂等成功。
@@ -37,8 +37,8 @@ Windows 与目标应用            外部依赖，状态可并发变化
 9. **本地完成验收。** planner prose 和旧 `VERIFIED_COMPLETION` 都不是证据；只有 `DesktopVerifier` 通过才返回 `LOCAL_VERIFIED_COMPLETION`。
 10. **精确确认。** 确认 ID 绑定动作参数、expectation 与 observation fingerprint；随机四位一次性口令还绑定本轮 runtime pending action，并只保证在当前 `VoiceRuntime` 进程运行期内不再次签发。
 11. **失败不降级。** `local_agent` 失败不会自动回退到旧 Codex controller、坐标点击或 shell。
-12. **完整界面不离开本地。** 本地策略先在完整 observation 上按已知词形和元素属性检查 terminal、UAC、认证、凭据、付款、隐私与公开链接界面；命中即 fail closed，再只为云 planner 重建本句肯定且精确点名控件的最小子集。
-13. **参数与完整目标逐步绑定。** 动作类型、完整目标短语、完整口述输入 payload、按键、点击参数、secondary action、滚动方向和页数必须来自当前用户步骤；`type/input` 与 `fill/write` 分别只授权 `type_text` 与 `set_value`。较长用户目标不能缩成当前唯一可见的短标签，输入不能截取口述 payload 的子串或借用后续输入动作的 payload，结果文本不能反向提供动作参数；文本动作后存在独立非空肯定 clause 时，payload 出现不能自证完成；不支持的尾随桌面动作仍计入总步骤，不能被提前完成掩盖。
+12. **按 profile 最小化界面数据。** 本地策略先在完整 observation 上按已知词形和元素属性分类敏感 surface。`strict`/`personal_trusted` 只为云 planner 重建已授权控件子集，不发送原始标题或截图；`local_unrestricted` 会发送全部 fresh 窗口的标题/进程摘要和选中窗口的真实标题/UIA context，Codex 还可接收选中窗口 PNG，Claude CLI adapter 仍为 text-only。结构化 `CONTENT`、element value/automation ID、PCM 与剪贴板不发送。
+13. **参数与显式目标绑定。** `strict`/`personal_trusted` 中，动作类型、完整目标短语、完整口述输入 payload、按键、点击参数、secondary action、滚动方向和页数必须来自当前用户步骤；`type/input` 与 `fill/write` 分别只授权 `type_text` 与 `set_value`。`local_unrestricted` 可推断普通中间导航，但用户明确说出的 app/window/field 仍约束最终用户 action，输入文本仍必须来自口述 exact span。自然搜索还必须精确设置查询、按 Enter/Return 并验证 fresh result transition。较长用户目标不能缩成短标签，输入不能截取 payload 子串或借用后续 payload，结果文本不能反向提供参数；不支持的尾随动作仍计入总步骤，不能被提前完成掩盖。
 14. **不猜条件语义。** 没有本地条件求值器的条件命令整体 fail closed；不会把 `if/when/unless` 的分支动作当成无条件授权。
 
 精确标签必须在动作前成立；fuzzy 命中不能先点击再失败。对于 click/navigation，单纯 `focused_contains` 只说明焦点移动，不证明目标页面已经打开。同目标 `ELEMENT_SELECTED` 只适用于用户明确要求 select/choose/switch 的步骤；open/click/send/delete/close 等必须使用用户原句明确给出的独立目标状态。
@@ -59,7 +59,7 @@ Windows 与目标应用            外部依赖，状态可并发变化
 
 ### 已识别时需要 typed confirmation
 
-- 通用 agent 的全部 `type_text` 与 `set_value`，包括只写入草稿而不发送；
+- `strict` 的全部通用 `type_text` 与 `set_value`，包括只写入草稿而不发送；`personal_trusted` 仅豁免本句完整口述、唯一聚焦非密码输入框中的未发送草稿；
 - 本地词形/上下文识别为发送、提交、发布、回复或评论；
 - 本地词形/上下文识别为删除、移除、清空或永久删除；
 - 本地词形/上下文识别为安装、卸载或升级软件；
@@ -67,7 +67,7 @@ Windows 与目标应用            外部依赖，状态可并发变化
 - 本地词形/上下文识别为关闭、退出、取消或舍弃应用状态；
 - 已知会触发上述副作用的 Enter/Delete/快捷键。
 
-除 `type_text`/`set_value` 的动作类型门禁外，以上副作用确认和 surface 阻断依赖有限的中英文词形、控件属性与上下文规则。它们只是纵深防御，不是完整语义证明；未知语言/同义词、应用文案变化、自绘控件或伪装界面可能漏检。因此公开默认关闭真实执行，重要外发、删除、安装、分享或不可逆任务不应无人监督。
+`local_unrestricted` 的普通低风险窗口/选项卡切换、菜单导航、Toggle 和没有命中风险分类的通用 OK/Continue 对话框不需要确认；这项豁免不覆盖上列已识别的高影响动作。除 `type_text`/`set_value` 的 profile 门禁外，以上副作用确认和 surface 阻断依赖有限的中英文词形、控件属性与上下文规则。它们只是纵深防御，不是完整语义证明；未知语言/同义词、应用文案变化、自绘控件或伪装界面可能漏检。因此公开默认关闭真实执行，重要外发、删除、安装、分享或不可逆任务不应无人监督。
 
 ## typed confirmation 协议
 
@@ -97,10 +97,10 @@ Windows 与目标应用            外部依赖，状态可并发变化
 网页、聊天消息、文档、项目名和 accessibility label 都可能包含恶意指令。防护：
 
 - planner prompt 明确把 task-authorized 控件子集标为 data；
-- planner 只收到唯一授权 app 摘要、本句肯定且精确点名的控件字段和最近本地验收摘要；原始窗口标题、聊天正文及未点名 UI 留在本地；
+- `strict`/`personal_trusted` 的 planner 只收到唯一授权 app 摘要、相应裁剪控件和最近本地验收摘要；`local_unrestricted` 则会收到全部 fresh 可见顶层窗口的标题/进程摘要、选中窗口真实标题和可寻址 UIA 控件，Codex 还会收到选中窗口截图；
 - Schema 只允许单个语义动作；
 - 本地策略不采信页面关于安全/确认的声明；
-- 已被本地词形/属性识别的终端、认证、凭据、付款、隐私/公开链接和 OS 安全界面在发送给云 planner 前 fail closed；
+- `strict`/`personal_trusted` 在发送 planner view 前阻断已识别的终端、认证、凭据、付款、隐私/公开链接和 OS 安全界面；`local_unrestricted` 在 observe 前阻断终端/Run/UAC/认证身份、聚焦 secret 和高置信凭据，付款/隐私目标则在 action 风险评估时硬阻断；
 - 动作必须引用当前 observation 的 element index；历史 index 不可复用；
 - 本地 verifier 只比较状态，不采信页面里的“操作已成功”作为唯一证据。
 
@@ -127,12 +127,12 @@ Claude adapter 显式传入独立 system policy、空工具列表、safe/restric
 启用 `local_agent` 且 `planner_backend != none` 时，配置必须同时允许转写和屏幕上下文离开本机。当前 0.3 planner prompt 可包含：
 
 - 完整的当前任务转写；
-- 用户原句中唯一明确授权、且当前可见的 app 摘要；
 - task-authorized observation generation；
-- 仅由本句肯定、精确点名的 UIA element 名称、index、control type 与 selected/focused/enabled 状态；
 - 最近最多 8 条本地验收历史。
 
-当前 prompt 不发送原始窗口标题、进程 ID、未点名元素、automation ID、element value、聊天正文、PCM、screenshot bytes 或真实截图可用性。完整 observation 留在本地 verifier；凭据样式长串在 planner payload 中再做 redaction。这不是未来版本保证，升级前应重审 [PRIVACY.md](../PRIVACY.md)。
+`strict`/`personal_trusted` 另包含唯一授权 app 摘要和相应的 task-authorized UIA element 名称/index/control type/selected/focused/enabled 状态；不发送原始窗口标题、截图 bytes 或真实截图可用性。`local_unrestricted` 另包含本轮所有 fresh 可见普通顶层窗口的动态 app ID、display name、foreground、process name、真实窗口标题，以及 observe 后经凭据过滤的全部可寻址 control/input 元素。Codex adapter 还可把选中窗口 PNG 作为临时 `--image` 输入；Claude CLI adapter 是 text-only，只接收文本 inventory/title/UIA context，不接收这份 PNG。
+
+所有 profile 都不把 automation ID、element value、PCM、剪贴板或 `CONTENT` plane 节点作为结构化字段发送；完整原始 observation 留在本地 verifier，凭据样式长串在 planner payload 中再做 redaction。但 `local_unrestricted` 截图像素可能视觉包含聊天正文、文件名或通知。这不是未来版本保证，升级前应重审 [PRIVACY.md](../PRIVACY.md)。
 
 这只限定 HandsFreePC 主动构造的 prompt。CLI/provider 仍可能处理账户/组织、认证、网络、CLI/OS/runtime、临时工作目录、调用时间/用量、错误和诊断/遥测等自身元数据，或添加自己的系统级 runtime context；项目开关不能证明这些数据不存在。
 
@@ -141,6 +141,8 @@ Claude adapter 显式传入独立 system policy、空工具列表、safe/restric
 受支持方式是普通权限、当前交互用户、`Default` input desktop。项目不安装 Windows Service、不要求管理员权限、不使用 UIAccess，也不自动同意 UAC。
 
 Windows UIA driver 的本地证据包括窗口 HWND、进程名/标题、当前 generation、可见/启用元素、值/选中/焦点状态。password value 不进入 observation。动作前后复核前台窗口；Windows UIPI 仍可能阻止普通进程向更高完整性应用输入。
+
+公开默认 `strict`/`personal_trusted` 只解析已配置 app profile。显式本机 `local_unrestricted` 会 fresh 枚举全部可见普通顶层 HWND，将多 Chrome 窗口分别绑定，并在后续步骤刷新 inventory；observe 时激活/复核确切 HWND/PID/process/title，消失、复用或身份变化即停止。它取消 `APP_SCOPE_REQUIRED`、普通中间导航目标点名与普通低风险导航确认，允许跨 app 推断窗口/选项卡、菜单、Toggle 和未命中风险分类的通用 OK/Continue 对话框；明确口述的 app/window/field 仍 exact bind。自然搜索必须精确设置 query、按 Enter/Return 并看到 fresh result transition。识别到的发送/提交、删除、安装、上传/分享和关闭等高影响动作仍要求本轮确认；终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、纯坐标和任意 shell 仍是硬边界。每个允许动作仍需 fresh bind 和本地 false-before/true-after 验证。
 
 残余风险：
 

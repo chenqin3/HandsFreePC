@@ -49,9 +49,7 @@ class FakeElement:
         on_visibility_check=None,
     ) -> None:
         labeled_by = (
-            SimpleNamespace(CurrentName=labeled_by_name)
-            if labeled_by_name is not None
-            else None
+            SimpleNamespace(CurrentName=labeled_by_name) if labeled_by_name is not None else None
         )
         self.element_info = SimpleNamespace(
             name=name,
@@ -205,6 +203,10 @@ class FakeNative:
     def assert_interactive_desktop(self):
         self.calls.append(("assert_interactive_desktop",))
 
+    def enumerate_windows(self):
+        self.calls.append(("enumerate_windows",))
+        return list(self.windows)
+
     def find_windows(self, *, title_patterns, process_names):
         self.calls.append(("find_windows", tuple(title_patterns), tuple(process_names)))
         return list(self.windows)
@@ -354,6 +356,171 @@ def test_list_apps_and_observe_are_restricted_to_configured_app_and_hwnd():
         driver.observe("terminal")
 
 
+class _FakePngImage:
+    def save(self, stream, *, format):
+        assert format == "PNG"
+        stream.write(b"\x89PNG\r\n\x1a\nfixture")
+
+
+class _ScreenshotRoot(FakeRoot):
+    def capture_as_image(self):
+        return _FakePngImage()
+
+
+def test_unrestricted_inventory_exposes_each_top_level_window_as_a_unique_target():
+    first = WindowInfo(101, "First tab - Chrome", 5101, "chrome.exe")
+    second = WindowInfo(202, "Second tab - Chrome", 5202, "chrome.exe")
+    explorer = WindowInfo(303, "Downloads", 5303, "explorer.exe")
+    native = FakeNative([first, second, explorer])
+    desktop = FakeDesktop(
+        {
+            first.hwnd: _ScreenshotRoot([FakeElement("Address", "Edit")]),
+            second.hwnd: _ScreenshotRoot([FakeElement("Second", "Button")]),
+            explorer.hwnd: _ScreenshotRoot([FakeElement("Downloads", "TreeItem")]),
+        }
+    )
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: desktop,
+        discover_all_windows=True,
+        activate_on_observe=True,
+        capture_screenshots=True,
+    )
+
+    inventory = json.loads(driver.list_apps())
+    app_ids = [item["app"] for item in inventory]
+    chrome_entries = [item for item in inventory if item["process_name"] == "chrome.exe"]
+
+    assert len(inventory) == 3
+    assert len(app_ids) == len(set(app_ids))
+    assert len(chrome_entries) == 2
+    assert all(item["visible_window_count"] == 1 for item in inventory)
+    assert {item["window_title"] for item in chrome_entries} == {
+        first.title,
+        second.title,
+    }
+
+    second_app = next(
+        item["app"] for item in chrome_entries if item["window_title"] == second.title
+    )
+    observation = driver.observe(second_app)
+
+    assert observation.app == second_app
+    assert observation.local_window_id == f"hwnd:{second.hwnd}"
+    assert observation.window_title == second.title
+    assert observation.screenshot_png == b"\x89PNG\r\n\x1a\nfixture"
+    assert desktop.handles == [second.hwnd]
+    assert ("activate_window", second.hwnd) in native.calls
+    assert ("assert_foreground", second.hwnd) in native.calls
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        WindowInfo(101, "Different title", 5101, "chrome.exe"),
+        WindowInfo(101, "First tab - Chrome", 9999, "chrome.exe"),
+        WindowInfo(101, "First tab - Chrome", 5101, "other.exe"),
+    ],
+)
+def test_unrestricted_observe_rejects_stale_window_rebinding(replacement):
+    original = WindowInfo(101, "First tab - Chrome", 5101, "chrome.exe")
+    native = FakeNative([original])
+    driver = WindowsUiaDriver(
+        {},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop(
+            {replacement.hwnd: FakeRoot([FakeElement("Open", "Button")])}
+        ),
+        discover_all_windows=True,
+    )
+    app_id = json.loads(driver.list_apps())[0]["app"]
+    native.windows = [replacement]
+
+    with pytest.raises(WindowsUiaStaleObservation, match="identity changed"):
+        driver.observe(app_id)
+
+
+def test_unrestricted_observe_rejects_a_window_that_disappeared_after_inventory():
+    window = WindowInfo(101, "First tab - Chrome", 5101, "chrome.exe")
+    native = FakeNative([window])
+    driver = WindowsUiaDriver(
+        {},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop({}),
+        discover_all_windows=True,
+    )
+    app_id = json.loads(driver.list_apps())[0]["app"]
+    native.windows = []
+
+    with pytest.raises(WindowsUiaStaleObservation, match="no longer visible"):
+        driver.observe(app_id)
+
+
+def test_unrestricted_binding_accepts_title_transition_only_after_one_bound_action():
+    original = WindowInfo(101, "Before - Chrome", 5101, "chrome.exe")
+    changed = WindowInfo(101, "After - Chrome", 5101, "chrome.exe")
+    native = FakeNative([original])
+
+    def change_title():
+        native.windows = [changed]
+
+    button = FakeElement("Open", "Button", on_invoke=change_title)
+    desktop = FakeDesktop({original.hwnd: FakeRoot([button])})
+    driver = WindowsUiaDriver(
+        {},
+        native=native,
+        desktop_factory=lambda **_kwargs: desktop,
+        discover_all_windows=True,
+        activate_on_observe=True,
+    )
+    app_id = json.loads(driver.list_apps())[0]["app"]
+    before = driver.observe(app_id)
+    action = DesktopAction(
+        DesktopActionType.CLICK,
+        app=app_id,
+        generation=before.generation,
+        element_index=before.elements[0].index,
+        mouse_button="left",
+        click_count=1,
+    )
+
+    driver.execute(action, before)
+    after = driver.observe(app_id)
+
+    assert after.window_title == changed.title
+    assert after.local_window_id == f"hwnd:{changed.hwnd}"
+
+
+def test_unrestricted_inventory_refresh_preserves_an_unchanged_window_snapshot():
+    window = WindowInfo(101, "Stable - Chrome", 5101, "chrome.exe")
+    native = FakeNative([window])
+    button = FakeElement("Open", "Button")
+    desktop = FakeDesktop({window.hwnd: FakeRoot([button])})
+    driver = WindowsUiaDriver(
+        {},
+        native=native,
+        desktop_factory=lambda **_kwargs: desktop,
+        discover_all_windows=True,
+        activate_on_observe=True,
+    )
+    app_id = json.loads(driver.list_apps())[0]["app"]
+    before = driver.observe(app_id)
+    action = DesktopAction(
+        DesktopActionType.CLICK,
+        app=app_id,
+        generation=before.generation,
+        element_index=before.elements[0].index,
+        mouse_button="left",
+        click_count=1,
+    )
+
+    driver.list_apps()
+    receipt = driver.execute(action, before)
+
+    assert receipt.accepted is True
+
+
 def test_observe_omits_one_transient_unwrappable_descendant_without_losing_surface():
     window = _window()
     open_button = FakeElement("Open", "Button")
@@ -397,9 +564,7 @@ def test_observe_omits_controls_with_unreadable_critical_state(broken_state):
     native = FakeNative([window])
     driver = _driver(
         native=native,
-        desktop=FakeDesktop(
-            {window.hwnd: FakeRoot([BrokenStateElement("Chat", "Button")])}
-        ),
+        desktop=FakeDesktop({window.hwnd: FakeRoot([BrokenStateElement("Chat", "Button")])}),
     )
 
     observation = driver.observe("claude")
@@ -640,9 +805,7 @@ def test_truncated_aria_dialog_identity_blocks_before_hidden_semantics_are_lost(
 
     observation = driver.observe("claude")
     dialog = next(
-        element
-        for element in observation.elements
-        if element_plane(element) == ElementPlane.DIALOG
+        element for element in observation.elements if element_plane(element) == ElementPlane.DIALOG
     )
     result = DesktopSafetyPolicy("personal_trusted").inspect_observation(observation)
 
@@ -997,11 +1160,7 @@ def test_profile_drops_one_long_content_node_without_losing_short_controls():
     long_content = "private conversation " * 40
     native = FakeNative([window])
     desktop = FakeDesktop(
-        {
-            window.hwnd: FakeRoot(
-                [FakeElement(long_content, "Text"), FakeElement("Chat", "TabItem")]
-            )
-        }
+        {window.hwnd: FakeRoot([FakeElement(long_content, "Text"), FakeElement("Chat", "TabItem")])}
     )
     driver = _driver(
         native=native,
@@ -1169,9 +1328,7 @@ def test_explicit_labeled_by_secret_relation_blocks_but_flat_neighbor_text_does_
     prompt = next(item for item in ordinary_surface.elements if item.name == "Prompt")
     assert prompt.secret_labeled is False
     assert (
-        DesktopSafetyPolicy("personal_trusted")
-        .inspect_observation(ordinary_surface)
-        .disposition
+        DesktopSafetyPolicy("personal_trusted").inspect_observation(ordinary_surface).disposition
         == DesktopSafetyDisposition.ALLOW
     )
 
@@ -1274,9 +1431,7 @@ def test_unreadable_dialog_identity_blocks_underlying_controls():
 
     observation = driver.observe("claude")
     dialog_element = next(
-        element
-        for element in observation.elements
-        if element_plane(element) == ElementPlane.DIALOG
+        element for element in observation.elements if element_plane(element) == ElementPlane.DIALOG
     )
     action = DesktopAction(
         DesktopActionType.CLICK,
@@ -1427,11 +1582,7 @@ def test_typed_observation_stats_report_bounding_without_parsing_header():
     window = _window()
     native = FakeNative([window])
     desktop = FakeDesktop(
-        {
-            window.hwnd: FakeRoot(
-                [FakeElement("Open", "Button"), FakeElement("Status", "Text")]
-            )
-        }
+        {window.hwnd: FakeRoot([FakeElement("Open", "Button"), FakeElement("Status", "Text")])}
     )
     driver = _driver(native=native, desktop=desktop, max_elements=1)
 
@@ -1468,9 +1619,7 @@ def test_raw_credential_finding_counts_survive_long_value_bounding():
     window = _window()
     first_secret = "sk-proj-" + ("A" * 32)
     second_secret = "github_pat_" + ("B" * 32)
-    long_value = (
-        ("x" * 2500) + " " + first_secret + " " + ("y" * 2500) + " " + second_secret
-    )
+    long_value = ("x" * 2500) + " " + first_secret + " " + ("y" * 2500) + " " + second_secret
     composer = FakeElement("Prompt", "Edit", value=long_value, focused=True)
     native = FakeNative([window])
     desktop = FakeDesktop({window.hwnd: FakeRoot([composer])})

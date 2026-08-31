@@ -11,7 +11,12 @@ from .step_planner import ClaudeDesktopStepPlanner, CodexDesktopStepPlanner, Des
 from .windows_uia import WindowsUiaDriver
 
 
-def build_computer_controller(settings: Settings, executor: WindowsExecutor) -> Controller:
+def build_computer_controller(
+    settings: Settings,
+    executor: WindowsExecutor,
+    *,
+    diagnostics: object | None = None,
+) -> Controller:
     """Build the explicit controller backend; never silently fall back to legacy Codex."""
 
     control = settings.computer_control
@@ -26,7 +31,13 @@ def build_computer_controller(settings: Settings, executor: WindowsExecutor) -> 
 
     driver = None
     if control.driver == "windows_uia":
-        driver = WindowsUiaDriver(settings.apps)
+        unrestricted = control.safety_profile == "local_unrestricted"
+        driver = WindowsUiaDriver(
+            settings.apps,
+            discover_all_windows=unrestricted,
+            activate_on_observe=unrestricted,
+            capture_screenshots=unrestricted,
+        )
     elif control.driver == "open_computer_use":
         driver = PersistentOpenComputerUseDriver(
             executable=control.open_computer_use_executable,
@@ -61,4 +72,5 @@ def build_computer_controller(settings: Settings, executor: WindowsExecutor) -> 
         timeout_seconds=control.timeout_seconds,
         confirmation_timeout_seconds=settings.execution.confirmation_timeout_seconds,
         max_steps=control.max_steps,
+        diagnostics=diagnostics,
     )

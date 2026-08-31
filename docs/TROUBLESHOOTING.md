@@ -174,7 +174,7 @@ execution:
 
 该命令只向唯一、安全绑定的非密码编辑框写入随机 token，并 fresh observe 后本地读回；不会点击发送。成功路径仅在字段仍精确等于本轮固定格式 token 时自动清空，并报告 `cleanup_verified: true`。出现 `ComposerNotUnique`、没有可靠焦点、敏感输入框、读回或清理失败时，应调整窗口/焦点或应用 profile 后重试，不要打开坐标 fallback。
 
-## `strict` 与 `personal_trusted` 表现不同
+## `strict`、`personal_trusted` 与 `local_unrestricted` 表现不同
 
 公开示例默认：
 
@@ -192,6 +192,31 @@ computer_control:
 
 `personal_trusted` 可免确认完成安全导航，并把用户本句完整口述的文字写入唯一聚焦、非密码编辑框；它不自动发送。发送/提交、删除、上传/分享、安装/卸载、关闭等副作用仍需本轮随机码，密码/令牌/认证/付款/UAC/Windows Security 仍阻断，纯坐标、shell 和未可靠绑定的控件仍不可用。若草稿输入仍要求确认，检查当前配置实际加载的是哪个文件、`safety_profile` 拼写，以及目标输入框是否唯一、聚焦并由 UIA 标为非密码字段。
 
+若要让 planner 自行选择任意当前可见顶层窗口、跨 app/多 Chrome 窗口并推断中间导航，只能在同一份本机配置中显式使用：
+
+```yaml
+computer_control:
+  driver: windows_uia
+  safety_profile: local_unrestricted
+```
+
+这个模式不要求每条口述点名/预配置唯一应用，也不再套用 `strict`/`personal_trusted` 的 app-scope 与普通低风险导航确认；窗口/选项卡切换、菜单、Toggle 和未命中风险分类的通用 OK/Continue 对话框可由 planner 推断。若口述明确指定 app/window/field，最终用户步骤仍必须绑定所说窗口和字段；看到动作落在别的应用或相似编辑框应视为失败，不要删掉 binding 检查。“搜索 X”也不是只把文字写进地址栏：必须把字段精确设为 `X`、按 Enter/Return，并在 fresh observation 中看到结果语义变化；只填文字、追加到旧值或只改变焦点都会失败。识别到的发送/提交、删除、安装、上传/分享和关闭仍需本轮确认。每个允许动作仍要求 fresh bind 和 false-before/true-after 本地验收；`done` 前会重新观察同一窗口，多段明确动作必须按顺序完成。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、纯坐标和任意 shell 继续被阻断。
+
+## 已设置 `local_unrestricted`，仍看到 `APP_SCOPE_REQUIRED`
+
+`DesktopAgentLoopController` 在真正加载 `local_unrestricted` 后不会走 `APP_SCOPE_REQUIRED` 分支。仍出现该错误通常说明当前进程没有加载你修改的配置，而不是 Windows 权限不足。检查：
+
+1. 启动命令是否明确使用预期的 `--config ./config.local.yaml`，或 `scripts/run.ps1` 是否指向同一文件；
+2. YAML 中键是否位于 `computer_control.safety_profile`，值是否精确为 `local_unrestricted`；
+3. 当前 backend/driver 是否为 `local_agent/windows_uia`，并已重启旧进程；
+4. 用配置加载器直接核对实际值：
+
+```powershell
+./.venv/Scripts/python.exe -c "from handsfree_pc.config import load_settings; print(load_settings('config.local.yaml').computer_control.safety_profile)"
+```
+
+若错误变成 `NO_VISIBLE_WINDOWS`、`OBSERVE_DRIVER_FAILED` 或 stale-window 类错误，说明 app-scope 已经移除，问题转到可交互桌面、窗口枚举/激活或 UIA 层。不要通过改成 legacy controller、管理员运行或关闭前台 HWND 复核来绕过。
+
 ## 静态 doctor 通过，但 `computer-doctor --live` 失败
 
 静态检查只证明文件和命令存在。live failure 常见原因：
@@ -207,7 +232,7 @@ computer_control:
 
 ## 找不到或无法唯一选择应用
 
-默认 `windows_uia` 只观察 `apps` 中配置的 profile。检查进程名和窗口标题：
+`strict`/`personal_trusted` 的 `windows_uia` 只观察 `apps` 中配置的 profile。检查进程名和窗口标题：
 
 ```yaml
 apps:
@@ -227,7 +252,9 @@ apps:
 - process name/title 不是签名验证，不要为高价值应用信任同名陌生窗口。
 - `mode_names` 同时是 native mode allowlist：只有显式 key 可执行，labels 按优先顺序映射到该版本的精确 accessible label。缺少映射会在输入前拒绝；只接受 normalized exact match，并要求最终 mode 变为 selected，focus-only 不算完成。应用升级后若 `Chat` 变成 `Chat and Cowork`，应更新映射并重测，不要降低模糊阈值。
 
-先关闭重复测试窗口或把正确窗口放前台，再做低风险观察。通用任务的口述还必须肯定且只明确指定一个应用；“不要操作 Claude”“比较 Codex 和 Claude”“我在 Claude 看到了错误，帮我处理”这类零授权、多个或顺带提及不会由 planner 猜目标。把命令改成如“在 Claude 点击 Chat”并保持只授权一个应用。
+在 `strict`/`personal_trusted` 中，先关闭重复测试窗口或把正确窗口放前台，再做低风险观察。通用任务的口述还必须肯定且只明确指定一个应用；“不要操作 Claude”“比较 Codex 和 Claude”“我在 Claude 看到了错误，帮我处理”这类零授权、多个或顺带提及不会由 planner 猜目标。把命令改成如“在 Claude 点击 Chat”并保持只授权一个应用。
+
+`local_unrestricted` 不使用这一静态 profile 选择规则；它在任务开始及后续规划步骤间刷新全部可见普通顶层 HWND，并把多个 Chrome 窗口分别交给 planner。observe 会把 planner 选中的精确窗口激活到前台；若标题/PID/process 与 inventory binding 不一致、窗口已消失或 HWND 被复用，返回 stale observation。若一次已验收的 UI 动作新开了窗口，下一规划步骤可把它纳入 inventory；完全未启动且无法从当前 UI 打开的应用，仍需先由已配置的确定性 native skill 启动。`local_unrestricted` 允许用户完全不说 app，但不会无视明确定位词：例如“在 Claude 的 Message 输入……”必须在 Claude 窗口的 exact `Message` 字段完成，“在 Chrome 搜索……”不能由其他窗口的搜索框代替。
 
 ## 打开路径后仍显示失败，或打开了同名文件
 
@@ -237,6 +264,26 @@ apps:
 - 文件：当前只能检查新前台窗口标题是否包含精确文件名，这是 best-effort；复用同一 HWND 的查看器会保守失败。
 
 因此同名文件、查看器复用旧窗口、标题不显示文件名、启动后仍有选择器/登录页时都可能无法证明或存在误判。增加完整父目录只会改善解析，不会把文件标题验证升级为内容验证；重要文件请人工看屏幕核对，不要放宽 verifier。
+
+## WorkMap 别名没有命中
+
+当前 WorkMap 只做本地精确路由，不做模糊 planner 搜索。确认本机配置（不要提交）满足：
+
+```yaml
+workmap:
+  enabled: true
+  out_directory: "<local-workmap-out-directory>"
+  aliases:
+    资料库:
+      project: "<unique-project-title-or-id>"
+      relative_path: "<relative-folder>"
+```
+
+- `out_directory` 必须含可读的 `WORKMAP.md` 和 `projects/`，项目索引段必须完整；
+- `project` 必须唯一匹配项目标题或 id，`relative_path` 只能位于该项目根目录之下且目标必须存在；
+- 口述必须是完整、肯定、单一的精确请求，如“打开资料库”。否定、引号、多分句、未知/歧义 alias 都会 miss；
+- WorkMap 正在重建或读取失败时不会阻止麦克风启动，而是回退到后续路由；
+- `planner_hints` 当前没有接入云 planner，所以不要期待 Codex/Claude 根据 WorkMap 摘要做模糊猜测。
 
 ## UIA 看不到按钮、输入框或选项卡
 
@@ -285,7 +332,7 @@ computer_control:
 
 顶层 `planner.enabled` 是另一条仅兼容旧 `VoiceRuntime` 的 one-shot fallback。它只能提出用户原句肯定、非引号/数据引用且精确授权的应用 UI 导航；feedback/pause/resume/wait/path/text/send 必须由本地确定性 parser 完整命中。若旧云 planner 提出这些动作或从“输入‘打开 Claude’”这类数据文本推导导航，看到阻断是预期行为，不要放宽 safety。
 
-Codex adapter 使用 ephemeral 临时目录、known-tool deny list 和 read-only sandbox，但订阅 CLI 没有完整 no-tools 保证，也不是主机级秘密隔离；Claude adapter 使用空工具列表、safe/restricted 模式与严格 MCP 配置。两者启动/超时错误不会回显原始 prompt/provider stderr，以免泄漏窗口内容。
+Codex adapter 使用 ephemeral 临时目录、known-tool deny list 和 read-only sandbox，但订阅 CLI 没有完整 no-tools 保证，也不是主机级秘密隔离；Claude adapter 使用空工具列表、safe/restricted 模式与严格 MCP 配置。`local_unrestricted/windows_uia` 下只有 Codex 通过临时 `--image` 接收选中窗口 PNG；Claude CLI adapter 是 text-only，只接收 inventory/title/UIA context。两者启动/超时错误不会回显原始 prompt/provider stderr，以免泄漏窗口内容。
 
 ## 屏幕上下文许可错误
 
@@ -299,11 +346,11 @@ computer_control:
   allow_screen_context_to_cloud: true
 ```
 
-许可不是形式开关：当前 task、唯一明确授权的可见 app 摘要、本句肯定且精确点名的 UIA 控件子集和本地验收历史会进入 provider context。原始窗口标题、进程 ID、未点名 UI 内容、automation ID、element value、PCM、screenshot bytes 和真实截图可用性当前不进入 HandsFreePC 组装的单步 prompt；完整快照只在本地验收。CLI/provider 仍可能另行处理账户/组织、认证、网络、CLI/OS/runtime、临时 cwd、用量、错误和诊断/遥测等自身元数据；项目开关不能证明这些数据为零。若不接受任何控件标签离机，使用 `planner_backend: none`，此时只能执行命中的本地 deterministic skills。
+许可不是形式开关。`strict`/`personal_trusted` 会发送当前 task、唯一授权 app 摘要、裁剪后的 UIA 控件和本地验收历史，但不会发送真实窗口标题或截图。`local_unrestricted` 会发送全部 fresh 可见顶层窗口的标题/进程摘要；observe 后还发送真实窗口标题和经凭据过滤的可寻址 UIA context。若 planner 是 Codex，选中窗口 PNG 还会作为临时 `--image` 输入；Claude 当前只接收文本 context。结构化 `CONTENT` 节点、automation ID、element value 和 PCM 不发送，但截图像素仍可能显示正文或通知。CLI/provider 还可能处理账户/组织、认证、网络、CLI/OS/runtime、临时 cwd、用量、错误和诊断/遥测等自身元数据；项目开关不能证明这些数据为零。若不接受任何屏幕信息离机，使用 `planner_backend: none`，此时只能执行命中的本地 deterministic skills。
 
 ## 等待确认但“确认执行”无效
 
-在 `strict` 下，通用文本输入会进入 confirmation；在 `personal_trusted` 下，只有满足唯一聚焦非密码输入框、文本等于本句完整口述且不构成发送等副作用的草稿输入才可免确认。其余需要确认的动作会绑定一个 runtime 保存的 ID，并为每次 pending action 生成随机四位挑战码。提示会类似“确认执行 4 8 2 7”；只说静态“确认执行”永远无效，也不靠模型理解“确认”。无效原因包括：
+在 `strict` 下，通用文本输入会进入 confirmation；在 `personal_trusted` 下，只有满足唯一聚焦非密码输入框、文本等于本句完整口述且不构成发送等副作用的草稿输入才可免确认。`local_unrestricted` 的普通低风险导航/切换/Toggle/通用无风险对话框不确认，但本地识别出的发送/提交、删除、安装、上传/分享和关闭仍会确认。所有实际需要确认的动作都会绑定一个 runtime 保存的 ID，并为每次 pending action 生成随机四位挑战码。提示会类似“确认执行 4 8 2 7”；只说静态“确认执行”永远无效，也不靠模型理解“确认”。无效原因包括：
 
 - 确认提示尚未实际显示/完整播报；
 - 已超过 `execution.confirmation_timeout_seconds`；

@@ -70,10 +70,13 @@ def test_raw_high_credential_flag_blocks_focused_input_after_display_bounding() 
     policy = DesktopSafetyPolicy("personal_trusted")
 
     assert policy.inspect_observation(observation).disposition == DesktopSafetyDisposition.BLOCK
-    assert policy.planner_observation(
-        observation,
-        user_text="In Claude, type hello into Prompt",
-    ).elements == ()
+    assert (
+        policy.planner_observation(
+            observation,
+            user_text="In Claude, type hello into Prompt",
+        ).elements
+        == ()
+    )
     assert observation_credential_summary(observation) == {
         "high": 1,
         "low": 0,
@@ -1616,10 +1619,15 @@ def test_sensitive_words_in_named_conversation_title_are_navigation_data(selecte
         ),
     )
 
-    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
-        observation,
-        user_text=task,
-    ).disposition == DesktopSafetyDisposition.ALLOW
+    assert (
+        DesktopSafetyPolicy("personal_trusted")
+        .inspect_observation(
+            observation,
+            user_text=task,
+        )
+        .disposition
+        == DesktopSafetyDisposition.ALLOW
+    )
     assert result.disposition == DesktopSafetyDisposition.ALLOW
 
 
@@ -2833,13 +2841,19 @@ def test_high_confidence_name_blocks_only_when_it_is_the_focused_input() -> None
         ),
     )
 
-    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
-        focused
-    ).disposition == DesktopSafetyDisposition.BLOCK
-    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
-        content,
-        user_text="In Claude, click Chat",
-    ).disposition == DesktopSafetyDisposition.ALLOW
+    assert (
+        DesktopSafetyPolicy("personal_trusted").inspect_observation(focused).disposition
+        == DesktopSafetyDisposition.BLOCK
+    )
+    assert (
+        DesktopSafetyPolicy("personal_trusted")
+        .inspect_observation(
+            content,
+            user_text="In Claude, click Chat",
+        )
+        .disposition
+        == DesktopSafetyDisposition.ALLOW
+    )
 
 
 def test_only_explicit_uia_labeled_by_relation_can_classify_an_empty_secret_input() -> None:
@@ -2861,12 +2875,14 @@ def test_only_explicit_uia_labeled_by_relation_can_classify_an_empty_secret_inpu
         ),
     )
 
-    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
-        unrelated_flat_text
-    ).disposition == DesktopSafetyDisposition.ALLOW
-    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
-        labeled_input
-    ).disposition == DesktopSafetyDisposition.BLOCK
+    assert (
+        DesktopSafetyPolicy("personal_trusted").inspect_observation(unrelated_flat_text).disposition
+        == DesktopSafetyDisposition.ALLOW
+    )
+    assert (
+        DesktopSafetyPolicy("personal_trusted").inspect_observation(labeled_input).disposition
+        == DesktopSafetyDisposition.BLOCK
+    )
 
 
 @pytest.mark.parametrize("label", ["Payment", "Windows Terminal", "API Key"])
@@ -2943,3 +2959,323 @@ def test_semantically_empty_dialog_container_names_fail_closed(dialog_name: str)
         DesktopSafetyPolicy("personal_trusted").inspect_observation(observation).disposition
         == DesktopSafetyDisposition.BLOCK
     )
+
+
+def test_local_unrestricted_planner_view_keeps_duplicate_controls_inputs_and_screenshot() -> None:
+    observation = DesktopObservation(
+        app="chrome",
+        generation=9,
+        accessibility_text="Chrome controls",
+        screenshot_png=b"\x89PNG\r\n\x1a\nfixture",
+        window_title="Research - Chrome",
+        elements=(
+            DesktopElement("0", "Open", "Button"),
+            DesktopElement("1", "Open", "Button"),
+            DesktopElement(
+                "2",
+                "Address and search bar",
+                "Edit",
+                focused=False,
+                plane=ElementPlane.INPUT,
+                editable=True,
+            ),
+        ),
+    )
+
+    planner_view = DesktopSafetyPolicy("local_unrestricted").planner_observation(
+        observation,
+        user_text="在 Chrome 搜索 OpenAI",
+    )
+
+    assert [element.index for element in planner_view.elements] == ["0", "1", "2"]
+    assert planner_view.screenshot_png == observation.screenshot_png
+    assert planner_view.window_title == "Research - Chrome"
+
+
+def test_local_unrestricted_search_request_authorizes_exact_query_text_without_type_verb() -> None:
+    observation = DesktopObservation(
+        app="chrome",
+        generation=9,
+        accessibility_text='2 name="Address and search bar" control_type="Edit" focused=true',
+        window_title="Chrome",
+        elements=(
+            DesktopElement(
+                "2",
+                "Address and search bar",
+                "Edit",
+                value="",
+                focused=True,
+                plane=ElementPlane.INPUT,
+                editable=True,
+            ),
+        ),
+    )
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="chrome",
+        generation=9,
+        element_index="2",
+        text="OpenAI",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="在 Chrome 搜索 OpenAI",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            text="OpenAI",
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_local_unrestricted_search_request_cannot_type_into_a_non_search_editor() -> None:
+    observation = DesktopObservation(
+        app="claude",
+        generation=9,
+        accessibility_text='2 name="Message" control_type="Edit" focused=true',
+        window_title="Claude",
+        elements=(
+            DesktopElement(
+                "2",
+                "Message",
+                "Edit",
+                value="",
+                focused=True,
+                plane=ElementPlane.INPUT,
+                editable=True,
+            ),
+        ),
+    )
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="claude",
+        generation=9,
+        element_index="2",
+        text="OpenAI",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="在 Chrome 搜索 OpenAI",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            text="OpenAI",
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "do not type OpenAI",
+        "say 'type OpenAI'",
+        "不要输入 OpenAI",
+        "他说“输入 OpenAI”",
+    ],
+)
+def test_local_unrestricted_never_types_text_from_negation_or_quoted_instruction(
+    user_text: str,
+) -> None:
+    observation = DesktopObservation(
+        app="chrome",
+        generation=9,
+        accessibility_text='2 name="Address and search bar" control_type="Edit" focused=true',
+        window_title="Chrome",
+        elements=(
+            DesktopElement(
+                "2",
+                "Address and search bar",
+                "Edit",
+                value="",
+                focused=True,
+                plane=ElementPlane.INPUT,
+                editable=True,
+            ),
+        ),
+    )
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="chrome",
+        generation=9,
+        element_index="2",
+        text="OpenAI",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text=user_text,
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            text="OpenAI",
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_local_unrestricted_click_focus_alone_never_proves_navigation_success() -> None:
+    observation = DesktopObservation(
+        app="claude",
+        generation=3,
+        accessibility_text='0 name="Projects" control_type="Button" focused=false',
+        window_title="Claude",
+        elements=(DesktopElement("0", "Projects", "Button", focused=False),),
+    )
+    action = DesktopAction(
+        DesktopActionType.CLICK,
+        app="claude",
+        generation=3,
+        element_index="0",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="打开示例数据库",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            text="Projects",
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_spoken_press_enter_without_xia_is_counted_as_a_user_step() -> None:
+    assert user_action_step_count("输入 OpenAI，然后按回车") == 2
+    assert user_action_step_count("输入 OpenAI，然后按一下回车") == 2
+    assert user_action_step_count("输入 OpenAI，然后按下回车") == 2
+
+
+@pytest.mark.parametrize(
+    ("field_value", "expectation_text"),
+    [
+        ("Wrong", "Wrong"),
+        ("OpenAI pricing", "OpenAI"),
+        ("OpenAI", "Wrong"),
+    ],
+)
+def test_local_unrestricted_search_enter_rejects_any_non_exact_query_binding(
+    field_value: str,
+    expectation_text: str,
+) -> None:
+    observation = _observation(
+        app="chrome",
+        title="Chrome",
+        elements=(
+            DesktopElement(
+                "2",
+                "Address and search bar",
+                "Edit",
+                value=field_value,
+                focused=True,
+                plane=ElementPlane.INPUT,
+                editable=True,
+            ),
+        ),
+    )
+    action = _action(
+        DesktopActionType.PRESS_KEY,
+        app="chrome",
+        index="2",
+        key="enter",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="在 Chrome 搜索 OpenAI",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.SEARCH_SUBMITTED,
+            expectation_text,
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_local_unrestricted_search_enter_allows_the_exact_spoken_query() -> None:
+    observation = _observation(
+        app="chrome",
+        title="Chrome",
+        elements=(
+            DesktopElement(
+                "2",
+                "Address and search bar",
+                "Edit",
+                value="OpenAI",
+                focused=True,
+                plane=ElementPlane.INPUT,
+                editable=True,
+            ),
+        ),
+    )
+    action = _action(
+        DesktopActionType.PRESS_KEY,
+        app="chrome",
+        index="2",
+        key="enter",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="在 Chrome 搜索 OpenAI",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.SEARCH_SUBMITTED,
+            "OpenAI",
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_local_unrestricted_allows_an_ordinary_toggle_without_confirmation() -> None:
+    observation = _observation(
+        elements=(DesktopElement("2", "Dark mode", "CheckBox", selected=False),),
+    )
+    action = _action(DesktopActionType.CLICK, index="2")
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="点击 Dark mode",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            "Dark mode",
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_local_unrestricted_keeps_high_impact_dialog_actions_confirmed() -> None:
+    observation = _observation(
+        elements=(
+            DesktopElement(
+                "0",
+                "Delete all conversations?",
+                "Dialog",
+                plane=ElementPlane.DIALOG,
+                addressable=False,
+            ),
+            DesktopElement("2", "Continue", "Button"),
+        ),
+    )
+    action = _action(DesktopActionType.CLICK, index="2")
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="点击 Continue",
+        expectation=DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "Done"),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.CONFIRM

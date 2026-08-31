@@ -70,7 +70,7 @@ KWS 命中不会抛异常中断 recorder，因此不会仅因听到 `over` 就�
 - 一旦确定性命中，先解析全部目标并完成风险分类，再执行第一个动作；
 - 受限动作直接完成，确认动作保存精确 `Plan`，被阻断或失败的确定性计划不会交给模型“再试一次”。
 
-该层没有 LLM、shell 或任意脚本 hook。它适合路径打开、激活已配置应用、固定选项卡/听写和反馈切换等可严格描述的操作。
+该层没有 LLM、shell 或任意脚本 hook。它适合路径打开、激活已配置应用、固定选项卡/听写和反馈切换等可严格描述的操作。可选 `WorkMapIndex` 只读本机 `WORKMAP.md` 与关联档案头部；完整、肯定、单一的精确项目标题/alias 请求可先解析为本地 `OPEN_PATH`。歧义、否定、引号、多分句、缺失目标或越界相对路径均视为 miss；`planner_hints` 当前没有接入云 planner。
 
 `OPEN_PATH` 也遵守 false-before/true-after：执行前目标不能已经满足“当前前台已打开”，Shell dispatch 后要求前台 HWND 与 before 不同。目录再通过 Shell.Application 返回的 Explorer 路径做规范化精确比较，证据较强；文件目前只能验证新前台窗口标题包含精确文件名，因此是 best-effort，不能区分不同目录中的同名文件，也不能覆盖复用同一 HWND 或不显示文件名的查看器。
 
@@ -88,16 +88,20 @@ KWS 命中不会抛异常中断 recorder，因此不会仅因听到 `over` 就�
 
 未命中 NativeSkillRouter 的请求才使用 `handsfree_pc/desktop/step_planner.py`。planner 每次只能返回严格 JSON Schema 中的一种决定：
 
-- `observe`：选择一个已配置且可见的应用；
+- `observe`：选择一个当前授权候选；`strict`/`personal_trusted` 中是已配置且明确绑定的应用，`local_unrestricted` 中是本轮 fresh 枚举的任一可见顶层窗口；
 - `action`：对当前 observation 给出一个 allow-listed 语义动作；
 - `done`：给出一个可由本地状态检查的 expectation；
 - `fail`：目标缺失、歧义、禁止或无法验证时停止。
 
 动作集合只有 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。0.3 planner Schema 不含任意 shell、PowerShell、脚本、文件系统 API 或坐标字段。
 
-进入 planner 前，agent loop 会从用户原句中提取肯定、明确命名的已配置应用。`strict` 要求每条任务恰好命名一个应用；`personal_trusted` 可在同一控制器会话内沿用上一条已经本地验证成功的应用/窗口，但沿用前必须 fresh observe 并核对应用与窗口身份。新控制器、窗口变化、零个可验证上下文、多个应用、否定提及或说明性顺带提及时均失败关闭；planner 不能自行把任务扩展到第二个应用。
+进入 planner 前，agent loop 按 profile 解析候选范围。`strict` 从用户原句提取肯定、明确命名的已配置应用，并要求每条任务恰好一个；`personal_trusted` 还可在同一控制器会话内沿用上一条已经本地验证成功的应用/窗口，但沿用前必须 fresh observe 并核对应用与窗口身份。新控制器、窗口变化、零个可验证上下文、多个应用、否定提及或说明性顺带提及时均失败关闭；这两个 profile 的 planner 不能扩展到第二个应用。
 
-规划上下文包括用户任务、唯一明确授权的可见应用摘要、task-authorized observation generation、最多 8 条本地已验收历史，以及由本地策略重建的 UI 子集。`strict` 只包含本句肯定且精确点名的可寻址控件；`personal_trusted` 还可包含已授权应用内的安全导航控件与当前输入框。两者都只发送 index/control type/selected/focused/enabled 等最小状态；`CONTENT` plane 永不进入 planner。原始窗口标题、进程 ID、automation ID、value、聊天正文、截图字节和真实截图可用性不进入 planner；完整 observation 只在本地做 freshness、动作重绑定与 after-state 验收。UI 子集仍被标记为 data，不能成为新指令。
+`local_unrestricted` 是只应写入本机忽略提交配置的显式模式。它跳过上述 explicit-app/unsupported-app gate，把 `driver.list_apps()` fresh 枚举出的全部可见普通顶层窗口设为 `allowed_apps`，所以无须点名或预配置应用，也不产生 `APP_SCOPE_REQUIRED`。每个 HWND 都有独立动态 app ID；同一进程的多个 Chrome 窗口不是一个模糊 app。inventory 会在任务的后续规划步骤间刷新，因此一次已验收 UI 动作新开的窗口可在下一步成为候选；planner 可通过新的 `observe` 跨 app 导航，但仍不能选择当前 inventory 外、已消失或身份变化的窗口。取消 app-scope 启动门禁不等于忽略用户定位：口述一旦明确给出 app/window/field，完成对应用户步骤的 action 必须绑定该 exact window/field；推断的跨 app bridge 只可用于中间导航。
+
+规划上下文包括用户任务、当前 profile 的可见候选摘要、task-authorized observation generation、最多 8 条本地已验收历史，以及由本地策略重建的 UI 子集。`strict` 只包含本句肯定且精确点名的可寻址控件；`personal_trusted` 还可包含已授权应用内的安全导航控件与当前输入框。这两个 profile 不发送原始窗口标题、截图字节或真实截图可用性。
+
+`local_unrestricted` 的候选摘要则保留每个 fresh 顶层窗口的 display name、foreground、process name 和真实 window title；observe 后的 planner view 也保留真实标题、截图可用性，以及全部经凭据过滤的可寻址 `CONTROL`/`INPUT` UIA 控件，包括重复名称控件和未聚焦输入框。`CONTENT` plane 仍不作为结构化元素进入 planner，automation ID 与 element value 也仍被移除；但截图像素可能视觉包含正文。所有 UI 上下文都标为不可信 data，不能成为新指令。
 
 ### Claude adapter（默认）
 
@@ -105,7 +109,7 @@ Claude 使用独立 `--system-prompt`、`--safe-mode`、`--restricted`、`--stri
 
 ### Codex adapter（显式 best-effort）
 
-Codex 每一步使用 ephemeral 临时目录、忽略用户配置和规则、结构化输出 Schema、`shell_environment_policy.inherit=none`、read-only sandbox，并尽量禁用当前已知工具。只有配置 `planner_backend: codex_cli_best_effort` 和 `allow_codex_cli_host_read: true` 才能启用。该 adapter 不持有 DesktopDriver，也不复用旧 Computer Use thread。
+Codex 每一步使用 ephemeral 临时目录、忽略用户配置和规则、结构化输出 Schema、`shell_environment_policy.inherit=none`、read-only sandbox，并尽量禁用当前已知工具。只有配置 `planner_backend: codex_cli_best_effort` 和 `allow_codex_cli_host_read: true` 才能启用。该 adapter 不持有 DesktopDriver，也不复用旧 Computer Use thread。若 `local_unrestricted/windows_uia` observation 含窗口 PNG，adapter 会把它写入同一临时目录并追加 `--image`；结构化 prompt 同时包含真实窗口标题和裁剪后的 UIA context。Claude CLI adapter 是 text-only：当前没有对应图片参数，只接收文本 inventory/title/UIA context，不接收 PNG。
 
 这不是完整 no-tools 保证。Codex CLI 仍是当前用户进程；临时空目录、deny list、环境变量过滤、prompt 禁令和 read-only sandbox 只是减小暴露面，不能证明当前用户可读文件绝对不可见。
 
@@ -115,14 +119,15 @@ Codex 每一步使用 ephemeral 临时目录、忽略用户配置和规则、结
 
 默认 `handsfree_pc/desktop/windows_uia.py` 组合 Win32 和 pywinauto UIA：
 
-- 只接受 `config.local.yaml` 中声明的应用 profile；
-- 通过进程名和标题查找可见窗口；多个窗口时只接受唯一前台匹配，否则报歧义；
-- 每次动作前要求 interactive `Default` desktop，激活并复核目标 HWND 为前台；
+- `strict`/`personal_trusted` 只接受配置中声明的应用 profile，并通过进程名/标题查找可见窗口；多个窗口时只接受唯一前台匹配，否则报歧义；
+- `local_unrestricted` fresh 枚举全部可见顶层窗口，每个 HWND/PID/process/title 组合形成独立动态 binding；重复 Chrome 窗口分别列出，不要求静态 app profile；
+- `local_unrestricted` 的 observe 会先激活确切 HWND 并复核前台，再捕获该窗口 PNG；窗口消失、HWND 复用、PID/process/title 身份变化都使 binding 失效。只有同一 HWND/PID/process 在刚执行本项目动作后的标题变化可被重新绑定；
+- 每次动作前都要求 interactive `Default` desktop，激活并复核目标 HWND 为前台；
 - observation 为不可变快照，元素 index 绑定 `app + HWND + generation`；
 - 一次动作后必须重新 observe，旧 index 失效；
 - 密码元素值永不进入 observation，也不能被执行器操作；
 - UIA 元素先分为 `CONTROL`、`INPUT`、`CONTENT`、`DIALOG`；Claude/Codex profile 优先保留可操作控件，长内容节点只保留本地有界摘要/digest 或省略；单个属性读取失败和元素超限不会拖垮整个 observation；
-- planner-facing observation 按 safety profile 保留精确点名控件或安全导航控件，但永不包含 `CONTENT`；本地原始 observation 与其 fingerprint 不被该最小化替代；
+- planner-facing observation 按 safety profile 保留精确点名控件、安全导航控件或 `local_unrestricted` 的全部可寻址控件，但永不把 `CONTENT` 作为结构化 UIA 元素；本地原始 observation 与其 fingerprint 不被该最小化替代；
 - click 是 UIA `invoke/select/toggle` 或已绑定元素的一次左键 activation，不接受纯坐标；
 - 输入优先 UIA value pattern，或对唯一焦点元素使用 Unicode `SendInput`；不使用剪贴板；
 - secondary action 只允许固定集合；drag 和坐标 click 默认关闭。
@@ -145,7 +150,7 @@ NativeSkillRouter
                -> driver.execute
                -> driver.observe(fresh generation)
                -> verifier.verify_action + 同一 expectation 必须为 true -> loop
-       done    -> verifier.verify_completion -> terminal result
+        done    -> fresh observe same HWND -> verifier.verify_completion -> terminal result
        fail    -> terminal failure
 ```
 
@@ -161,21 +166,28 @@ NativeSkillRouter
 - after observation 属于同一应用且 generation 严格增加；
 - after 不早于 before，Unicode 没有 replacement character；
 - before/after fingerprint 不同；
-- `type_text`/`set_value` 的**精确文本**出现在新 UIA 状态中。
+- `type_text`/`set_value` 的**精确文本**出现在新 UIA 状态中；
+- 自然搜索使用独立 `SEARCH_SUBMITTED` 证据链：动作前搜索/地址字段必须精确等于查询文本，Enter/Return 后还要看到非焦点变化的 fresh 结果语义 transition；只填入文本、子串命中或没有新结果都不算完成。
 
 动作还必须携带任务相关 expectation。agent loop 在执行前确认它为 false，执行和 fresh observe 后确认它为 true；动作级 receipt/fingerprint 变化与任务后置条件两项缺一不可。
 
-任务级 `done` 只能使用有限 expectation：应用当前可观察、文本存在/不存在、焦点元素包含文本，或上一个动作已由同一 generation 的本地 verifier 验收。只有这一步通过才产生 `LOCAL_VERIFIED_COMPLETION`。
+任务级 `done` 只能使用有限 expectation：应用当前可观察、文本存在/不存在、焦点元素包含文本，或上一个动作已由同一 generation 的本地 verifier 验收。`local_unrestricted` 在验收 `done` 前还会重新 observe 并复核同一 HWND；多段明确动作会与推断的 navigation bridge 分开计数，只有口述步骤依次完成且最后条件属于最后一步才可结束。只有这一步通过才产生 `LOCAL_VERIFIED_COMPLETION`。
 
 这是比 0.2 自报状态更强的证据，但仍不是形式化证明：UIA 树可能缺失业务状态，应用可能在验收后立即变化，外部网络副作用也可能延迟。高价值任务仍需人工监督。
 
 ## 本地安全策略与 typed confirmation
 
-在把 task-authorized 子集发送给云 planner **之前**，本地策略把三类判断分开：planner 数据最小化、当前敏感 surface 分类、具体动作风险。聊天正文等 `CONTENT` plane 即使讨论 password、terminal、payment 或示例 token，也不会把整个窗口判成敏感 surface，并且不会进入 planner。私钥头、已知服务 key、结构有效 JWT、明确 Bearer 等高置信度凭据会被删除/脱敏；普通 40--512 字符不透明标识只记为低置信度并从 planner view 排除，绝不单独阻断整窗。真正的密码属性、当前聚焦的 secret/API-key 输入框、认证/UAC/Windows Security/付款顶层界面仍 fail closed。每个 planner action 在执行前都会对目标元素和 fresh snapshot 重新分类。
+本地策略把三类判断分开：planner 数据最小化、当前敏感 surface 分类、具体动作风险。聊天正文等 `CONTENT` plane 即使讨论 password、terminal、payment 或示例 token，也不会把整个窗口判成敏感 surface，并且不会作为结构化元素进入 planner。私钥头、已知服务 key、结构有效 JWT、明确 Bearer 等高置信度凭据会被删除/脱敏；普通 40--512 字符不透明标识只记为低置信度并从 planner view 排除，绝不单独阻断整窗。
 
-本地有限语法还要求 planner 动作与用户下一步逐字段一致：动作类型、完整目标边界、完整口述输入 payload、按键、单次左键、secondary `invoke`、滚动方向和显式页数都不能由 outcome 文本、后续文本动词的 payload、口述文本子串或较长标签的短前缀借出授权。`type/input/输入/键入` 只匹配 `type_text`，`fill/write/填写/写入` 只匹配 `set_value`；文本动作后若还有 payload 外的独立非空肯定 clause，payload-presence 特例整体关闭，必须验证真正的用户结果；明确否定的“不发送”等 side clause 不会被误当成结果。尚未实现本地条件求值的 `if/when/unless` 等条件命令整体 fail closed；不支持的 drag/hover/move/resize/double-click/right-click/download/copy/rename 等尾随动作仍计入用户步骤，不能被 planner 提前 `DONE` 隐去。同目标 `ELEMENT_SELECTED` 只可证明用户明确说出的 select/choose/switch；open/click/send/delete/close 等需要用户原句中独立、可观察的结果条件。
+`strict`/`personal_trusted` 在发送 planner view 前阻断已识别的密码属性、聚焦 secret/API-key、认证、UAC/Windows Security 和付款 surface。`local_unrestricted` 在 observe 前阻断终端/Run/UAC/认证身份、聚焦 secret 字段和 planner view 中的高置信凭据；付款/隐私/账户目标在具体 action 风险评估时硬阻断，但全窗口 title inventory 和 Codex 选中窗口像素可能早于 action 阻断离机。每个 planner action 在执行前都会对目标元素和 fresh snapshot 重新分类。
+
+`strict`/`personal_trusted` 的本地有限语法还要求 planner 动作与用户下一步逐字段一致：动作类型、完整目标边界、完整口述输入 payload、按键、单次左键、secondary `invoke`、滚动方向和显式页数都不能由 outcome 文本、后续文本动词的 payload、口述文本子串或较长标签的短前缀借出授权。`type/input/输入/键入` 只匹配 `type_text`，`fill/write/填写/写入` 只匹配 `set_value`；文本动作后若还有 payload 外的独立非空肯定 clause，payload-presence 特例整体关闭，必须验证真正的用户结果；明确否定的“不发送”等 side clause 不会被误当成结果。尚未实现本地条件求值的 `if/when/unless` 等条件命令整体 fail closed；不支持的 drag/hover/move/resize/double-click/right-click/download/copy/rename 等尾随动作仍计入用户步骤，不能被 planner 提前 `DONE` 隐去。同目标 `ELEMENT_SELECTED` 只可证明用户明确说出的 select/choose/switch；open/click/send/delete/close 等需要用户原句中独立、可观察的结果条件。
 
 公开默认 `strict` 对通用 `type_text`/`set_value` 要求确认。只在本机忽略提交的配置中显式启用的 `personal_trusted`，可以免确认执行安全导航，以及把本句完整口述草稿写入唯一、聚焦、非密码输入框；它不会自动发送。点击/按键上下文命中本地已知的发送、提交、删除、安装、上传、共享、关闭等词形时，两种 profile 都要求确认。该词表不是完整语义证明，未知语言/同义词、自绘控件或伪装文案可能漏分，重要副作用必须人工监督。需要确认的动作会产生由动作类型、应用、参数、包含本地 HWND identity 的 observation fingerprint 和 expectation 绑定的 ID。generation 在确认前 fresh observe 后重新绑定，不直接进入 digest。runtime 另外生成随机四位挑战码并提示“确认执行 4 8 2 7”这类一次性口令；只说静态“确认执行”永远不授权，也不会重新让模型解释确认意图。
+
+`local_unrestricted` 有意绕过 app-scope 启动门禁、逐字段**中间导航**语法和普通低风险导航确认：planner 可以推断必要的跨 app bridge，窗口/选项卡切换、菜单导航、Toggle，以及未命中风险分类的通用 OK/Continue 对话框可以在绑定当前 observation、目标元素和 expectation 后直接执行。这里的“无需逐字段口述”不适用于用户明确定位的最终步骤：一旦原句说出 app/window/field，最终输入、搜索或其他用户 action 必须落在该 exact window/field。
+
+自然“搜索 X”无需另说“输入”：UIA 已确认搜索/地址字段为空时可用精确 `type_text`，字段非空或旧值不明时必须用 `set_value` 精确替换为用户原文 `X`，然后按 Enter/Return；本地 verifier 随后要求 fresh `SEARCH_SUBMITTED` 结果 transition。向聊天/普通编辑框写入、把 `X` 追加到已有文字、字段值只是包含 `X`、或者只填文字不提交都不能算完成。识别到的发送/提交、删除、安装、上传、共享和关闭等高影响动作仍进入 typed confirmation。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、纯坐标和任意 shell 仍被本地阻断；key 仍受固定 allowlist，文本不能由 planner 发明。
 
 通用 UI confirmation 摘要若原文显示 UI 标签，只使用从用户原句验证出的 exact target label。未授权 sibling/window label 的原文和语义仍保留在本地完整快照中做风险分类，不进入摘要；摘要中的短 digest 只是不可逆绑定元数据。输入 payload 则只来自用户亲口给出的 exact span。
 
@@ -219,6 +231,8 @@ computer_control:
   backend: local_agent
   driver: windows_uia
   planner_backend: claude
+  safety_profile: strict
+  allow_screen_context_to_cloud: false
   allow_codex_cli_host_read: false
   allow_legacy_codex_computer_use: false
   allow_experimental_driver: false
@@ -226,7 +240,14 @@ computer_control:
 
 execution:
   dry_run: true
+
+workmap:
+  enabled: false
+  out_directory: null
+  aliases: {}
 ```
+
+本机 `local_unrestricted` 不是公开默认：它必须在 Git 忽略的 `config.local.yaml` 中显式设置 `driver: windows_uia`、`safety_profile: local_unrestricted`，并在使用云 planner 时同时设置两项云/屏幕许可；Codex 还要求独立 host-read consent。WorkMap 同理只在本地填入导出目录和精确 aliases，当前不会把 `planner_hints` 附加到云 context。
 
 主要模块：
 
@@ -239,6 +260,7 @@ execution:
 - `desktop/safety.py`：界面/动作风险策略与 typed confirmation；
 - `desktop/verifier.py`：动作和完成条件本地验收；
 - `desktop/agent_loop.py`：持久 controller；
+- `workmap.py`：只读 WorkMap 索引与精确本地 alias 解析；
 - `desktop/open_computer_use.py`、`desktop/mcp_client.py`：实验 MCP 驱动；
 - `live_fixture.py`：自有 live doctor fixture。
 

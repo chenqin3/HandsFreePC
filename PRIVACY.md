@@ -25,7 +25,9 @@ HandsFreePC 是本地优先、常开麦克风的 Windows 辅助工具。公开�
 - `privacy.save_transcripts: false`；
 - `privacy.allow_cloud_planner: false`；
 - `computer_control.enabled: false`；
+- `computer_control.safety_profile: strict`；
 - `computer_control.allow_screen_context_to_cloud: false`；
+- `workmap.enabled: false`；
 - `execution.dry_run: true`；
 - `speech.fallback.backend: none`。
 
@@ -79,33 +81,24 @@ execution:
 NativeSkillRouter miss 后，每个 planner step 当前可能收到：
 
 - 用户完成的一条语音 prompt；
-- 用户原句中唯一明确授权、且当前可见的 app 摘要；
 - 当前 task-authorized observation generation；
-- `strict` 下只包含用户原句中肯定、精确点名控件的任务授权 UIA 子集；`personal_trusted` 下还可包含已授权应用内的安全导航控件与当前输入框；
-- 这些控件的 index、名称、control type、selected/focused/enabled 状态；
 - 最近最多 8 条本地验收历史；
-- 合成的应用级窗口标识。
 
-通用任务还必须在用户原句中肯定、明确且只指定一个已配置应用。应用清单会先被本地解析为严格 JSON；零个、多个、仅否定提及或顺带提及应用时，不会把整段自由文本清单继续交给 planner 猜测目标。
+随后按 profile 扩展：
 
-当前 0.3 planner prompt **不发送**：
+- `strict`：用户原句中唯一明确授权、当前可见的 app 摘要，以及仅由本句肯定、精确点名的可寻址 UIA 控件；
+- `personal_trusted`：同一已本地验收 app/window 的摘要、安全导航控件和当前输入框；
+- `local_unrestricted`：本轮 fresh 枚举、并可在后续步骤间动态刷新的**全部可见普通顶层窗口**，每个窗口独立包含动态 app ID、display name、foreground 状态、process name 和真实窗口标题。planner 选择一个窗口并 observe 后，还会收到该窗口的真实标题，以及经凭据过滤的全部可寻址 `CONTROL`/`INPUT` UIA 控件（index、名称、control type、selected/focused/enabled 等）。同一进程的多个 Chrome 顶层窗口也是不同候选。
 
-- 原始 PCM 音频；
-- 未由 `over` 完成的 pending 半条；
-- screenshot PNG bytes；
-- 真实 screenshot 是否存在/可用；
-- 原始窗口标题和进程 ID；
-- 聊天正文和其他 `CONTENT` plane 节点；`strict` 下也不发送未由当前任务明确点名的控件；
-- automation ID 和元素 value；
-- 剪贴板内容；
-- 全桌面截图；
-- 全量目录清单；
-- HandsFreePC 主动收集的密码字段值；
-- 名称含常见 API key/token/secret/password/credential 标记的环境变量。
+`strict`/`personal_trusted` 仍要求一条任务只绑定一个明确应用或已 fresh-verified 的继承窗口；零个、多个、否定或顺带提及时不会让 planner 猜目标。`local_unrestricted` 刻意取消这项 app-scope 门禁，planner 可从上述 fresh inventory 自选窗口并跨应用导航，因此不会产生 `APP_SCOPE_REQUIRED`。这不表示忽略用户明确的定位词：若口述明确指定 app、窗口或字段，完成该用户步骤的动作仍须精确绑定所说 window/field；只是无需为了启动 planner 先提供 app scope。
 
-完整 UIA 快照可能包含病历、学生信息、客户数据、聊天内容、文件名或页面里的无关私人信息，因此只留在本地做 fingerprint、目标重绑定和 after-state 验收。云 planner 只接收按 profile 重建的最小控制子集，`CONTENT` plane 永不进入该子集；高置信度凭据节点会被删除/脱敏，普通不透明长标识也会从 planner view 排除。该最小化不是完整 DLP：可见控件标签仍可能离机并包含敏感内容，所以仍要求独立屏幕上下文许可，并应先在非敏感测试账户验收。
+三种 profile 都**不发送**原始 PCM、未由 `over` 完成的 pending 半条、剪贴板、全量目录清单、元素 value/automation ID、密码字段值，或名称含常见 API key/token/secret/password/credential 标记的环境变量。`CONTENT` plane 节点不会作为结构化 UIA 元素进入 planner；高置信度凭据节点会被删除/脱敏，普通不透明长标识也会从 planner view 排除。
 
-密码元素值不会进入 observation。敏感 surface 分类依据顶层窗口/对话框身份、密码属性、当前聚焦输入框、相邻标签和具体目标元素；聊天正文中出现 password、terminal、payment 或凭据示例不会单独阻断整窗。真正的认证、密码、UAC/Windows Security、付款和聚焦 secret/API-key 输入 surface 仍在发送前 fail closed。规则无法识别所有语言、同义词、自绘控件或伪装界面，因此这不是完整 DLP。
+截图边界按 profile 和 adapter 不同：`strict`/`personal_trusted` 不把截图字节、真实截图可用性或原始窗口标题放进 planner view。`local_unrestricted/windows_uia` 会在 observe 时捕获**选中窗口**而非全桌面的 PNG，并保留真实标题；使用 `codex_cli_best_effort` 时 PNG 被写入本轮一次性临时目录，通过 `codex exec --image` 发送给 Codex。Claude adapter 当前不接收 PNG 字节，但会接收文本化的窗口 inventory、真实标题和 UIA context。截图可能视觉呈现聊天正文、文件名、通知或其他内容，即使这些内容没有作为结构化 `CONTENT` 节点发送。
+
+完整原始 UIA 快照仍可能包含病历、学生信息、客户数据、聊天内容、文件名或页面里的无关私人信息，并留在本地做 fingerprint、目标重绑定和 after-state 验收；`local_unrestricted` 发送的是凭据过滤后的可寻址控件子集和真实标题，而不是完整原始 tree。该最小化不是完整 DLP，截图尤其可能绕过结构化节点分类，所以仍要求独立屏幕上下文许可，并应先关闭无关窗口、使用非敏感测试账户验收。
+
+密码元素值不会进入 observation。敏感 surface 分类依据顶层窗口/对话框身份、密码属性、当前聚焦输入框、相邻标签和具体目标元素；聊天正文中出现 password、terminal、payment 或凭据示例不会单独阻断整窗。`strict`/`personal_trusted` 会在发送 planner view 前阻断已识别的认证、密码、UAC/Windows Security、付款和聚焦 secret/API-key surface。`local_unrestricted` 在 observe 前阻断已识别的终端/Run/UAC/认证身份、聚焦 secret 字段和高置信凭据，付款/隐私/账户目标则在动作评估时硬阻断；但全窗口标题 inventory 已发送，选中窗口像素也可能在动作阻断前交给 Codex。规则无法识别所有语言、同义词、自绘控件或伪装界面，因此这不是完整 DLP。
 
 通用 UI confirmation 摘要若需要原文显示一个目标标签，只回显用户原句中已经验证的 exact target label。未授权 sibling/window label 的原文和语义只在本地分类，不进入摘要；摘要中的短 digest 只是不可逆绑定元数据。文本 payload 只取用户亲口给出的 exact span；确定性 native path 摘要可能另行显示已解析路径，因此 overlay/SAPI 的路径旁观风险仍适用。
 
@@ -119,7 +112,7 @@ Claude 是 0.3 的默认 desktop planner。adapter 使用独立 system policy、
 
 ## Codex planner 边界
 
-Codex 不是默认 planner。只有显式设置 `planner_backend: codex_cli_best_effort` 和 `allow_codex_cli_host_read: true` 后，0.3 单步 adapter 才可使用 ephemeral 临时目录、忽略用户配置/规则、结构化输出、environment filtering 与 read-only sandbox。它没有 HandsFreePC 的 DesktopDriver，也不复用旧 Computer Use thread。
+Codex 不是默认 planner。只有显式设置 `planner_backend: codex_cli_best_effort` 和 `allow_codex_cli_host_read: true` 后，0.3 单步 adapter 才可使用 ephemeral 临时目录、忽略用户配置/规则、结构化输出、environment filtering 与 read-only sandbox。它没有 HandsFreePC 的 DesktopDriver，也不复用旧 Computer Use thread。在 `local_unrestricted/windows_uia` 下，HandsFreePC 会把本轮选中窗口的 PNG 暂存到该 ephemeral 目录并通过 `--image` 交给 Codex；临时文件清理不等于 provider 未处理或未保留图像。
 
 项目会尽量禁用当前已知工具，但订阅版 Codex CLI 没有可由本项目证明的完整 no-tools 模式。read-only sandbox 也不是主机保密容器：CLI 仍以当前用户身份运行；空目录、deny list 和 prompt 禁令不证明当前用户可读文件绝对不可访问。不要在包含高敏感文件的主机上仅凭这些参数开启 planner。
 
@@ -127,13 +120,21 @@ Codex 的认证、传输、服务端留存、训练/数据控制、错误报告�
 
 ## 项目自有 Windows UIA driver
 
-默认 `windows_uia` 在本机读取已配置目标应用的窗口标题、进程元数据和 accessibility tree；执行 UIA semantic action 或 Unicode `SendInput`，并重新读取状态做本地验证。
+默认 `strict`/`personal_trusted` 的 `windows_uia` 在本机读取已配置目标应用的窗口标题、进程元数据和 accessibility tree；执行 UIA semantic action 或 Unicode `SendInput`，并重新读取状态做本地验证。`local_unrestricted` 改为 fresh 枚举全部可见顶层 HWND，observe 时先激活并核验选中的确切 HWND/PID/process/title，再读取 UIA 与窗口截图。
 
-启用云 planner 时，仅前述 task-authorized 子集进入 planner；完整 UIA 元数据仍只在本地 verifier 使用。使用 `planner_backend: none` 时不发送给 Codex/Claude，但 generic miss 无法规划，只能运行确定性 native skill。
+启用云 planner 时，进入 planner 的范围以本节前述 profile 差异为准；完整原始 UIA 元数据仍只在本地 verifier 使用。使用 `planner_backend: none` 时不发送给 Codex/Claude，但 generic miss 无法规划，只能运行确定性 native skill。
 
-driver 不使用剪贴板，不读取 password value，也不保存 screenshot 或 PCM 音频。ASR 原文只有在 `privacy.save_transcripts: true` 时由独立本机 journal 保存；driver 自身不另建 transcript 文件。操作会占用前台窗口，并可能让旁人看到输入或使目标应用自己产生历史、草稿、审计日志和云同步；这些外部持久化不受 `save_transcripts` 控制。
+driver 不使用剪贴板，不读取 password value，也不建立 screenshot 或 PCM 音频历史。`local_unrestricted` 截图在内存中形成；Codex adapter 需要时只写入本轮临时目录，随后由临时目录生命周期清理。ASR 原文只有在 `privacy.save_transcripts: true` 时由独立本机 journal 保存；driver 自身不另建 transcript 文件。操作会占用前台窗口，并可能让旁人看到输入或使目标应用自己产生历史、草稿、审计日志和云同步；这些外部持久化不受 `save_transcripts` 控制。
 
 公开默认 `strict` 中，通用 agent 的 `type_text`/`set_value` 即使只写草稿，也必须先显示/播报本轮随机四位一次性确认口令。仅在本机忽略提交配置中显式启用的 `personal_trusted`，可把本句完整口述草稿免确认写入唯一聚焦、非密码输入框，但不会自动发送；发送、提交及其他副作用仍需确认。单独说静态“确认执行”无效。同一 `VoiceRuntime` 进程内已签发码在确认、取消或超时后都不回收，有界重抽耗尽时拒绝；去重集合不持久化，重启后不保证绝对不复用。挑战码不是持久化防重放凭证或说话人认证，也不能阻止同一房间的人、扬声器或实时转述/重放获取本轮口令后代说。
+
+`local_unrestricted` 不保留上述 app-scope、普通导航目标点名与普通低风险导航确认限制；窗口/选项卡切换、菜单导航、Toggle 和未命中风险分类的通用 OK/Continue 对话框可由 planner 推断并直接进入本地验收。自然“搜索 X”必须把 UIA 搜索/地址字段设为精确原文 `X`、按 Enter/Return，并用 fresh result transition 验收，而不是只验证文字写入。明确口述的 app/window/field 仍需 exact binding。识别到的发送/提交、删除、安装、上传/分享和关闭等高影响动作仍要求本轮确认。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、纯坐标与任意 shell 仍被阻断；所有允许动作仍需 fresh bind、fresh after 和本地后置验证。
+
+## 可选 WorkMap 的本地边界
+
+启用 `workmap` 后，HandsFreePC 只读本机导出目录中的项目索引和关联档案头部，并用本机配置中的精确 alias/唯一项目标题解析完整、肯定、单一的“打开/进入/查看”请求。命中结果成为本地 `OPEN_PATH`，不会把本机绝对路径附加给云 planner；歧义、否定、引号、多分句、目标不存在或相对路径越界均不会执行。
+
+代码中虽有生成去路径候选的 `planner_hints` 接口，当前生产 agent loop **没有把它接入 Codex/Claude prompt**。WorkMap 导出路径、别名、项目标题和相对目录仍可能属于私人工作信息，必须只保存在不提交的 `config.local.yaml`；公开 `config.example.yaml` 保持 `workmap.enabled: false`、空 alias 和空目录。
 
 ## Qwen open-computer-use 实验 driver
 
@@ -223,4 +224,4 @@ HandsFreePC 不建立 PCM 音频历史库。公开默认也不建立转写历史
 
 ---
 
-**English summary:** Audio recognition is local by default; HandsFreePC never persists PCM through the current `save_audio` setting and does not save transcripts by default. Explicitly setting `privacy.save_transcripts: true` writes model-adapter text before prompt normalization—including empty returns and sample-bound marker segments—to a separate rotating per-user JSONL journal. Adapters trim surrounding whitespace, and segments skipped by the silence gate are explicitly marked `transcribed: false`; the journal remains separate from privacy-bounded diagnostics. Cloud planning and live control remain disabled by public defaults. With the 0.3 local agent enabled, the default Claude planner—or an explicitly consented Codex CLI best-effort planner—may receive a completed transcript, visible-app summary, task-named controls (`strict`) or locally classified safe navigation controls (`personal_trusted`), and recent local verification history. Content-plane nodes, raw window titles, process IDs, automation IDs, element values, PCM, screenshot bytes, and actual screenshot availability are excluded from the project-built step prompt; the full snapshot stays local for verification. CLI/provider account, host, connection, runtime, and diagnostic metadata remain separate boundaries.
+**English summary:** Audio recognition is local by default; HandsFreePC never persists PCM through the current `save_audio` setting and does not save transcripts by default. Explicitly setting `privacy.save_transcripts: true` writes model-adapter text before prompt normalization to a separate rotating per-user JSONL journal. Cloud planning, live control, WorkMap, and `local_unrestricted` all remain disabled by public defaults. `strict` and `personal_trusted` keep raw titles and screenshots out of the project-built planner view. The explicitly local `local_unrestricted` profile instead sends every fresh visible ordinary top-level window's title/process summary and the selected window's title/addressable UIA context; Codex additionally receives the selected-window PNG via a temporary `--image` file, while the Claude CLI adapter is text-only. Structured content-plane nodes, element values, automation IDs, PCM, and clipboard data remain excluded, but pixels may visibly contain private content. WorkMap production routing is exact and local; planner hints are not attached to cloud prompts. CLI/provider account, host, connection, runtime, image, and diagnostic metadata remain separate boundaries.

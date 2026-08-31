@@ -6,10 +6,11 @@ from typing import Protocol
 
 from ..config import Settings
 from ..intents import DeterministicIntentParser
-from ..models import ActionType, ExecutionResult, Plan, RiskLevel, clone_plan
+from ..models import Action, ActionType, ExecutionResult, Plan, RiskLevel, clone_plan
 from ..path_binding import bind_plan_paths, guard_plan_paths
 from ..safety import SafetyPolicy
 from ..windows.executor import WindowsExecutor
+from ..workmap import WorkMapError, WorkMapIndex
 
 
 class NativeRouteStatus(StrEnum):
@@ -66,15 +67,46 @@ class NativeSkillRouter:
         parser: DeterministicIntentParser | None = None,
         executor: NativeExecutor | None = None,
         safety: SafetyPolicy | None = None,
+        workmap_index: WorkMapIndex | None = None,
     ) -> None:
         self.settings = settings
         self.parser = parser or DeterministicIntentParser()
         self.executor = executor or WindowsExecutor(settings)
         self.safety = safety or SafetyPolicy(settings.execution)
+        self.workmap_index = workmap_index
+        if (
+            self.workmap_index is None
+            and settings.workmap.enabled
+            and settings.workmap.out_directory is not None
+        ):
+            try:
+                self.workmap_index = WorkMapIndex.load(
+                    settings.workmap.out_directory,
+                    aliases=settings.workmap.aliases,
+                )
+            except WorkMapError:
+                # A generated index can be temporarily absent while WorkMap is
+                # rebuilding.  Do not make microphone startup depend on it;
+                # the instruction can still fall through to the desktop loop.
+                self.workmap_index = None
+
+    def _workmap_plan(self, text: str) -> Plan | None:
+        if self.workmap_index is None:
+            return None
+        target = self.workmap_index.resolve_open_request(text)
+        if target is None:
+            return None
+        return Plan(
+            "打开 WorkMap 中唯一匹配的本地资源",
+            [Action(ActionType.OPEN_PATH, path=str(target))],
+            source="workmap",
+        )
 
     def can_route(self, text: str) -> bool:
         """Report a deterministic match without preparing or executing it."""
 
+        if self._workmap_plan(text) is not None:
+            return True
         plan = self.parser.parse(text)
         return plan is not None and self._covers_full_request(text, plan)
 
@@ -133,8 +165,13 @@ class NativeSkillRouter:
         *,
         explicit_submission: bool = False,
     ) -> NativeSkillResult:
-        plan = self.parser.parse(text)
-        if plan is None or not self._covers_full_request(text, plan):
+        plan = self._workmap_plan(text)
+        if plan is None:
+            plan = self.parser.parse(text)
+            covered = plan is not None and self._covers_full_request(text, plan)
+        else:
+            covered = True
+        if plan is None or not covered:
             return NativeSkillResult(
                 status=NativeRouteStatus.MISS,
                 message="NATIVE_ROUTE_MISS: 未命中确定性本地操作",

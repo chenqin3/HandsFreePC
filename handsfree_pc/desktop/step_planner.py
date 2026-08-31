@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from .mcp_client import _stop_process_tree
-from .protocol import DesktopDecision, DesktopObservation
+from .protocol import DesktopDecision, DesktopObservation, redact_credential_like_text
 
 
 class DesktopPlannerError(RuntimeError):
@@ -24,6 +25,7 @@ class DesktopPlannerUnavailable(DesktopPlannerError):
 
 
 _SECRET_ENV_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+_WINDOWS_PATH_RE = re.compile(r"(?i)(?<![\w])(?:[a-z]:[\\/]|\\\\|//)[^\s\"'<>|]+")
 _ENV_ALLOWLIST = {
     "APPDATA",
     "COMSPEC",
@@ -73,9 +75,12 @@ Mandatory rules:
   left, up, right, or down.
 - One action means one click, one semantic action, one text insertion, or one allow-listed key.
 - type_text and set_value payloads must be exact contiguous spans copied from user_authored_task.
-  Use type_text only for type/input/输入/键入 wording; use set_value only for fill/write/填写/写入
-  wording. Never copy text from UI state into an input and never reinterpret quoted or negated text.
-- An action postcondition may be text_present, text_absent, focused_contains, or element_selected.
+  Except for the explicit local-unrestricted natural-search rule below, use type_text only for
+  type/input/输入/键入 wording and set_value only for fill/write/填写/写入 wording. Never copy text
+  from UI state into an input and never reinterpret quoted or negated text.
+- An action postcondition may be text_present, text_absent, focused_contains, element_selected, or
+  search_submitted. search_submitted is only for Enter/Return on a focused search/address input and
+  its text must be the exact user-authored query already present in that input.
   Never use app_visible or last_action_verified as an action postcondition, and never reuse a
   condition that is already true before the action. A click/secondary action may not use
   text_absent or focused_contains. Focus alone proves only that a click reached a control; it never
@@ -109,8 +114,31 @@ payments, terminals, or any other side effect. Text payloads must still be exact
 spans; this mode does not authorize invented content or a final outcome the user did not request.
 """
 
+_LOCAL_UNRESTRICTED_NAVIGATION_POLICY = """
+Local-unrestricted navigation mode is enabled for this explicitly configured private machine.
+This paragraph explicitly replaces the app-scope and type-verb requirements described above.
+You may choose any application listed in authorized_visible_apps even when the user did not name
+an application. Infer and perform necessary intermediate UI navigation across listed applications.
+Use the visible window titles, the current screenshot when supplied, and the indexed accessibility
+controls to decide the next atomic action. You may focus search/address fields, open tabs, navigate
+  menus and type an exact contiguous user-authored payload. You may use focused_contains naming the
+  exact editable input as the postcondition for the one click needed to focus that input. In this
+  mode, natural requests such as
+"search for X" authorize typing the exact user-authored X span into the selected search/address
+  field; the user does not need to separately say "type". If the observed field is empty, exact
+  type_text is allowed; otherwise use set_value to replace the prior value with exact X. Never
+  append X to an unknown or non-empty prior value. A natural search is not
+  complete after filling: focus the same field if necessary, then press Enter/Return with
+  search_submitted and the exact query as its postcondition. Never invent text to type. Continue
+  until the user's requested
+  observable result is true. An observe step may bring the selected application
+to the foreground; for a switch-only task, return done with app_visible after observing it.
+"""
+
 
 def _planner_policy(safety_profile: str) -> str:
+    if safety_profile == "local_unrestricted":
+        return _PLANNER_POLICY + _LOCAL_UNRESTRICTED_NAVIGATION_POLICY
     if safety_profile == "personal_trusted":
         return _PLANNER_POLICY + _PERSONAL_TRUSTED_NAVIGATION_POLICY
     return _PLANNER_POLICY + _STRICT_NAVIGATION_POLICY
@@ -140,6 +168,27 @@ def _creation_flags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
+def _bounded_cli_error(raw: str) -> str:
+    lines = [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and line.strip() not in {"{", "}", "[", "]"}
+    ]
+    if not lines:
+        return "no diagnostic output"
+    selected = next(
+        (
+            line
+            for line in reversed(lines)
+            if re.search(r"(?i)\b(?:message|error|detail|reason)\b", line)
+        ),
+        lines[-1],
+    )
+    value = redact_credential_like_text(selected) or "diagnostic output was redacted"
+    value = _WINDOWS_PATH_RE.sub("[LOCAL_PATH]", value)
+    return value[:240]
+
+
 def _planner_data_prompt(
     task: str,
     *,
@@ -147,12 +196,15 @@ def _planner_data_prompt(
     observation: DesktopObservation | None,
     history: Sequence[str],
     max_observation_chars: int,
+    screenshot_available: bool | None = None,
 ) -> str:
     observation_payload = (
         observation.planner_context(max_chars=max_observation_chars)
         if observation is not None
         else None
     )
+    if observation_payload is not None and screenshot_available is not None:
+        observation_payload["screenshot_available"] = screenshot_available
     context = {
         "authorized_visible_apps": apps[:8000],
         "observation": observation_payload,
@@ -275,8 +327,10 @@ class _CliDesktopStepPlanner:
             raise ValueError("timeout_seconds must be positive")
         if max_observation_chars < 1000:
             raise ValueError("max_observation_chars must be at least 1000")
-        if safety_profile not in {"strict", "personal_trusted"}:
-            raise ValueError("safety_profile must be strict or personal_trusted")
+        if safety_profile not in {"strict", "personal_trusted", "local_unrestricted"}:
+            raise ValueError(
+                "safety_profile must be strict, personal_trusted, or local_unrestricted"
+            )
         self.executable = executable
         self.model = model.strip() if isinstance(model, str) and model.strip() else None
         self.timeout_seconds = float(timeout_seconds)
@@ -369,6 +423,15 @@ class CodexDesktopStepPlanner(_CliDesktopStepPlanner):
         executable = self._resolve_executable()
         with tempfile.TemporaryDirectory(prefix="handsfreepc-desktop-planner-") as temp_dir:
             output_path = Path(temp_dir) / "step.json"
+            image_path: Path | None = None
+            if observation is not None and observation.screenshot_png:
+                image_path = Path(temp_dir) / "observation.png"
+                try:
+                    image_path.write_bytes(observation.screenshot_png)
+                except OSError as exc:
+                    raise DesktopPlannerError(
+                        "desktop planner could not stage the local window screenshot"
+                    ) from exc
             args = [
                 executable,
                 "exec",
@@ -430,6 +493,8 @@ class CodexDesktopStepPlanner(_CliDesktopStepPlanner):
             ]
             if self.model:
                 args.extend(["--model", self.model])
+            if image_path is not None:
+                args.extend(["--image", str(image_path)])
             args.append("-")
             returncode, _stdout, _stderr = self._communicate(
                 args,
@@ -438,7 +503,9 @@ class CodexDesktopStepPlanner(_CliDesktopStepPlanner):
                 cancel_event=cancel_event,
             )
             if returncode != 0:
-                raise DesktopPlannerError(f"Codex desktop planner exited with {returncode}")
+                raise DesktopPlannerError(
+                    f"Codex desktop planner exited with {returncode}: {_bounded_cli_error(_stderr)}"
+                )
             try:
                 payload = output_path.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
@@ -492,10 +559,15 @@ class ClaudeDesktopStepPlanner(_CliDesktopStepPlanner):
                     observation=observation,
                     history=history,
                     max_observation_chars=self.max_observation_chars,
+                    # Claude Code is deliberately text-only in this backend;
+                    # unlike Codex CLI, no image argument is attached.
+                    screenshot_available=False,
                 ),
                 cwd=temp_dir,
                 cancel_event=cancel_event,
             )
         if returncode != 0:
-            raise DesktopPlannerError(f"Claude desktop planner exited with {returncode}")
+            raise DesktopPlannerError(
+                f"Claude desktop planner exited with {returncode}: {_bounded_cli_error(_stderr)}"
+            )
         return _parse_claude_envelope(stdout, observation=observation)

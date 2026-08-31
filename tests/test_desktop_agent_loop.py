@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,7 @@ import pytest
 
 from handsfree_pc.desktop.agent_loop import (
     DesktopAgentLoopController,
+    _explicit_step_window_scope,
     _explicitly_named_apps,
     _unsupported_explicit_app_scopes,
 )
@@ -28,7 +30,7 @@ from handsfree_pc.desktop.protocol import (
     DesktopExpectationKind,
     DesktopObservation,
 )
-from handsfree_pc.desktop.safety import DesktopSafetyPolicy
+from handsfree_pc.desktop.safety import DesktopSafetyPolicy, user_action_step_count
 from handsfree_pc.models import Action, ActionType, ExecutionResult, Plan, RiskLevel
 
 
@@ -93,6 +95,16 @@ class FakeDriver:
 
     def close(self):
         self.closed = True
+
+
+class InventoryDriver(FakeDriver):
+    def __init__(self, observations, inventory):
+        super().__init__(observations)
+        self.inventory = inventory
+
+    def list_apps(self, *, cancel_event=None):
+        self.calls.append(("list_apps",))
+        return json.dumps(self.inventory, ensure_ascii=False)
 
 
 class ContextRecordingDriver(FakeDriver):
@@ -237,6 +249,259 @@ def _run_verified_alpha_session(*, profile, later_observations=(), later_decisio
     return controller, driver, planner
 
 
+def test_local_unrestricted_never_requires_an_explicit_app_scope_for_visible_window():
+    planner = SequencePlanner([_observe_decision(), _done_decision()])
+    driver = FakeDriver([_selection_observation(1), _selection_observation(2)])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("切换到 Claude")
+
+    assert result.success is True
+    assert result.error_code is None
+    assert ("observe", "claude") in driver.calls
+
+
+def test_local_unrestricted_cannot_claim_an_arbitrary_task_done_after_only_observing():
+    planner = SequencePlanner([_observe_decision(), _done_decision()])
+    driver = FakeDriver([_selection_observation(1), _selection_observation(2)])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("继续处理当前界面")
+
+    assert result.success is False
+    assert result.error_code == "NO_VERIFIED_ACTIONS"
+
+
+def test_local_unrestricted_accepts_verified_intermediate_navigation_not_named_by_user():
+    events = []
+
+    class Diagnostics:
+        def event(self, **kwargs):
+            events.append(kwargs)
+
+    destination = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "最终页面")
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "open one necessary intermediate control",
+                app="claude",
+                action=DesktopAction(
+                    DesktopActionType.CLICK,
+                    app="claude",
+                    generation=1,
+                    element_index="0",
+                ),
+                expectation=destination,
+            ),
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "最终页面"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _selection_observation(1),
+            _selection_observation(2),
+            _selection_observation(3, marker="最终页面"),
+            _selection_observation(4, marker="最终页面"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+        diagnostics=Diagnostics(),
+    )
+
+    result = controller.run("打开最终页面")
+
+    assert result.success is True
+    assert any(call[0] == "execute" for call in driver.calls)
+    codes = [event["error_code"] for event in events]
+    assert "APP_SCOPE_RESOLVED" in codes
+    assert "PLANNER_DECISION_OBSERVE" in codes
+    assert "PLANNER_DECISION_ACTION" in codes
+    assert "ACTION_DISPATCHED" in codes
+    assert "ACTION_VERIFIED" in codes
+
+
+def test_local_unrestricted_refreshes_inventory_for_a_window_opened_mid_task():
+    def window_observation(app: str, generation: int, *, destination_visible: bool = False):
+        elements = [DesktopElement("0", "Launch", "Button", selected=False)]
+        text = '0 name="Launch" control_type="Button" selected=false'
+        if destination_visible:
+            elements.append(
+                DesktopElement(
+                    "1",
+                    "目标窗口",
+                    "Text",
+                    addressable=False,
+                )
+            )
+            text += '\n1 name="目标窗口" control_type="Text"'
+        return DesktopObservation(
+            app=app,
+            generation=generation,
+            accessibility_text=text,
+            window_title="Source" if app == "source" else "目标窗口",
+            elements=tuple(elements),
+            local_window_id=f"window-{app}",
+        )
+
+    class ExpandingInventoryDriver(FakeDriver):
+        def __init__(self):
+            super().__init__(
+                [
+                    window_observation("source", 1),
+                    window_observation("source", 2),
+                    window_observation("source", 3, destination_visible=True),
+                    window_observation("target", 4, destination_visible=True),
+                    window_observation("target", 5, destination_visible=True),
+                ]
+            )
+            self.inventory_calls = 0
+
+        def list_apps(self, *, cancel_event=None):
+            self.inventory_calls += 1
+            self.calls.append(("list_apps",))
+            items = [
+                {
+                    "app": "source",
+                    "display_name": "Source",
+                    "visible_window_count": 1,
+                }
+            ]
+            if self.inventory_calls >= 3:
+                items.append(
+                    {
+                        "app": "target",
+                        "display_name": "目标窗口",
+                        "visible_window_count": 1,
+                    }
+                )
+            return json.dumps(items, ensure_ascii=False)
+
+    destination = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "目标窗口")
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe source", app="source"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "launch destination",
+                app="source",
+                action=DesktopAction(
+                    DesktopActionType.CLICK,
+                    app="source",
+                    generation=1,
+                    element_index="0",
+                ),
+                expectation=destination,
+            ),
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe new window", app="target"),
+            DesktopDecision(
+                DesktopDecisionKind.DONE,
+                "destination is visible",
+                app="target",
+                expectation=destination,
+            ),
+        ]
+    )
+    driver = ExpandingInventoryDriver()
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开目标窗口")
+
+    assert result.success is True
+    assert driver.inventory_calls >= 4
+    assert ("observe", "target") in driver.calls
+
+
+def test_local_unrestricted_cannot_finish_after_only_the_first_spoken_action():
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _selection_observation(1),
+            _selection_observation(2),
+            _selection_observation(3, selected={"Alpha"}),
+            _selection_observation(4, selected={"Alpha"}),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("open Alpha then open Beta")
+
+    assert result.success is False
+    assert result.error_code == "USER_STEPS_INCOMPLETE"
+
+
+def test_local_unrestricted_done_uses_a_fresh_completion_observation():
+    destination = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "最终页面")
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "open one necessary intermediate control",
+                app="claude",
+                action=DesktopAction(
+                    DesktopActionType.CLICK,
+                    app="claude",
+                    generation=1,
+                    element_index="0",
+                ),
+                expectation=destination,
+            ),
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "最终页面"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _selection_observation(1),
+            _selection_observation(2),
+            _selection_observation(3, marker="最终页面"),
+            _selection_observation(4),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开最终页面")
+
+    assert result.success is False
+    assert result.error_code == "COMPLETION_NOT_VERIFIED"
+
+
 def test_app_scope_requires_one_affirmative_control_clause_and_rejects_denials():
     visible = ("codex", "claude")
 
@@ -289,9 +554,7 @@ def test_sensevoice_claude_aliases_do_not_bypass_app_scope_gate(task: str) -> No
 def test_longer_cloud_product_name_remains_an_unsupported_explicit_scope() -> None:
     task = "切换到 Cloud Storage，然后打开设置"
 
-    assert _unsupported_explicit_app_scopes(task, ("codex", "claude")) == (
-        "cloud storage",
-    )
+    assert _unsupported_explicit_app_scopes(task, ("codex", "claude")) == ("cloud storage",)
 
 
 def test_app_scope_reuses_data_and_negation_boundaries() -> None:
@@ -372,7 +635,7 @@ def test_unknown_explicit_app_scope_is_detected_without_matching_quotes_or_negat
         known,
     )
     assert not _unsupported_explicit_app_scopes(
-        '输入“打开记事本然后点击 Code”到 Prompt',
+        "输入“打开记事本然后点击 Code”到 Prompt",
         known,
     )
     assert not _unsupported_explicit_app_scopes(
@@ -439,9 +702,7 @@ def test_chinese_click_tab_role_suffix_counts_one_step_and_completes():
 
     assert result.success
     assert result.message.startswith("LOCAL_VERIFIED_COMPLETION:")
-    assert [call for call in driver.calls if call[0] == "execute"] == [
-        ("execute", "click", 2)
-    ]
+    assert [call for call in driver.calls if call[0] == "execute"] == [("execute", "click", 2)]
 
 
 @pytest.mark.parametrize(
@@ -465,9 +726,7 @@ def test_action_before_unknown_app_clears_personal_context(task):
     assert unsupported.error_code == "APP_SCOPE_UNSUPPORTED"
     assert inherited.error_code == "APP_SCOPE_REQUIRED"
     assert len(planner.calls) == calls_before
-    assert [call for call in driver.calls if call[0] == "execute"] == [
-        ("execute", "click", 2)
-    ]
+    assert [call for call in driver.calls if call[0] == "execute"] == [("execute", "click", 2)]
 
 
 def test_personal_trusted_reuses_same_verified_app_window_for_next_over_command():
@@ -508,9 +767,7 @@ def test_unknown_explicit_app_clears_personal_context_instead_of_using_claude():
     assert unsupported.error_code == "APP_SCOPE_UNSUPPORTED"
     assert inherited.error_code == "APP_SCOPE_REQUIRED"
     assert len(planner.calls) == calls_before
-    assert [call for call in driver.calls if call[0] == "execute"] == [
-        ("execute", "click", 2)
-    ]
+    assert [call for call in driver.calls if call[0] == "execute"] == [("execute", "click", 2)]
 
 
 def test_named_but_invisible_app_clears_personal_context():
@@ -628,9 +885,7 @@ def test_native_app_success_establishes_fresh_context_for_next_utterance():
         "activate Claude",
         [Action(ActionType.ACTIVATE_APP, app="claude")],
     )
-    router = FakeNativeRouter(
-        NativeSkillResult(NativeRouteStatus.SUCCEEDED, "done", plan=plan)
-    )
+    router = FakeNativeRouter(NativeSkillResult(NativeRouteStatus.SUCCEEDED, "done", plan=plan))
     driver = ContextRecordingDriver(
         [
             _selection_observation(1, selected={"Alpha"}),
@@ -802,9 +1057,7 @@ def test_post_action_reobserve_retries_tree_rebuild_without_repeating_action():
     result = controller.run("In Claude, select Alpha")
 
     assert result.success
-    assert [call for call in driver.calls if call[0] == "execute"] == [
-        ("execute", "click", 2)
-    ]
+    assert [call for call in driver.calls if call[0] == "execute"] == [("execute", "click", 2)]
     assert [call for call in driver.calls if call[0] == "observe"] == [
         ("observe", "claude"),
         ("observe", "claude"),
@@ -844,9 +1097,7 @@ def test_changed_same_window_is_refreshed_and_replanned_without_executing_stale_
         "refreshed changed UI in the same local window; previous action was not executed"
         in planner.calls[2][2]
     )
-    assert [call for call in driver.calls if call[0] == "execute"] == [
-        ("execute", "click", 3)
-    ]
+    assert [call for call in driver.calls if call[0] == "execute"] == [("execute", "click", 3)]
 
 
 def test_repeated_pre_action_changes_fail_as_unstable_without_executing():
@@ -1520,9 +1771,7 @@ def test_cancel_during_native_context_refresh_cannot_publish_success():
         "activate Claude",
         [Action(ActionType.ACTIVATE_APP, app="claude")],
     )
-    router = FakeNativeRouter(
-        NativeSkillResult(NativeRouteStatus.SUCCEEDED, "done", plan=plan)
-    )
+    router = FakeNativeRouter(NativeSkillResult(NativeRouteStatus.SUCCEEDED, "done", plan=plan))
 
     class BlockingContextDriver(ContextRecordingDriver):
         def observe(self, app, *, cancel_event=None):
@@ -1759,3 +2008,602 @@ def test_generic_loop_cannot_ignore_a_trailing_unsupported_action():
     assert not result.success
     assert "全部桌面步骤" in result.message
     assert [call for call in driver.calls if call[0] == "execute"] == [("execute", "click", 2)]
+
+
+def _dynamic_observation(
+    app: str,
+    generation: int,
+    title: str,
+    elements: tuple[DesktopElement, ...],
+    *,
+    local_window_id: str | None = None,
+    screenshot_png: bytes | None = None,
+) -> DesktopObservation:
+    text = "\n".join(
+        f'{element.index} name="{element.name}" control_type="{element.control_type}" '
+        f'focused={str(bool(element.focused)).lower()} '
+        f'selected={str(bool(element.selected)).lower()} value="{element.value or ""}"'
+        for element in elements
+    )
+    return DesktopObservation(
+        app=app,
+        generation=generation,
+        accessibility_text=text,
+        screenshot_png=screenshot_png,
+        window_title=title,
+        elements=elements,
+        local_window_id=local_window_id,
+    )
+
+
+def test_explicit_scope_prefers_trusted_app_identity_over_spoofed_window_title():
+    inventory = json.dumps(
+        [
+            {
+                "app": "claude-id",
+                "display_name": "Claude",
+                "process_name": "claude.exe",
+                "window_title": "Claude",
+            },
+            {
+                "app": "chrome-id",
+                "display_name": "Google Chrome",
+                "process_name": "chrome.exe",
+                "window_title": "Claude",
+            },
+        ]
+    )
+
+    assert _explicit_step_window_scope(
+        "在 Claude 打开 Chat",
+        inventory=inventory,
+        completed_steps=0,
+    ) == (True, frozenset({"claude-id"}))
+
+
+def test_known_app_name_cannot_be_satisfied_only_by_an_untrusted_window_title():
+    inventory = json.dumps(
+        [
+            {
+                "app": "chrome-id",
+                "display_name": "Google Chrome",
+                "process_name": "chrome.exe",
+                "window_title": "Claude",
+            }
+        ]
+    )
+
+    assert _explicit_step_window_scope(
+        "在 Claude 输入你好",
+        inventory=inventory,
+        completed_steps=0,
+    ) == (True, frozenset())
+
+
+def test_explicit_app_scope_blocks_text_entry_in_the_wrong_visible_app():
+    inventory = [
+        {"app": "claude-id", "display_name": "Claude", "process_name": "claude.exe"},
+        {
+            "app": "chrome-id",
+            "display_name": "Google Chrome",
+            "process_name": "chrome.exe",
+        },
+    ]
+    observation = _dynamic_observation(
+        "chrome-id",
+        1,
+        "Browser",
+        (DesktopElement("0", "Address and search bar", "Edit", value="", focused=True),),
+    )
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe", app="chrome-id"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "wrong app",
+                app="chrome-id",
+                action=DesktopAction(
+                    DesktopActionType.TYPE_TEXT,
+                    app="chrome-id",
+                    generation=1,
+                    element_index="0",
+                    text="hello",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.FOCUSED_CONTAINS,
+                    "hello",
+                ),
+            ),
+        ]
+    )
+    driver = InventoryDriver([observation], inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, type hello")
+
+    assert not result.success
+    assert result.error_code == "EXPLICIT_STEP_WINDOW_MISMATCH"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "In Claude Message, type hello",
+        "In Claude's Message, type hello",
+        "在 Claude 的 Message 输入 hello",
+        "在 Message 输入 hello",
+    ],
+)
+def test_explicit_text_field_blocks_a_different_focused_editor(task):
+    inventory = [
+        {"app": "claude-id", "display_name": "Claude", "process_name": "claude.exe"}
+    ]
+    observation = _dynamic_observation(
+        "claude-id",
+        1,
+        "Claude",
+        (DesktopElement("0", "Search", "Edit", value="", focused=True),),
+    )
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe", app="claude-id"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "wrong field",
+                app="claude-id",
+                action=DesktopAction(
+                    DesktopActionType.TYPE_TEXT,
+                    app="claude-id",
+                    generation=1,
+                    element_index="0",
+                    text="hello",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.FOCUSED_CONTAINS,
+                    "hello",
+                ),
+            ),
+        ]
+    )
+    driver = InventoryDriver([observation], inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert not result.success
+    assert result.error_code == "EXPLICIT_TEXT_TARGET_MISMATCH"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_natural_search_scope_blocks_another_browsers_address_bar():
+    inventory = [
+        {"app": "chrome-id", "display_name": "Google Chrome", "process_name": "chrome.exe"},
+        {"app": "edge-id", "display_name": "Microsoft Edge", "process_name": "msedge.exe"},
+    ]
+    observation = _dynamic_observation(
+        "edge-id",
+        1,
+        "Edge",
+        (DesktopElement("0", "Address and search bar", "Edit", value="", focused=True),),
+    )
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe", app="edge-id"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "wrong browser",
+                app="edge-id",
+                action=DesktopAction(
+                    DesktopActionType.SET_VALUE,
+                    app="edge-id",
+                    generation=1,
+                    element_index="0",
+                    value="OpenAI",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.FOCUSED_CONTAINS,
+                    "OpenAI",
+                ),
+            ),
+        ]
+    )
+    driver = InventoryDriver([observation], inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("在 Chrome 搜索 OpenAI")
+
+    assert not result.success
+    assert result.error_code == "EXPLICIT_STEP_WINDOW_MISMATCH"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_natural_search_requires_exact_fill_enter_and_fresh_result_state():
+    inventory = [
+        {"app": "chrome-id", "display_name": "Google Chrome", "process_name": "chrome.exe"}
+    ]
+
+    def search_observation(generation: int, value: str, title: str) -> DesktopObservation:
+        elements = [
+            DesktopElement(
+                "0",
+                "Address and search bar",
+                "Edit",
+                value=value,
+                focused=True,
+            )
+        ]
+        if "Search results" in title:
+            elements.append(DesktopElement("1", "Results", "Text"))
+        return _dynamic_observation(
+            "chrome-id",
+            generation,
+            title,
+            tuple(elements),
+            local_window_id="hwnd:chrome",
+        )
+
+    observations = [
+        search_observation(1, "", "Chrome"),
+        search_observation(2, "", "Chrome"),
+        search_observation(3, "OpenAI", "Chrome"),
+        search_observation(4, "OpenAI", "Chrome"),
+        search_observation(5, "OpenAI", "Search results - Chrome"),
+        search_observation(6, "OpenAI", "Search results - Chrome"),
+    ]
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe", app="chrome-id"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "replace query",
+                app="chrome-id",
+                action=DesktopAction(
+                    DesktopActionType.SET_VALUE,
+                    app="chrome-id",
+                    generation=1,
+                    element_index="0",
+                    value="OpenAI",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.FOCUSED_CONTAINS,
+                    "OpenAI",
+                ),
+            ),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "submit query",
+                app="chrome-id",
+                action=DesktopAction(
+                    DesktopActionType.PRESS_KEY,
+                    app="chrome-id",
+                    generation=3,
+                    element_index="0",
+                    key="enter",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.SEARCH_SUBMITTED,
+                    "OpenAI",
+                ),
+            ),
+            DesktopDecision(
+                DesktopDecisionKind.DONE,
+                "verified search",
+                app="chrome-id",
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.SEARCH_SUBMITTED,
+                    "OpenAI",
+                ),
+            ),
+        ]
+    )
+    driver = InventoryDriver(observations, inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("在 Chrome 搜索 OpenAI")
+
+    assert result.success
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "set_value",
+        "press_key",
+    ]
+
+
+def test_explicit_app_terminal_condition_cannot_finish_in_another_app():
+    inventory = [
+        {"app": "claude-id", "display_name": "Claude", "process_name": "claude.exe"},
+        {"app": "chrome-id", "display_name": "Google Chrome", "process_name": "chrome.exe"},
+    ]
+    before = _dynamic_observation(
+        "chrome-id",
+        1,
+        "Chrome",
+        (DesktopElement("0", "Foo", "Button"),),
+        local_window_id="hwnd:chrome",
+    )
+    refresh = _dynamic_observation(
+        "chrome-id",
+        2,
+        "Chrome",
+        (DesktopElement("0", "Foo", "Button"),),
+        local_window_id="hwnd:chrome",
+    )
+    after = _dynamic_observation(
+        "chrome-id",
+        3,
+        "Chrome",
+        (DesktopElement("0", "Foo", "Button"), DesktopElement("1", "Chat", "Text")),
+        local_window_id="hwnd:chrome",
+    )
+    completion = _dynamic_observation(
+        "chrome-id",
+        4,
+        "Chrome",
+        (DesktopElement("0", "Foo", "Button"), DesktopElement("1", "Chat", "Text")),
+        local_window_id="hwnd:chrome",
+    )
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe", app="chrome-id"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "bridge in wrong app",
+                app="chrome-id",
+                action=DesktopAction(
+                    DesktopActionType.CLICK,
+                    app="chrome-id",
+                    generation=1,
+                    element_index="0",
+                ),
+                expectation=DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "Chat"),
+            ),
+            DesktopDecision(
+                DesktopDecisionKind.DONE,
+                "claim wrong app",
+                app="chrome-id",
+                expectation=DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "Chat"),
+            ),
+        ]
+    )
+    driver = InventoryDriver([before, refresh, after, completion], inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("在 Claude 打开 Chat")
+
+    assert not result.success
+    assert result.error_code == "COMPLETION_EXPLICIT_WINDOW_MISMATCH"
+
+
+def test_volatile_window_png_does_not_prevent_a_semantically_stable_action():
+    base_elements = (DesktopElement("0", "Alpha", "Button", selected=False),)
+    selected_elements = (DesktopElement("0", "Alpha", "Button", selected=True),)
+    observations = [
+        _dynamic_observation(
+            "claude",
+            1,
+            "Claude",
+            base_elements,
+            local_window_id="hwnd:1",
+            screenshot_png=b"png-one",
+        ),
+        _dynamic_observation(
+            "claude",
+            2,
+            "Claude",
+            base_elements,
+            local_window_id="hwnd:1",
+            screenshot_png=b"png-two",
+        ),
+        _dynamic_observation(
+            "claude",
+            3,
+            "Claude",
+            selected_elements,
+            local_window_id="hwnd:1",
+            screenshot_png=b"png-three",
+        ),
+        _dynamic_observation(
+            "claude",
+            4,
+            "Claude",
+            selected_elements,
+            local_window_id="hwnd:1",
+            screenshot_png=b"png-four",
+        ),
+    ]
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+        ]
+    )
+    driver = FakeDriver(observations)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+    )
+
+    result = controller.run("In Claude, select Alpha")
+
+    assert result.success
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
+def test_chinese_sequence_prefixes_preserve_each_explicit_app_scope():
+    task = "先在 Chrome 搜索 OpenAI，然后在 Claude 的 Message 输入总结"
+    inventory = json.dumps(
+        [
+            {"app": "chrome-id", "display_name": "Google Chrome", "process_name": "chrome.exe"},
+            {"app": "claude-id", "display_name": "Claude", "process_name": "claude.exe"},
+        ],
+        ensure_ascii=False,
+    )
+
+    assert user_action_step_count(task) == 2
+    assert _explicit_step_window_scope(
+        task,
+        inventory=inventory,
+        completed_steps=0,
+    ) == (True, frozenset({"chrome-id"}))
+    assert _explicit_step_window_scope(
+        task,
+        inventory=inventory,
+        completed_steps=1,
+    ) == (True, frozenset({"claude-id"}))
+
+
+def test_chinese_cross_app_search_then_exact_field_input_completes_in_order():
+    task = "先在 Chrome 搜索 OpenAI，然后在 Claude 的 Message 输入总结"
+    inventory = [
+        {"app": "chrome-id", "display_name": "Google Chrome", "process_name": "chrome.exe"},
+        {"app": "claude-id", "display_name": "Claude", "process_name": "claude.exe"},
+    ]
+
+    def chrome(generation: int, value: str, title: str) -> DesktopObservation:
+        elements = [
+            DesktopElement(
+                "0",
+                "Address and search bar",
+                "Edit",
+                value=value,
+                focused=True,
+            )
+        ]
+        if "Search results" in title:
+            elements.append(DesktopElement("1", "Results", "Text"))
+        return _dynamic_observation(
+            "chrome-id",
+            generation,
+            title,
+            tuple(elements),
+            local_window_id="hwnd:chrome",
+        )
+
+    def claude(generation: int, value: str) -> DesktopObservation:
+        return _dynamic_observation(
+            "claude-id",
+            generation,
+            "Claude",
+            (DesktopElement("0", "Message", "Edit", value=value, focused=True),),
+            local_window_id="hwnd:claude",
+        )
+
+    observations = [
+        chrome(1, "", "Chrome"),
+        chrome(2, "", "Chrome"),
+        chrome(3, "OpenAI", "Chrome"),
+        chrome(4, "OpenAI", "Chrome"),
+        chrome(5, "OpenAI", "Search results - Chrome"),
+        claude(6, ""),
+        claude(7, ""),
+        claude(8, "总结"),
+        claude(9, "总结"),
+    ]
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe search", app="chrome-id"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "fill query",
+                app="chrome-id",
+                action=DesktopAction(
+                    DesktopActionType.SET_VALUE,
+                    app="chrome-id",
+                    generation=1,
+                    element_index="0",
+                    value="OpenAI",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.FOCUSED_CONTAINS,
+                    "OpenAI",
+                ),
+            ),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "submit query",
+                app="chrome-id",
+                action=DesktopAction(
+                    DesktopActionType.PRESS_KEY,
+                    app="chrome-id",
+                    generation=3,
+                    element_index="0",
+                    key="enter",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.SEARCH_SUBMITTED,
+                    "OpenAI",
+                ),
+            ),
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "observe composer", app="claude-id"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "type exact text",
+                app="claude-id",
+                action=DesktopAction(
+                    DesktopActionType.TYPE_TEXT,
+                    app="claude-id",
+                    generation=6,
+                    element_index="0",
+                    text="总结",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.FOCUSED_CONTAINS,
+                    "总结",
+                ),
+            ),
+            DesktopDecision(
+                DesktopDecisionKind.DONE,
+                "all spoken steps verified",
+                app="claude-id",
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.FOCUSED_CONTAINS,
+                    "总结",
+                ),
+            ),
+        ]
+    )
+    driver = InventoryDriver(observations, inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "set_value",
+        "press_key",
+        "type_text",
+    ]

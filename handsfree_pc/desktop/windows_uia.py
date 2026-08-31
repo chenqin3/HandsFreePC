@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
 import threading
@@ -39,6 +40,16 @@ class _Snapshot:
     hwnd: int
     observation: DesktopObservation
     wrappers: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _DynamicWindowBinding:
+    """One inventory identifier pinned to one exact top-level window."""
+
+    app_id: str
+    window: WindowInfo
+    profile: AppProfile
+    display_name: str
 
 
 @dataclass(slots=True)
@@ -224,6 +235,9 @@ class WindowsUiaDriver:
         native: NativeWindows | None = None,
         desktop_factory: Callable[..., Any] | None = None,
         max_elements: int = 500,
+        discover_all_windows: bool = False,
+        activate_on_observe: bool = False,
+        capture_screenshots: bool = False,
     ) -> None:
         if max_elements < 1 or max_elements > 2000:
             raise ValueError("max_elements must be between 1 and 2000")
@@ -231,9 +245,13 @@ class WindowsUiaDriver:
         self._native = native
         self._desktop_factory = desktop_factory
         self.max_elements = max_elements
+        self._discover_all_windows = bool(discover_all_windows)
+        self._activate_on_observe = bool(activate_on_observe)
+        self._capture_screenshots = bool(capture_screenshots)
         self._generation = 0
         self._snapshots: dict[str, _Snapshot] = {}
         self._pending_observation: set[str] = set()
+        self._dynamic_windows: dict[str, _DynamicWindowBinding] = {}
         self._task_context = ""
         self._lock = threading.RLock()
 
@@ -267,12 +285,67 @@ class WindowsUiaDriver:
 
     def _profile(self, app: str) -> AppProfile:
         normalized = self._normalize_app(app)
-        try:
-            return self.profiles[normalized]
-        except KeyError as exc:
-            raise WindowsUiaDriverError(f"application is not configured: {app!r}") from exc
+        profile = self.profiles.get(normalized)
+        if profile is not None:
+            return profile
+        if self._discover_all_windows:
+            with self._lock:
+                binding = self._dynamic_windows.get(normalized)
+            if binding is not None:
+                return binding.profile
+        raise WindowsUiaDriverError(f"application is not configured: {app!r}")
 
-    def _resolve_window(self, app: str) -> WindowInfo:
+    @staticmethod
+    def _same_window_identity(
+        expected: WindowInfo,
+        actual: WindowInfo,
+        *,
+        allow_title_change: bool = False,
+    ) -> bool:
+        return bool(
+            expected.hwnd == actual.hwnd
+            and expected.process_id == actual.process_id
+            and (expected.process_name or "").casefold() == (actual.process_name or "").casefold()
+            and (allow_title_change or expected.title == actual.title)
+        )
+
+    def _resolve_window(
+        self,
+        app: str,
+        *,
+        allow_dynamic_title_change: bool = False,
+    ) -> WindowInfo:
+        normalized = self._normalize_app(app)
+        if self._discover_all_windows:
+            with self._lock:
+                binding = self._dynamic_windows.get(normalized)
+            if binding is not None:
+                matches = {item.hwnd: item for item in self._native_backend().enumerate_windows()}
+                current = matches.get(binding.window.hwnd)
+                if current is None:
+                    raise WindowsUiaStaleObservation(
+                        "the selected top-level window is no longer visible"
+                    )
+                if not self._same_window_identity(
+                    binding.window,
+                    current,
+                    allow_title_change=allow_dynamic_title_change,
+                ):
+                    raise WindowsUiaStaleObservation(
+                        "the selected top-level window identity changed after inventory"
+                    )
+                if allow_dynamic_title_change and current.title != binding.window.title:
+                    with self._lock:
+                        latest = self._dynamic_windows.get(normalized)
+                        if latest != binding:
+                            raise WindowsUiaStaleObservation(
+                                "the selected top-level window binding changed"
+                            )
+                        self._dynamic_windows[normalized] = replace(
+                            binding,
+                            window=current,
+                        )
+                return current
         profile = self._profile(app)
         native = self._native_backend()
         matches = native.find_windows(
@@ -290,6 +363,76 @@ class WindowsUiaDriver:
         if len(foreground_matches) == 1:
             return foreground_matches[0]
         raise AmbiguousWindowError(matches)
+
+    @staticmethod
+    def _window_matches_profile(window: WindowInfo, profile: AppProfile) -> bool:
+        patterns = tuple(item.strip().casefold() for item in profile.title_patterns if item.strip())
+        processes = {item.strip().casefold() for item in profile.process_names if item.strip()}
+        title_matches = not patterns or any(
+            pattern in window.title.casefold() for pattern in patterns
+        )
+        process_matches = not processes or (
+            window.process_name is not None and window.process_name.casefold() in processes
+        )
+        return title_matches and process_matches and bool(patterns or processes)
+
+    @staticmethod
+    def _dynamic_window_slug(window: WindowInfo) -> str:
+        source = (window.process_name or "window").removesuffix(".exe").casefold()
+        slug = re.sub(r"[^a-z0-9_.+-]+", "-", source).strip("-._+")
+        return slug[:48] or "window"
+
+    @classmethod
+    def _dynamic_window_id(cls, window: WindowInfo) -> str:
+        identity = json.dumps(
+            {
+                "hwnd": window.hwnd,
+                "process_id": window.process_id,
+                "process_name": window.process_name,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        token = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return f"{cls._dynamic_window_slug(window)}-{token}"
+
+    def _dynamic_profile(self, window: WindowInfo) -> tuple[AppProfile, str]:
+        for profile in self.profiles.values():
+            if self._window_matches_profile(window, profile):
+                return profile, profile.name
+        process_name = (window.process_name or "Window").removesuffix(".exe")
+        display_name = process_name.strip() or "Window"
+        return (
+            AppProfile(
+                name=display_name[:128],
+                process_names=[window.process_name] if window.process_name else [],
+                executable=None,
+                title_patterns=[window.title],
+                search_hotkey=None,
+                native_voice_hotkey=None,
+                voice_button_names=[],
+            ),
+            display_name[:128],
+        )
+
+    @staticmethod
+    def _capture_window_png(root: Any) -> bytes | None:
+        """Best-effort in-memory screenshot for visual planner context."""
+
+        capture = _safe_attr(root, "capture_as_image", None)
+        if not callable(capture):
+            return None
+        try:
+            image = capture()
+            stream = io.BytesIO()
+            image.save(stream, format="PNG")
+            payload = stream.getvalue()
+        except Exception:
+            return None
+        if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None
+        return payload
 
     def _root(self, hwnd: int) -> Any:
         try:
@@ -541,10 +684,7 @@ class WindowsUiaDriver:
                     return False
             except Exception:
                 pass
-            label_name = (
-                getattr(labeled_by, "CurrentName", "")
-                or getattr(labeled_by, "name", "")
-            )
+            label_name = getattr(labeled_by, "CurrentName", "") or getattr(labeled_by, "name", "")
             if not label_name:
                 window_text = getattr(labeled_by, "window_text", None)
                 if callable(window_text):
@@ -558,10 +698,7 @@ class WindowsUiaDriver:
                 "could not revalidate the target labeled-by relation"
             ) from exc
         normalized = _normalized_text(label_name)
-        return bool(
-            len(normalized) <= 120
-            and _SECRET_LABELED_BY_RE.fullmatch(normalized)
-        )
+        return bool(len(normalized) <= 120 and _SECRET_LABELED_BY_RE.fullmatch(normalized))
 
     @staticmethod
     def _runtime_composer_state(wrapper: Any, expected: DesktopElement) -> bool:
@@ -574,19 +711,13 @@ class WindowsUiaDriver:
         try:
             info = getattr(wrapper, "element_info", None)
             raw_element = getattr(info, "element", None)
-            aria = _normalized_text(
-                getattr(raw_element, "CurrentAriaProperties", "")
-            ).casefold()
-            role = _normalized_text(
-                getattr(raw_element, "CurrentAriaRole", "")
-            ).casefold()
+            aria = _normalized_text(getattr(raw_element, "CurrentAriaProperties", "")).casefold()
+            role = _normalized_text(getattr(raw_element, "CurrentAriaRole", "")).casefold()
         except Exception as exc:
             raise WindowsUiaDriverError(
                 "could not revalidate the target composer semantics"
             ) from exc
-        return role == "textbox" and (
-            "multiline=true" in aria or "contenteditable=true" in aria
-        )
+        return role == "textbox" and ("multiline=true" in aria or "contenteditable=true" in aria)
 
     def _element_metadata(self, wrapper: Any, index: str) -> DesktopElement:
         name = self._name(wrapper)
@@ -605,11 +736,7 @@ class WindowsUiaDriver:
             name=name,
             control_type=control_type,
             automation_id=self._automation_id(wrapper),
-            value=(
-                _bounded_text(value, maximum=4000).display
-                if value is not None
-                else None
-            ),
+            value=(_bounded_text(value, maximum=4000).display if value is not None else None),
             value_observed=value_observed,
             selected=selected,
             focused=_safe_call(wrapper, "has_keyboard_focus", None),
@@ -642,18 +769,14 @@ class WindowsUiaDriver:
             try:
                 wrappers = list(root.descendants())
             except Exception as exc:
-                raise WindowsUiaDriverError(
-                    "could not enumerate UIA descendants"
-                ) from exc
+                raise WindowsUiaDriverError("could not enumerate UIA descendants") from exc
             return list(enumerate(wrappers)), len(wrappers), []
 
         if not callable(raw_descendants) or not callable(wrapper_factory):
             try:
                 wrappers = list(root.descendants())
             except Exception as exc:
-                raise WindowsUiaDriverError(
-                    "could not enumerate UIA descendants"
-                ) from exc
+                raise WindowsUiaDriverError("could not enumerate UIA descendants") from exc
             return list(enumerate(wrappers)), len(wrappers), []
 
         try:
@@ -680,14 +803,9 @@ class WindowsUiaDriver:
                         "unwrappable-descendant",
                         _metadata_digest(
                             name=_normalized_text(safe_raw_attr(raw_info, "name")),
-                            control_type=_normalized_text(
-                                safe_raw_attr(raw_info, "control_type")
-                            ),
+                            control_type=_normalized_text(safe_raw_attr(raw_info, "control_type")),
                             automation_id=(
-                                _normalized_text(
-                                    safe_raw_attr(raw_info, "automation_id")
-                                )
-                                or None
+                                _normalized_text(safe_raw_attr(raw_info, "automation_id")) or None
                             ),
                             value=None,
                             selected=None,
@@ -704,9 +822,7 @@ class WindowsUiaDriver:
         root: Any,
         profile: AppProfile,
     ) -> tuple[tuple[DesktopElement, ...], dict[str, Any], dict[str, Any]]:
-        descendants, total_descendants, enumeration_omissions = (
-            self._enumerate_descendants(root)
-        )
+        descendants, total_descendants, enumeration_omissions = self._enumerate_descendants(root)
 
         candidates: list[_ElementCandidate] = []
         bounded_entries: list[tuple[int, str, str]] = list(enumeration_omissions)
@@ -814,9 +930,7 @@ class WindowsUiaDriver:
             return _metadata_digest(
                 name=name or _normalized_text(safe_info_attr("name")),
                 control_type=_normalized_text(safe_info_attr("control_type")),
-                automation_id=(
-                    _normalized_text(safe_info_attr("automation_id")) or None
-                ),
+                automation_id=(_normalized_text(safe_info_attr("automation_id")) or None),
                 value=None,
                 selected=None,
                 focused=None,
@@ -946,17 +1060,12 @@ class WindowsUiaDriver:
                     except Exception:
                         stats["property_errors"] += 1
                         return False
-            return bool(
-                len(label_name) <= 120
-                and _SECRET_LABELED_BY_RE.fullmatch(label_name)
-            )
+            return bool(len(label_name) <= 120 and _SECRET_LABELED_BY_RE.fullmatch(label_name))
 
         include_types = self._profile_control_types(profile)
         content_types = self._profile_content_types(profile)
         profile_enabled = bool(
-            profile.include_control_types
-            or profile.content_control_types
-            or profile.composer_names
+            profile.include_control_types or profile.content_control_types or profile.composer_names
         )
         retained_content_nodes = 0
         with self._lock:
@@ -984,9 +1093,7 @@ class WindowsUiaDriver:
                 name = _normalized_text(counted_attr(info, "name", ""))
             control_type = _normalized_text(counted_attr(info, "control_type", None))
             if not control_type:
-                control_type = _normalized_text(
-                    counted_call(wrapper, "friendly_class_name", "")
-                )
+                control_type = _normalized_text(counted_call(wrapper, "friendly_class_name", ""))
             try:
                 password = UIABackend._is_password(wrapper)
             except Exception:
@@ -1036,9 +1143,7 @@ class WindowsUiaDriver:
             )
             secret_labeled = secret_labeled_state(info)
             automation_id_value = counted_attr(info, "automation_id", None)
-            automation_id = (
-                _normalized_text(automation_id_value) if automation_id_value else None
-            )
+            automation_id = _normalized_text(automation_id_value) if automation_id_value else None
             local_identity = _local_identity_digest(
                 counted_attr(info, "runtime_id", None, count_error=False)
             )
@@ -1072,24 +1177,18 @@ class WindowsUiaDriver:
                 ),
             )
             high_credential = any(
-                finding.confidence == CredentialConfidence.HIGH
-                for finding in raw_findings
+                finding.confidence == CredentialConfidence.HIGH for finding in raw_findings
             )
             low_credential = any(
-                finding.confidence == CredentialConfidence.LOW
-                for finding in raw_findings
+                finding.confidence == CredentialConfidence.LOW for finding in raw_findings
             )
             stats["high_credential_count"] += sum(
-                finding.confidence == CredentialConfidence.HIGH
-                for finding in raw_findings
+                finding.confidence == CredentialConfidence.HIGH for finding in raw_findings
             )
             stats["low_credential_count"] += sum(
-                finding.confidence == CredentialConfidence.LOW
-                for finding in raw_findings
+                finding.confidence == CredentialConfidence.LOW for finding in raw_findings
             )
-            stats["credential_affected_element_count"] += int(
-                high_credential or low_credential
-            )
+            stats["credential_affected_element_count"] += int(high_credential or low_credential)
 
             normalized_control_type = control_type.casefold()
             content_plane = normalized_control_type in content_types
@@ -1097,9 +1196,7 @@ class WindowsUiaDriver:
             aria_properties = _normalized_text(
                 counted_attr(raw_element, "CurrentAriaProperties", "")
             )
-            aria_role = _normalized_text(
-                counted_attr(raw_element, "CurrentAriaRole", "")
-            )
+            aria_role = _normalized_text(counted_attr(raw_element, "CurrentAriaRole", ""))
             dialog_plane = normalized_control_type in _DIALOG_CONTROL_TYPES or (
                 aria_role.casefold() in {"dialog", "alertdialog"}
             )
@@ -1151,9 +1248,7 @@ class WindowsUiaDriver:
                 continue
 
             name_limit = (
-                min(profile.max_content_chars, 1024)
-                if content_plane
-                else control_name_limit
+                min(profile.max_content_chars, 1024) if content_plane else control_name_limit
             )
             name_metadata = _bounded_text(name, maximum=name_limit)
             value_limit = profile.max_content_chars if content_plane else 4000
@@ -1232,10 +1327,7 @@ class WindowsUiaDriver:
                     wrapper=wrapper,
                     element=item,
                     actionable=addressable
-                    and (
-                        composer
-                        or self._is_actionable(control_type, enabled=enabled)
-                    ),
+                    and (composer or self._is_actionable(control_type, enabled=enabled)),
                     addressable=addressable,
                     content_plane=content_plane,
                     private_digest=private_digest,
@@ -1372,6 +1464,52 @@ class WindowsUiaDriver:
             raise WindowsUiaDriverError("desktop operation was cancelled")
         native = self._native_backend()
         native.assert_interactive_desktop()
+        if self._discover_all_windows:
+            windows = native.enumerate_windows()
+            foreground = native.get_foreground_window_info()
+            bindings: dict[str, _DynamicWindowBinding] = {}
+            visible: list[dict[str, Any]] = []
+            for window in windows:
+                app_id = self._dynamic_window_id(window)
+                if app_id in bindings:
+                    # A duplicate HWND/PID record is not a second selectable window.
+                    continue
+                profile, display_name = self._dynamic_profile(window)
+                binding = _DynamicWindowBinding(
+                    app_id=app_id,
+                    window=window,
+                    profile=profile,
+                    display_name=display_name,
+                )
+                bindings[app_id] = binding
+                visible.append(
+                    {
+                        "app": app_id,
+                        "display_name": display_name,
+                        "foreground": bool(
+                            foreground is not None and foreground.hwnd == window.hwnd
+                        ),
+                        "process_name": window.process_name,
+                        "visible_window_count": 1,
+                        "window_title": window.title,
+                    }
+                )
+            with self._lock:
+                old_bindings = self._dynamic_windows
+                self._dynamic_windows = bindings
+                invalidated_ids = {
+                    app_id
+                    for app_id, old_binding in old_bindings.items()
+                    if app_id not in bindings
+                    or not self._same_window_identity(
+                        old_binding.window,
+                        bindings[app_id].window,
+                    )
+                }
+                for app_id in invalidated_ids:
+                    self._snapshots.pop(app_id, None)
+                    self._pending_observation.discard(app_id)
+            return json.dumps(visible, ensure_ascii=False, sort_keys=True)
         visible: list[dict[str, Any]] = []
         for app, profile in self.profiles.items():
             matches = native.find_windows(
@@ -1394,15 +1532,35 @@ class WindowsUiaDriver:
         profile = self._profile(app)
         native = self._native_backend()
         native.assert_interactive_desktop()
-        window = self._resolve_window(app)
+        with self._lock:
+            allow_dynamic_title_change = bool(
+                normalized in self._dynamic_windows
+                and normalized in self._pending_observation
+                and normalized in self._snapshots
+            )
+        window = self._resolve_window(
+            app,
+            allow_dynamic_title_change=allow_dynamic_title_change,
+        )
+        if self._activate_on_observe:
+            activated = native.activate_window(window.hwnd)
+            if not self._same_window_identity(window, activated):
+                raise WindowsUiaStaleObservation(
+                    "the selected top-level window changed during activation"
+                )
+            native.assert_foreground(window.hwnd)
         root = self._root(window.hwnd)
         elements, wrappers, stats = self._elements(root, profile)
+        screenshot_png = self._capture_window_png(root) if self._capture_screenshots else None
+        if self._activate_on_observe:
+            native.assert_foreground(window.hwnd)
         with self._lock:
             self._generation += 1
             observation = DesktopObservation(
                 app=normalized,
                 generation=self._generation,
                 accessibility_text=self._accessibility_text(window, elements, stats),
+                screenshot_png=screenshot_png,
                 window_title=window.title,
                 elements=elements,
                 local_window_id=f"hwnd:{window.hwnd}",
@@ -1412,9 +1570,7 @@ class WindowsUiaDriver:
                 property_error_count=int(stats["property_error_count"]),
                 high_credential_count=int(stats["high_credential_count"]),
                 low_credential_count=int(stats["low_credential_count"]),
-                credential_affected_element_count=int(
-                    stats["credential_affected_element_count"]
-                ),
+                credential_affected_element_count=int(stats["credential_affected_element_count"]),
             )
             self._snapshots[normalized] = _Snapshot(window.hwnd, observation, wrappers)
             self._pending_observation.discard(normalized)
@@ -1426,9 +1582,7 @@ class WindowsUiaDriver:
             visible_member = wrapper.is_visible
             visible = visible_member() if callable(visible_member) else visible_member
         except Exception as exc:
-            raise WindowsUiaStaleObservation(
-                "target visibility could not be revalidated"
-            ) from exc
+            raise WindowsUiaStaleObservation("target visibility could not be revalidated") from exc
         if visible is not True:
             raise WindowsUiaStaleObservation("target element is no longer visible")
         try:
@@ -1462,9 +1616,7 @@ class WindowsUiaDriver:
             current_password = UIABackend._is_password(wrapper)
             try:
                 enabled_member = wrapper.is_enabled
-                current_enabled = (
-                    enabled_member() if callable(enabled_member) else enabled_member
-                )
+                current_enabled = enabled_member() if callable(enabled_member) else enabled_member
             except Exception as exc:
                 raise WindowsUiaStaleObservation(
                     "target enabled state could not be revalidated"
@@ -1549,8 +1701,10 @@ class WindowsUiaDriver:
         selection_changed = current_selected != expected.selected and not (
             expected.selected is False and current_selected is None
         )
-        if current_state != expected_state or selection_changed or (
-            require_focus and (expected.focused is not True or current_focused is not True)
+        if (
+            current_state != expected_state
+            or selection_changed
+            or (require_focus and (expected.focused is not True or current_focused is not True))
         ):
             raise WindowsUiaStaleObservation(
                 "target element identity or state changed after the observation"
@@ -1788,9 +1942,7 @@ class WindowsUiaDriver:
                     or element_plane(expected_element) != ElementPlane.INPUT
                     or expected_element.editable is False
                 ):
-                    raise WindowsUiaDriverError(
-                        "type_text target is not a verified editable input"
-                    )
+                    raise WindowsUiaDriverError("type_text target is not a verified editable input")
                 self._assert_element_still_bound(
                     wrapper,
                     expected_element,
@@ -1808,9 +1960,7 @@ class WindowsUiaDriver:
                     or element_plane(expected_element) != ElementPlane.INPUT
                     or expected_element.editable is False
                 ):
-                    raise WindowsUiaDriverError(
-                        "set_value target is not a verified editable input"
-                    )
+                    raise WindowsUiaDriverError("set_value target is not a verified editable input")
                 self._assert_element_still_bound(wrapper, expected_element)
                 method = self._set_value(wrapper, action.value)
             elif action.type == DesktopActionType.PRESS_KEY:
@@ -1864,3 +2014,4 @@ class WindowsUiaDriver:
         with self._lock:
             self._snapshots.clear()
             self._pending_observation.clear()
+            self._dynamic_windows.clear()

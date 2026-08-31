@@ -262,6 +262,7 @@ class DesktopExpectationKind(StrEnum):
     TEXT_ABSENT = "text_absent"
     FOCUSED_CONTAINS = "focused_contains"
     ELEMENT_SELECTED = "element_selected"
+    SEARCH_SUBMITTED = "search_submitted"
     LAST_ACTION_VERIFIED = "last_action_verified"
 
 
@@ -621,9 +622,12 @@ class DesktopObservation:
                 sort_keys=True,
             ).encode("utf-8")
         )
-        if self.screenshot_png is not None:
-            digest.update(b"\0image\0")
-            digest.update(self.screenshot_png)
+        # Screenshots are planner context, not a semantic freshness signal.
+        # Cursor blink, video, animation, and sub-pixel rendering can change
+        # PNG bytes between two observations of the same actionable UI state.
+        # Window identity, title, UIA text, and structured elements above stay
+        # bound into the fingerprint used for stale-action and confirmation
+        # checks.
         return digest.hexdigest()
 
     def planner_context(self, *, max_chars: int) -> dict[str, Any]:

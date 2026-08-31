@@ -80,8 +80,8 @@ speech:
     device: auto
     compute_type: auto
     beam_size: 5
-    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chat and Cowork、Design 和 over。"
-    hotwords: "Claude Codex Chat and Cowork Design over"
+    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
+    hotwords: "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
   fallback:
     backend: none
     model: large-v3-turbo
@@ -89,8 +89,8 @@ speech:
     compute_type: auto
     language: zh
     beam_size: 5
-    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chat and Cowork、Design 和 over。"
-    hotwords: "Claude Codex Chat and Cowork Design over"
+    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
+    hotwords: "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
 
 planner:
   # Legacy one-shot VoiceRuntime fallback only. Cloud output is locally restricted
@@ -107,13 +107,24 @@ computer_control:
   enabled: false
   backend: local_agent
   driver: windows_uia
-  # Each generic spoken task must affirmatively name exactly one configured app.
+  # strict requires each generic task to name exactly one configured app.
+  # local_unrestricted has no APP_SCOPE_REQUIRED gate: it exposes every freshly
+  # enumerated visible ordinary top-level window and refreshes that inventory
+  # between steps so the planner can infer low-risk cross-app navigation.
+  # If speech explicitly names an app/window/field, the corresponding user step
+  # still binds that exact target. Natural search sets the exact query, presses
+  # Enter/Return, and requires a fresh result transition; text entry alone is not
+  # search completion. Low-risk switching/navigation/toggle/generic safe dialogs
+  # do not confirm, but recognized send/delete/install/upload/share/close actions
+  # still do. Terminal/Run/UAC/auth/password/credential/payment/privacy targets,
+  # coordinates, and arbitrary shell remain blocked in every profile.
   # Every generic planner action needs a locally checkable false-before/true-after
   # condition. Deterministic native skills use action-specific local evidence.
   # claude is the default strict planner. Other accepted values are
   # codex_cli_best_effort (requires separate host-read consent) and none.
   planner_backend: claude
-  # Public default. Use personal_trusted only on a private, supervised machine.
+  # Public default. personal_trusted and the broader local_unrestricted profile
+  # belong only in an ignored config.local.yaml on a private, supervised machine.
   safety_profile: strict
   allow_screen_context_to_cloud: false
   # Codex subscription CLI has no complete no-tools mode. This separate consent
@@ -136,6 +147,13 @@ computer_control:
   open_computer_use_args: [mcp]
   allow_experimental_driver: false
   allow_coordinate_actions: false
+
+# Optional read-only grounding over a local WorkMap export. Keep machine paths
+# and personal aliases in config.local.yaml; they are intentionally not public.
+workmap:
+  enabled: false
+  out_directory: null
+  aliases: {}
 
 execution:
   dry_run: true
@@ -237,3 +255,82 @@ apps:
       - "Type a message"
       - "输入消息"
       - "询问 Claude"
+  chrome:
+    process_names: ["chrome.exe"]
+    executable: null
+    title_patterns: ["Chrome"]
+    search_hotkey: null
+    native_voice_hotkey: null
+    voice_button_names: []
+    mode_names: {}
+    include_control_types:
+      - "Button"
+      - "TabItem"
+      - "MenuItem"
+      - "ListItem"
+      - "TreeItem"
+      - "Edit"
+      - "ComboBox"
+      - "CheckBox"
+      - "RadioButton"
+      - "Dialog"
+      - "Window"
+    content_control_types: ["Text", "Document", "Pane", "Group"]
+    drop_long_content: true
+    max_control_name_chars: 500
+    max_content_chars: 1000
+    max_content_nodes: 120
+    composer_names: ["Address and search bar", "Search"]
+  explorer:
+    process_names: ["explorer.exe"]
+    executable: null
+    title_patterns: ["File Explorer", "资源管理器", "此电脑"]
+    search_hotkey: null
+    native_voice_hotkey: null
+    voice_button_names: []
+    mode_names: {}
+    include_control_types:
+      - "Button"
+      - "TabItem"
+      - "MenuItem"
+      - "ListItem"
+      - "TreeItem"
+      - "Edit"
+      - "ComboBox"
+      - "CheckBox"
+      - "RadioButton"
+      - "DataItem"
+      - "Dialog"
+      - "Window"
+    content_control_types: ["Text", "Document", "Pane", "Group"]
+    drop_long_content: true
+    max_control_name_chars: 500
+    max_content_chars: 1000
+    max_content_nodes: 160
+    composer_names: ["Address", "Search"]
+  wechat:
+    process_names: ["Weixin.exe", "WeChat.exe"]
+    executable: null
+    title_patterns: ["微信", "WeChat"]
+    search_hotkey: null
+    native_voice_hotkey: null
+    voice_button_names: []
+    mode_names: {}
+    include_control_types:
+      - "Button"
+      - "TabItem"
+      - "MenuItem"
+      - "ListItem"
+      - "TreeItem"
+      - "Edit"
+      - "ComboBox"
+      - "CheckBox"
+      - "RadioButton"
+      - "Dialog"
+      - "Window"
+    content_control_types: ["Text", "Document", "Pane", "Group"]
+    drop_long_content: true
+    max_control_name_chars: 500
+    max_content_chars: 1000
+    max_content_nodes: 120
+    composer_names: ["输入", "消息", "Type a message"]
