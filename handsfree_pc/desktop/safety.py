@@ -687,7 +687,10 @@ _APP_CONTROL_TARGET_RE = re.compile(
 )
 _SCROLL_TARGET_RE = re.compile(r"(?:滚动|\bscroll\b)", re.IGNORECASE)
 _TYPE_TEXT_ACTION_RE = re.compile(
-    r"(?:输入|键入|转写|复述|\b(?:type|input|transcribe|repeat)\b)",
+    # ``输入框`` is a target noun, not an earlier text-entry action.  Treating
+    # its prefix as a verb makes the real later ``输入 ...`` look like payload
+    # and reduces an ordinary spoken command to zero user steps.
+    r"(?:输入(?!框)|键入|转写|复述|\b(?:type|input|transcribe|repeat)\b)",
     re.IGNORECASE,
 )
 _SET_VALUE_ACTION_RE = re.compile(
@@ -821,7 +824,9 @@ _CHINESE_APP_LOCATION_PREFIX_RE = re.compile(
     r"\s*(?:(?:请|麻烦|帮我)\s*)*(?:在|于)\s*"
     r"(?!(?:我|如果|若|当|因为|由于|之后|之前))"
     r"(?:[a-z0-9_.+-]+(?:\s+[a-z0-9_.+-]+){0,5}|[\u3400-\u9fff]{2,32})"
-    r"(?:\s*(?:app|应用|程序|窗口))?(?:\s*(?:里|中|内|里面|上))?\s*",
+    r"(?:\s*(?:app|应用|程序|窗口))?(?:\s*(?:里|中|内|里面|上))?"
+    r"(?:\s*的\s*(?:[a-z0-9_.+ -]{1,64}|[\u3400-\u9fff]{1,32})"
+    r"(?:\s*(?:里|中|内|里面|上))?)?\s*",
     re.IGNORECASE,
 )
 _APP_TRAILING_OUTCOME_RE = re.compile(
@@ -1676,10 +1681,17 @@ def _expectation_suffix_is_complete(
     """Reject partial result labels and unverified qualifiers/conjuncts."""
 
     suffix = source[end:step_end]
-    if has_next_action and _NEXT_ACTION_SEPARATOR_RE.fullmatch(suffix):
-        suffix = ""
-    else:
-        suffix = re.sub(r"[，。；,;.!！？?]+\s*$", "", suffix)
+    if has_next_action:
+        # A natural target label often includes a control-type decoration before
+        # the separator (for example, ``Code 选项卡，然后 ...``).  Strip only a
+        # suffix that consists entirely of next-step separators; any additional
+        # words or clauses remain and must still fail the full match below.
+        for separator_start in range(len(suffix) + 1):
+            separator = suffix[separator_start:]
+            if separator.strip() and _NEXT_ACTION_SEPARATOR_RE.fullmatch(separator):
+                suffix = suffix[:separator_start]
+                break
+    suffix = re.sub(r"[，。；,;.!！？?]+\s*$", "", suffix)
     patterns = {
         DesktopExpectationKind.TEXT_PRESENT: re.compile(
             r"\s*(?:(?:(?:is|becomes?|remains?)\s+)?"
@@ -1696,7 +1708,10 @@ def _expectation_suffix_is_complete(
             re.IGNORECASE,
         ),
         DesktopExpectationKind.ELEMENT_SELECTED: re.compile(
-            r"\s*(?:(?:(?:is|becomes?|remains?)\s+)?selected|选中)?\s*",
+            r"\s*(?:(?:the\s+)?(?:tab(?:\s+item)?|button|menu(?:\s+item)?|"
+            r"list(?:\s+item)?|tree(?:\s+item)?|item|option)|"
+            r"选项卡|标签页|按钮|菜单项|列表项|树项目|项目|选项)?\s*"
+            r"(?:(?:(?:is|becomes?|remains?)\s+)?selected|(?:已|被)?选中)?\s*",
             re.IGNORECASE,
         ),
     }

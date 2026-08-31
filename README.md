@@ -2,7 +2,7 @@
 
 HandsFreePC 让 Windows 11 在双手被占用时继续接受语音操作：说“开始语音操作”进入连续会话，每条指令以英文 `over` 结束并按 FIFO 排队，说“结束语音操作”停止接收新指令并排空已接受队列。
 
-0.3.0 的关键变化是：**Codex 或 Claude 只负责规划下一步，本项目自己持有鼠标键盘权限，并在每个通用 planner 动作后重新观察、在本地验收。** 不再把 `codex exec` 的“已完成”文本当成屏幕操作成功的证据。
+0.3.1 的关键变化是：**Codex 或 Claude 只负责规划下一步，本项目自己持有鼠标键盘权限，并在每个通用 planner 动作后重新观察、在本地验收。** `over` 另由独立英文离线模型检测，不再依赖中文词表或正文转写碰巧识别成功。
 
 > [!WARNING]
 > 这是面向 **Windows 11、64 位 Python 3.11/3.12** 的 alpha。公开配置默认关闭电脑控制、云规划和真实执行。即使通过自有 fixture 的 live test，也只证明本机 UIA 基础链路可用，不证明任意第三方应用或高风险任务安全可控。
@@ -11,7 +11,7 @@ HandsFreePC 让 Windows 11 在双手被占用时继续接受语音操作：说�
 
 ```text
 麦克风
-  -> 本地 Vosk 控制词 + Silero VAD + SenseVoice 正文转写
+  -> 中文 Vosk 控制词 + 英文 Vosk `over` 检测 + Silero VAD + SenseVoice 正文转写
   -> “开始语音操作”会话 / over 分段 / 有界 FIFO
   -> NativeSkillRouter（确定性命令优先）
   -> StepPlanner（默认 Claude CLI；Codex CLI 仅为显式 best-effort 备选）
@@ -22,7 +22,7 @@ HandsFreePC 让 Windows 11 在双手被占用时继续接受语音操作：说�
 
 核心约束：
 
-- 持续监听、`over` 分段、执行期间继续收音、FIFO、失败暂停、结束后 drain 和急停均保留；
+- 持续监听、独立 `over` 检测、执行期间继续收音、FIFO、结束后 drain 和急停均保留；公开配置在普通失败后暂停，本机 `failure_policy: continue` 可让后续已入队指令继续；
 - 确定性解析命中时，`NativeSkillRouter` 先解析目标并走本地白名单执行器，不调用模型；
 - 普通桌面任务必须在口述中明确且肯定地只指定一个目标应用，才进入单步 agent loop；零个、多个、仅否定提及或顺带提及应用都会拒绝；
 - 通用 agent 的每个 planner 动作都执行 `fresh before -> 任务后置条件此时必须为 false -> 一个动作 -> fresh after -> 同一后置条件必须为 true`，再交给 LocalVerifier；确定性 native skill 使用各动作自己的本地证据，精确目标状态已成立时可幂等成功；
@@ -114,7 +114,7 @@ execution:
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --draft-smoke
 ```
 
-`--draft-smoke` 只会在可唯一、安全绑定的非密码编辑框中写入一个随机测试 token，再通过 fresh observe 和 LocalVerifier 读回；**不会点击发送，也不会替你提交 prompt**。它会在界面里留下未发送草稿，测试后可人工清除。若编辑框不唯一、没有可靠焦点、目标是敏感字段或界面无法读回，命令会失败关闭。
+`--draft-smoke` 只会在可唯一、安全绑定的非密码编辑框中写入一个随机测试 token，再通过 fresh observe 和 LocalVerifier 读回；**不会点击发送，也不会替你提交 prompt**。成功后只在当前字段仍精确等于本轮随机 token 时自动清空，并再次观察确认空白；若编辑框不唯一、没有可靠焦点、目标是敏感字段、界面无法读回或精确清理无法验收，命令会失败关闭。
 
 ## 启用连续桌面 agent
 
@@ -180,14 +180,14 @@ Electron 应用的可访问标签会随版本变化。`apps.*.mode_names` 同时
 - 一条正在执行时可以继续说下一条，普通任务严格 FIFO；队列满会明确拒绝，不会静默丢弃；
 - “结束语音操作”丢弃尚未由 `over` 完成的半条，并默认排空已接受任务；
 - “立即停止所有操作”“取消所有操作”等急停词请求取消当前任务并清空队列，但不能撤回已经发生的点击、输入或外部副作用；
-- 失败或待确认会暂停队列。提示会给出随机四位挑战码，例如“确认执行 4 8 2 7”；只有本轮准确口令会携带运行时保存的 confirmation ID。单独说“确认执行”无效，也不会作为新 prompt 交回模型猜测。
+- 公开默认 `failure_policy: pause` 会在普通失败或待确认时暂停队列；本机设为 `continue` 后普通失败不再卡住后续指令，但待确认仍暂停。确认提示会给出随机四位挑战码，例如“确认执行 4 8 2 7”；只有本轮准确口令会携带运行时保存的 confirmation ID。单独说“确认执行”无效，也不会作为新 prompt 交回模型猜测。
 - 同一 `VoiceRuntime` 进程运行期内，已经签发的四位码持续保持占用：确认、取消或超时都不回收到抽样池；有界重抽仍找不到新码时 fail closed。该集合不持久化，进程重启后不保证绝对不复用，所以四位码不是持久化防重放凭证。
 
-### `over` 的当前限制
+### `over` 的独立本地检测
 
-0.3 只增加了 `PromptAssembler.finalize()` 这个未来 KWS 可调用的 out-of-band seam；**当前运行时的 `over` 仍由正文 SenseVoice ASR 识别**，并不是独立关键词检测器。短英文词在中文语流中可能漏识别。
+`over` 现在由独立的英文 Vosk small-en-us 0.15 小词表检测器识别，不再要求中文 Vosk 词表或正文 SenseVoice 必须转写出这个短词。中文控制词检测、英文 delimiter 检测、Silero VAD 和正文 ASR 都消费同一次麦克风采集的音频 block；程序不会为 `over` 再打开一个麦克风，也不会保存原始音频。
 
-未来接入独立 KWS 不能简单再开一次麦克风：需要单一音频采集后的 block fan-out、统一时间戳、命中前音频前缀回灌和去重，否则会吞掉 `over` 前的正文。候选 sherpa-onnx KWS 模型的许可归属仍待上游澄清，因此 0.3 不自动下载或宣称已经启用。当前建议清晰说出 `over`，并以屏幕队列反馈确认是否入队。
+英文 detector 会请求 Vosk 的词级和 partial 词级时间，把命中的 `over` 绑定到当前麦克风流的样本区间；若没有可用词时间，则保守退回到命中所在音频 block 的近似区间。命中不会用异常截断 VAD，而是在话语结束后按 marker 区间切分本轮内存音频：marker 本身不送入 SenseVoice，前后非空片段分别转写，每个 marker 完成它前面的 prompt，最后一段保留为下一条 pending prompt。因此同一个 VAD 话语中的多个 `over` 也可依次入队；若 KWS 漏掉，正文 ASR 自己识别出的独立单词 `over` 仍是后备路径。安装或升级后必须重新运行 `download-models`；`doctor` 的 `models.delimiter.ready` 应为 `true`。样本边界不等于所有口音和噪声下都精确的词边界，清晰说出 `over` 并留一个很短的自然停顿仍有助于识别；最终以“已入队”反馈为准。
 
 ## 屏幕与语音反馈
 
@@ -264,4 +264,4 @@ computer_control:
 
 ---
 
-**English summary:** HandsFreePC 0.3.0 keeps continuous local speech input, `over` segmentation, and FIFO execution, but replaces model-owned mouse/keyboard control with an owned Windows UIA driver. Claude CLI is the default strict step planner. Codex CLI is an explicit best-effort alternative that requires host-read consent and is not a guaranteed no-tools mode. Every generic planner action requires a false-before/true-after local postcondition; deterministic native skills use action-specific local evidence and may succeed idempotently when the exact target state already holds. The public `strict` profile requires a fresh random four-digit confirmation for generic text entry; an explicitly local `personal_trusted` profile may enter the user's exact spoken draft into one focused non-password field, but never auto-sends it and retains confirmation/blocking for side effects and sensitive surfaces. Cloud planning and live control remain disabled by default. The legacy Codex Computer Use controller and Qwen open-computer-use 0.2.3 adapter are explicit, non-default compatibility/experimental options.
+**English summary:** HandsFreePC 0.3.1 keeps continuous local speech input, independent offline English-Vosk `over` detection, and FIFO execution, but replaces model-owned mouse/keyboard control with an owned Windows UIA driver. Claude CLI is the default strict step planner. Codex CLI is an explicit best-effort alternative that requires host-read consent and is not a guaranteed no-tools mode. Every generic planner action requires a false-before/true-after local postcondition; deterministic native skills use action-specific local evidence and may succeed idempotently when the exact target state already holds. The public `strict` profile requires a fresh random four-digit confirmation for generic text entry; an explicitly local `personal_trusted` profile may enter the user's exact spoken draft into one focused non-password field, but never auto-sends it and retains confirmation/blocking for side effects and sensitive surfaces. Cloud planning and live control remain disabled by default. The legacy Codex Computer Use controller and Qwen open-computer-use 0.2.3 adapter are explicit, non-default compatibility/experimental options.

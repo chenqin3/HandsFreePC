@@ -9,8 +9,10 @@ HandsFreePC 是运行在当前 Windows 11 用户会话中的本地优先语音�
 ```text
 AudioCapture（单麦克风）
   +-> Vosk control detector：开始/结束/急停/确认/恢复
-  +-> Silero VAD -> SenseVoice command ASR
-                    -> PromptAssembler（正文中的 over）
+  +-> Vosk delimiter detector（small-en-us）：over
+  +-> Silero VAD + delimiter 样本区间切分
+                    -> SenseVoice 分段 command ASR
+                    -> PromptAssembler（逐 marker finalize；正文 ASR delimiter 后备）
                     -> bounded FIFO CommandWorker
                     -> DesktopAgentLoopController
                          1. NativeSkillRouter
@@ -38,26 +40,26 @@ AudioCapture（单麦克风）
 
 取消无法撤回已经到达 Windows 或外部服务的副作用。退出进程或关闭系统麦克风权限才会停止采集；结束语音会话不是关麦。
 
-## `over` 与未来 KWS seam
+## `over` 的独立 KWS
 
-当前 delimiter 仍来自正文 SenseVoice 转写。`PromptAssembler` 对 ASCII delimiter 使用单词边界，所以 `mouseover`、`voiceover` 不会误切；但短英文 `over` 在中文语流中可能漏识别。
+delimiter 有两条本地路径。主路径由 Vosk small-en-us 0.15 小词表检测器请求词级及 partial 词级时间，把命中的 `over` 绑定到单调递增的麦克风样本区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入 SenseVoice，各非空段分别转写，每个 marker 依次 `finalize()` 它前面的 prompt，最后一段保留为下一条 pending prompt。若某次 Vosk 结果没有可用词时间，则区间退化为命中所在 audio block，不能把这个近似当成精确词边界。若 KWS 没有命中而正文 SenseVoice 转写出独立单词 `over`，`PromptAssembler.feed()` 仍会按 ASCII 单词边界切分。中文 Vosk 不再加载它词表中不存在的英文 `over`。
 
-0.3 只加入 `PromptAssembler.finalize()`：未来独立 KWS 在 out-of-band 命中 delimiter 后，可以完成当前 pending prompt，而不用把 `over` 注入正文。它尚未接入运行时。
-
-正确的 KWS 架构必须是同一次麦克风采集后的 audio block fan-out，而不是两个组件各自打开麦克风：
+两套 Vosk 检测器与 VAD/ASR 都消费同一个 `MicrophoneSource` 的 block，不会各自打开麦克风：
 
 ```text
-Audio block + monotonic timestamp
+Audio block + monotonic sample counter
   +-> control/KWS stream
-  +-> VAD/ASR stream + pre-roll buffer
+  +-> VAD stream + in-memory capture
 
-KWS hit(t)
-  -> 先转写 hit 前尚未结算的 audio prefix
-  -> 去重/按 timestamp 合并
-  -> PromptAssembler.finalize()
+delimiter KWS hit
+  -> 继续录到本话语的 VAD 终点
+  -> 用词时间或 block fallback 得到 marker 样本区间
+  -> 按一个或多个 marker 区间切成 n+1 段
+  -> marker 音频不进 ASR；其他非空段分别由 SenseVoice 转写
+  -> 每个 marker finalize 前段；末段保留为下一条 pending prompt
 ```
 
-否则 KWS 抛出 delimiter 时可能吞掉它之前的正文，或把同一音频转写两次。候选 sherpa-onnx KWS 模型的许可问题仍待澄清，0.3 不自动下载模型、不启用隐藏的第二音频流。
+KWS 命中不会抛异常中断 recorder，因此不会仅因听到 `over` 就吞掉前面的正文。当前实现支持同一 VAD 话语内的多个 marker，也会把 marker 后正文留给下一条 prompt；但 Vosk 词时间或 block fallback 都不保证在所有口音、噪声和语速下形成精确边界。短暂自然停顿是提高识别和切分稳健性的建议，不是协议强制要求，用户仍应以入队反馈确认结果。
 
 ## NativeSkillRouter：本地确定性优先
 

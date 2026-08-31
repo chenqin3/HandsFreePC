@@ -69,7 +69,56 @@ def test_doctor_strict_requires_complete_runtime(tmp_path, monkeypatch, capsys) 
     report = yaml.safe_load(capsys.readouterr().out)
     assert exit_code == 1
     assert report["ready_for_run"] is False
-    assert set(report["models"]) == {"wake", "command", "vad"}
+    assert set(report["models"]) == {"wake", "delimiter", "command", "vad"}
+
+
+def test_doctor_requires_a_complete_delimiter_model(tmp_path, monkeypatch, capsys) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+speech:
+  wake:
+    model_path: models/wake
+  delimiter:
+    model_path: models/delimiter
+  command:
+    model_path: models/command
+  vad:
+    model_path: models/vad.onnx
+""",
+        encoding="utf-8",
+    )
+    for directory in ("wake/am", "wake/conf", "delimiter/am", "command"):
+        (tmp_path / "models" / directory).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models/wake/am/final.mdl").touch()
+    (tmp_path / "models/wake/conf/model.conf").touch()
+    (tmp_path / "models/delimiter/am/final.mdl").touch()
+    (tmp_path / "models/command/tokens.txt").touch()
+    (tmp_path / "models/command/model.int8.onnx").touch()
+    (tmp_path / "models/vad.onnx").touch()
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
+    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
+    monkeypatch.setattr(cli, "_check_command", lambda *_args, **_kwargs: {"found": False})
+
+    cli.command_doctor(
+        SimpleNamespace(config=str(config), check_planner_auth=False, strict=False)
+    )
+    incomplete = json.loads(capsys.readouterr().out)
+
+    assert incomplete["models"]["delimiter"]["ready"] is False
+    assert incomplete["ready_for_run"] is False
+
+    (tmp_path / "models/delimiter/conf").mkdir()
+    (tmp_path / "models/delimiter/conf/model.conf").touch()
+    cli.command_doctor(
+        SimpleNamespace(config=str(config), check_planner_auth=False, strict=False)
+    )
+    complete = json.loads(capsys.readouterr().out)
+
+    assert complete["models"]["delimiter"]["ready"] is True
+    assert complete["ready_for_run"] is True
 
 
 def test_json_fallback_remains_valid_on_legacy_console(monkeypatch) -> None:

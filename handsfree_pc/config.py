@@ -71,6 +71,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             ],
             "phrase_window_seconds": 5.0,
         },
+        "delimiter": {
+            "backend": "vosk",
+            "model_path": "models/vosk-model-small-en-us-0.15",
+            "grammar": ["over"],
+            "phrase_window_seconds": 2.0,
+        },
         "command": {
             "backend": "sensevoice",
             "model_path": "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
@@ -338,6 +344,7 @@ class SpeechSettings:
     noise_multiplier: float
     vad: dict[str, Any]
     wake: dict[str, Any]
+    delimiter: dict[str, Any]
     command: dict[str, Any]
     fallback: dict[str, Any]
 
@@ -517,6 +524,10 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
     wake_settings["grammar"] = _require_string_list(
         speech_raw["wake"], "grammar", section="speech.wake"
     )
+    delimiter_settings = copy.deepcopy(speech_raw["delimiter"])
+    delimiter_settings["grammar"] = _require_string_list(
+        speech_raw["delimiter"], "grammar", section="speech.delimiter"
+    )
 
     aliases = {
         str(name): _expand_path(str(value), base_dir=base_dir)
@@ -614,6 +625,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             noise_multiplier=float(speech_raw["noise_multiplier"]),
             vad=copy.deepcopy(speech_raw["vad"]),
             wake=wake_settings,
+            delimiter=delimiter_settings,
             command=copy.deepcopy(speech_raw["command"]),
             fallback=copy.deepcopy(speech_raw["fallback"]),
         ),
@@ -685,12 +697,18 @@ def _validate(settings: Settings) -> None:
     for label, values in phrase_groups.items():
         if not values or any(not compact_text(value) for value in values):
             raise ValueError(f"At least one non-empty {label} is required")
-    try:
-        phrase_window_seconds = float(settings.speech.wake.get("phrase_window_seconds", 0))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("speech.wake.phrase_window_seconds must be a positive number") from exc
-    if phrase_window_seconds <= 0:
-        raise ValueError("speech.wake.phrase_window_seconds must be a positive number")
+    for section, values in (
+        ("speech.wake", settings.speech.wake),
+        ("speech.delimiter", settings.speech.delimiter),
+    ):
+        try:
+            phrase_window_seconds = float(values.get("phrase_window_seconds", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{section}.phrase_window_seconds must be a positive number") from exc
+        if phrase_window_seconds <= 0:
+            raise ValueError(f"{section}.phrase_window_seconds must be a positive number")
+        if str(values.get("backend", "")).lower() != "vosk":
+            raise ValueError(f"{section}.backend must be vosk")
     if settings.speech.sample_rate not in {8000, 16000, 24000, 32000, 44100, 48000}:
         raise ValueError("Unsupported sample rate")
     if not 0 < settings.execution.ambiguity_threshold <= 1:
@@ -742,8 +760,8 @@ def _validate(settings: Settings) -> None:
         raise ValueError("computer_control.max_steps must be between 1 and 100")
     if not 1000 <= settings.computer_control.max_observation_chars <= 100000:
         raise ValueError("computer_control.max_observation_chars must be between 1000 and 100000")
-    if settings.computer_control.failure_policy != "pause":
-        raise ValueError("computer_control.failure_policy must be pause")
+    if settings.computer_control.failure_policy not in {"pause", "continue"}:
+        raise ValueError("computer_control.failure_policy must be pause or continue")
     if settings.computer_control.end_policy != "drain":
         raise ValueError("computer_control.end_policy must be drain")
     uses_cloud_desktop_planner = settings.computer_control.backend == "legacy_codex_cli" or (

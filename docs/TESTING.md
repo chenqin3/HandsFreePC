@@ -77,7 +77,7 @@ execution:
 
 - Windows 与 Python 版本；
 - `yaml`、`psutil`、audio、Vosk、sherpa-onnx、pywin32 和 pywinauto；
-- 三个本地模型的运行文件；
+- 四个本地模型的运行文件（中文控制词、英文 delimiter、正文 ASR、VAD）；
 - 至少一个音频输入；
 - 当前 backend、driver、planner 与云许可；
 - 相应 CLI 是否存在；
@@ -155,14 +155,14 @@ ASCII 文本出现不算 Unicode PASS。退出码非 0、字段缺失或 verifie
 只用无敏感内容检查：
 
 1. 正常语速说“开始语音操作”，确认进入“我在听”；
-2. 说一条命令后清晰说英文 `over`，确认只入队一次；
-3. 第一条执行反馈期间说第二条，确认 FIFO；
+2. 说一条命令后清晰说英文 `over`，确认只入队一次；分别测试短暂停顿和同一 VAD 话语内紧接下一条正文；
+3. 第一条执行反馈期间说第二条，确认 FIFO；再在同一 VAD 话语内说两个 `over`，确认两条依次入队且末尾未完成正文保留为 pending；
 4. 说 `mouseover`、`voiceover`，确认不切分；
 5. 不说 `over`，然后“结束语音操作”，确认半条被丢弃；
 6. 测试急停、失败暂停、恢复和队列满反馈；
 7. 分别测试 `overlay`、`voice`、`both`、`silent`。
 
-当前 `over` 仍由正文 SenseVoice 识别；`PromptAssembler.finalize()` 只有单元测试 seam，没有 KWS runtime。必须把“ASR 识别了 over”与“独立关键词检测成功”分开记录。
+当前 `over` 同时有独立英文 Vosk KWS 主路径和正文 SenseVoice 后备路径。KWS 验收还要确认词时间与无词时间 block fallback：marker 音频不送入正文 ASR，marker 前后非空片段分别转写，每个 marker 只完成它前面的 prompt，末段进入下一条 pending；同一 VAD 内单个/多个 marker 都不得丢前缀、吞后缀、重复入队或把 `over` 混入正文。分别记录 `PROMPT_DELIMITER_DETECTED` 与 `COMMAND_ENQUEUED`。
 
 TTS 为半双工：播放期间说话可能被丢弃，也不能靠语音急停打断正在播放的 SAPI。确认测试必须等确认提示实际显示或完整播报后，再说提示中的完整“确认执行 + 随机四位码”。还要断言静态“确认执行”、错误码、旧码、超时码和已使用码全部无效；同一进程内取消/超时码也不得重新签发，并测试有界生成空间耗尽会 fail closed。去重集合不跨进程持久化，重启后不保证绝对不复用。随机码不是持久化防重放凭证或说话人认证；另记录旁人/扬声器实时听到并转述本轮码的残余风险，不要把该测试写成防声学重放证明。
 
@@ -237,7 +237,7 @@ apps:
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --observe-only
 ```
 
-只读观察成功后，才可显式运行未发送草稿 smoke。它必须写入唯一、聚焦、非密码 composer，fresh observe 后 exact read-back，并报告 `sent: false`；测试 token 会保留在输入框中，验收后人工清除：
+只读观察成功后，才可显式运行未发送草稿 smoke。它必须写入唯一、聚焦、非密码 composer，fresh observe 后 exact read-back，并报告 `sent: false`；随后只清理仍与本轮固定格式 token 精确相同的内容，并要求 `cleanup_verified: true`：
 
 ```powershell
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --draft-smoke

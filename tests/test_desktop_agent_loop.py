@@ -347,6 +347,69 @@ def test_unknown_explicit_app_scope_is_detected_without_matching_quotes_or_negat
         "不要打开记事本然后点击 Code；在 Claude 点击 Code",
         known,
     )
+    for task in (
+        "在 Claude 的输入框输入 测试",
+        "在 Claude 应用的输入框输入 测试",
+        "切换到 Codex，打开其中的项目",
+    ):
+        assert not _unsupported_explicit_app_scopes(task, known)
+
+
+def test_chinese_click_tab_role_suffix_counts_one_step_and_completes():
+    task = "在 Claude 中点击 Code 选项卡"
+    before = _observation(
+        1,
+        '25 name="Code" control_type="TabItem" selected=false',
+        elements=(DesktopElement("25", "Code", "TabItem", selected=False),),
+    )
+    refresh = _observation(
+        2,
+        '25 name="Code" control_type="TabItem" selected=false',
+        elements=(DesktopElement("25", "Code", "TabItem", selected=False),),
+    )
+    after = _observation(
+        3,
+        '25 name="Code" control_type="TabItem" selected=true',
+        elements=(DesktopElement("25", "Code", "TabItem", selected=True),),
+    )
+    action = DesktopAction(
+        DesktopActionType.CLICK,
+        app="claude",
+        generation=1,
+        element_index="25",
+    )
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.ELEMENT_SELECTED,
+        text="Code",
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "click exact tab",
+                app="claude",
+                action=action,
+                expectation=expectation,
+            ),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Code"),
+        ]
+    )
+    driver = FakeDriver([before, refresh, after])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("personal_trusted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success
+    assert result.message.startswith("LOCAL_VERIFIED_COMPLETION:")
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
 
 
 @pytest.mark.parametrize(

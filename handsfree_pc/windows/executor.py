@@ -366,15 +366,33 @@ class WindowsExecutor:
             return self._success(action, f"Dry run: would open mode {action.mode}", evidence)
         assert hwnd is not None
 
+        def retry_uia(operation: Callable[[], dict[str, object]]) -> dict[str, object]:
+            # Exact mode selection is idempotent, so this retry stays local to OPEN_MODE.
+            for attempt in range(3):
+                try:
+                    return operation()
+                except ElementNotFoundError:
+                    # A missing exact label must continue through the configured
+                    # fallbacks instead of retrying the same label.
+                    raise
+                except UIAError:
+                    if attempt == 2:
+                        raise
+                    self._sleep((0.15, 0.35)[attempt])
+                    self._native_backend().assert_foreground(hwnd)
+            raise AssertionError("unreachable")
+
         def click_mode(canonical_name: str) -> tuple[str, dict[str, object]]:
             labels = profile.mode_names[canonical_name.casefold()]
             last_not_found: ElementNotFoundError | None = None
             for label in labels:
                 try:
-                    match = self._uia_backend().click_named_exact(
-                        hwnd,
-                        label,
-                        control_types=("TabItem", "Button", "ListItem", "TreeItem"),
+                    match = retry_uia(
+                        lambda label=label: self._uia_backend().click_named_exact(
+                            hwnd,
+                            label,
+                            control_types=("TabItem", "Button", "ListItem", "TreeItem"),
+                        )
                     )
                 except ElementNotFoundError as exc:
                     last_not_found = exc
@@ -393,10 +411,12 @@ class WindowsExecutor:
         matches.append(mode_match)
         self._native_backend().assert_foreground(hwnd)
         try:
-            selected = self._uia_backend().verify_named_selected(
-                hwnd,
-                mode_label,
-                control_types=("Button", "ListItem", "TreeItem", "TabItem"),
+            selected = retry_uia(
+                lambda: self._uia_backend().verify_named_selected(
+                    hwnd,
+                    mode_label,
+                    control_types=("Button", "ListItem", "TreeItem", "TabItem"),
+                )
             )
         except UIAError:
             selected = None

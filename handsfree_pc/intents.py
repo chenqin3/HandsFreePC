@@ -96,7 +96,11 @@ _APP_ENTITY_OPERATION_MARKERS = tuple(
     if marker not in {"打开", "然后", "接着", "随后", "再", "同时", "并且"}
 )
 
-_APP_SURFACE_PATTERN = r"(?<![a-z0-9_-])(chat|code|cowork)(?![a-z0-9_-])"
+_APP_SURFACE_PATTERN = r"(?<![a-z0-9_-])(chatandcowork|chat|code|cowork)(?![a-z0-9_-])"
+
+
+def _canonical_app_surface(value: str) -> str:
+    return "chat" if value.casefold() == "chatandcowork" else value.casefold()
 
 
 def _detect_app(text: str) -> str | None:
@@ -130,13 +134,13 @@ def _detect_app_surface(compact: str) -> str | None:
         re.IGNORECASE,
     )
     if labelled:
-        return labelled.group(1).lower()
+        return _canonical_app_surface(labelled.group(1))
     navigated = re.search(
         rf"(?:切换到|切换至|进入|打开|到)(?:其中的)?{_APP_SURFACE_PATTERN}",
         compact,
         re.IGNORECASE,
     )
-    return navigated.group(1).lower() if navigated else None
+    return _canonical_app_surface(navigated.group(1)) if navigated else None
 
 
 def _normalize_spoken_path_tail(value: str) -> str:
@@ -298,10 +302,14 @@ class DeterministicIntentParser:
                         r"(?:并|然后)?(?:开启|创建|打开)(?:一个)?" + re.escape(mode)
                     )
                 elif mode in {"chat", "code", "cowork"}:
+                    surface_pattern = (
+                        "(?:chatandcowork|chat)" if mode == "chat" else re.escape(mode)
+                    )
                     pattern = (
-                        r"^(?:并|然后)?(?:的|到|至|进入|打开|切换到|切换至)?(?:其中的)?"
-                        + re.escape(mode)
-                        + r"(?:选项卡|标签页|tab)(?:里面|中)?"
+                        r"^[,，]?(?:并|然后)?"
+                        r"(?:的|到|至|进入|打开|切换到|切换至)?(?:其中的)?"
+                        + surface_pattern
+                        + r"(?:(?:选项卡|标签页|tab)(?:里面|中)?)?"
                     )
                 else:
                     pattern = r"^(?:并|然后)?(?:开启|创建|打开)(?:一个)?" + re.escape(mode)

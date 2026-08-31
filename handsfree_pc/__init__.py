@@ -3,4 +3,4 @@
 from .models import Action, ActionType, Plan
 
 __all__ = ["Action", "ActionType", "Plan"]
-__version__ = "0.3.0"
+__version__ = "0.3.1"

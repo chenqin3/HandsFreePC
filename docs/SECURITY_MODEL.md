@@ -182,14 +182,14 @@ Windows UIA driver 的本地证据包括窗口 HWND、进程名/标题、当前 
 |---|---|---|
 | 旁人/扬声器说出唤醒词 | 小词表、本地状态机、动作级安全与确认 | 没有说话人识别；环境音仍可能触发 |
 | 旁人/扬声器重放确认 | 随机四位码、短有效期、动作/界面绑定、当前进程内已签发码不回收 | 实时听到并转述/重放本轮码仍可能授权；重启后可能复用，不是持久凭证或说话人认证 |
-| `over` 漏识别 | 独立单词边界、overlay 队列反馈 | 仍依赖正文 ASR；0.3 KWS 只有 finalize seam |
+| `over` 漏识别 | 独立英文 Vosk 小词表、正文 ASR 后备、overlay 队列反馈 | 口音、噪声或设备距离仍可能漏检 |
 | 一条失败后后续继续误操作 | worker 默认失败暂停 | 已发生副作用不能撤回 |
 | 队列淹没 | 有界 FIFO、满时显式拒绝 | 用户可能没看到/听到拒绝反馈 |
 | 急停延迟 | 本地控制词、取消当前与清队列 | cooperative cancellation 不能中断已到 OS 的一次输入；TTS 播放中不能语音急停 |
 | 待确认界面变化 | 确认前 fresh observe + fingerprint | 应用仍可能在最终动作瞬间变化 |
-| KWS 双开麦克风 | 本轮不实现；未来要求单流 fan-out/timestamp | 许可与模型质量尚未解决 |
+| KWS 双开麦克风或 delimiter 错切 | 两个 Vosk detector 复用同一 `MicrophoneSource` block；delimiter 请求词级/partial 词级时间并按样本区间切分 | 词时间或 block fallback 仍可能受口音、噪声和语速影响而产生近似边界；短暂停顿可提高稳健性，但仍需核对入队反馈 |
 
-`PromptAssembler.finalize()` 不是一个已启用的 KWS。候选模型许可待上游澄清，0.3 不下载或分发此类权重。
+英文 small-en-us 模型由安装器从 Vosk 官方地址下载并校验固定 SHA-256；模型不进 Git，安装目录保留来源、哈希和 Apache-2.0 COPYING。原始音频默认不保存。
 
 ## 静态与 live 证据
 

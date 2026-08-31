@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import SpeechSettings
-from .normalize import phrase_in_text
+from .normalize import compact_text, phrase_in_text
 
 
 class AudioError(RuntimeError):
@@ -36,6 +36,22 @@ class ControlPhraseDetected(AudioError):
 
 class FeedbackPending(AudioError):
     """Wake the microphone loop so queued spoken feedback can play at a safe boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class PhraseDetection:
+    """A local KWS match tied to one monotonic microphone-sample interval."""
+
+    phrase: str
+    start_sample: int
+    end_sample: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TimedToken:
+    text: str
+    start_sample: int
+    end_sample: int
 
 
 def rms(samples: Any) -> float:
@@ -152,45 +168,182 @@ class VoskWakeDetector:
         self.phrases = phrases
         self.phrase_window_seconds = phrase_window_seconds
         self._monotonic = monotonic
-        self._rolling_finals: list[tuple[float, str]] = []
+        self._rolling_finals: list[tuple[float, str, tuple[_TimedToken, ...]]] = []
         self._np: Any = None
-        grammar_json = json.dumps([*(grammar or phrases), "[unk]"], ensure_ascii=False)
+        self._samples_seen = 0
+        self._recognizer_base_sample = 0
+        self.last_detection: PhraseDetection | None = None
+        grammar_items: list[str] = []
+        seen_grammar: set[str] = set()
+        for raw_phrase in [*(grammar or ()), *phrases]:
+            phrase = str(raw_phrase).strip()
+            key = phrase.casefold()
+            if phrase and key not in seen_grammar:
+                grammar_items.append(phrase)
+                seen_grammar.add(key)
+        grammar_json = json.dumps([*grammar_items, "[unk]"], ensure_ascii=False)
         self._recognizer = vosk.KaldiRecognizer(
             vosk.Model(str(model_path)), sample_rate, grammar_json
         )
+        # Word intervals let the delimiter path separate audio before and after
+        # the keyword.  Older/fake recognizers remain usable through the
+        # block-interval fallback in ``accept_detection``.
+        if hasattr(self._recognizer, "SetWords"):
+            self._recognizer.SetWords(True)
+        if hasattr(self._recognizer, "SetPartialWords"):
+            self._recognizer.SetPartialWords(True)
+
+    @property
+    def samples_seen(self) -> int:
+        return self._samples_seen
 
     def accept(self, samples: Any) -> str | None:
+        detection = self.accept_detection(samples)
+        return detection.phrase if detection is not None else None
+
+    def accept_detection(self, samples: Any) -> PhraseDetection | None:
         if self._np is None:
             import numpy as np
 
             self._np = np
-        pcm = (self._np.clip(samples, -1, 1) * 32767).astype(self._np.int16).tobytes()
+        array = self._np.asarray(samples, dtype=self._np.float32).reshape(-1)
+        block_start = self._samples_seen
+        block_end = block_start + int(array.size)
+        self._samples_seen = block_end
+        pcm = (self._np.clip(array, -1, 1) * 32767).astype(self._np.int16).tobytes()
         is_final = self._recognizer.AcceptWaveform(pcm)
         raw = self._recognizer.Result() if is_final else self._recognizer.PartialResult()
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
             return None
+        return self._detection_from_payload(
+            payload,
+            is_final=bool(is_final),
+            block_start=block_start,
+            block_end=block_end,
+        )
+
+    def finalize_detection(self) -> PhraseDetection | None:
+        """Flush a phrase that Vosk only emits after the current endpoint closes."""
+
+        try:
+            payload = json.loads(self._recognizer.FinalResult())
+        except (AttributeError, json.JSONDecodeError):
+            self.reset()
+            return None
+        detection = self._detection_from_payload(
+            payload,
+            is_final=True,
+            block_start=self._recognizer_base_sample,
+            block_end=self._samples_seen,
+        )
+        if detection is None:
+            self.reset()
+        return detection
+
+    def _detection_from_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        is_final: bool,
+        block_start: int,
+        block_end: int,
+    ) -> PhraseDetection | None:
         text = payload.get("text") or payload.get("partial") or ""
+        token_key = "result" if is_final else "partial_result"
+        tokens = self._timed_tokens(
+            payload.get(token_key),
+            fallback_text=str(text),
+            block_start=block_start,
+            block_end=block_end,
+        )
         now = self._monotonic()
         cutoff = now - self.phrase_window_seconds
         self._rolling_finals = [
-            (seen_at, value) for seen_at, value in self._rolling_finals if seen_at >= cutoff
+            (seen_at, value, final_tokens)
+            for seen_at, value, final_tokens in self._rolling_finals
+            if seen_at >= cutoff
         ]
         if is_final and text:
-            self._rolling_finals.append((now, text))
+            self._rolling_finals.append((now, str(text), tokens))
             partial = ""
+            partial_tokens: tuple[_TimedToken, ...] = ()
         else:
-            partial = text
-        rolling_text = " ".join([*(value for _, value in self._rolling_finals), partial]).strip()
+            partial = str(text)
+            partial_tokens = tokens
+        rolling_text = " ".join(
+            [*(value for _, value, _ in self._rolling_finals), partial]
+        ).strip()
         matched = phrase_in_text(rolling_text, self.phrases)
         if matched:
+            rolling_tokens = tuple(
+                token
+                for _, _, final_tokens in self._rolling_finals
+                for token in final_tokens
+            ) + partial_tokens
+            span = self._phrase_sample_span(rolling_tokens, matched)
+            if span is None:
+                span = (block_start, block_end)
+            detection = PhraseDetection(matched, span[0], span[1])
             self.reset()
-        return matched
+            self.last_detection = detection
+            return detection
+        return None
+
+    def _timed_tokens(
+        self,
+        raw_tokens: Any,
+        *,
+        fallback_text: str,
+        block_start: int,
+        block_end: int,
+    ) -> tuple[_TimedToken, ...]:
+        result: list[_TimedToken] = []
+        if isinstance(raw_tokens, list):
+            for item in raw_tokens:
+                if not isinstance(item, dict):
+                    continue
+                word = str(item.get("word", "")).strip()
+                try:
+                    start = self._recognizer_base_sample + round(
+                        float(item["start"]) * self.sample_rate
+                    )
+                    end = self._recognizer_base_sample + round(
+                        float(item["end"]) * self.sample_rate
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if word and end > start:
+                    result.append(_TimedToken(word, max(0, start), max(0, end)))
+        if not result and fallback_text:
+            result.append(_TimedToken(fallback_text, block_start, block_end))
+        return tuple(result)
+
+    @staticmethod
+    def _phrase_sample_span(
+        tokens: tuple[_TimedToken, ...], phrase: str
+    ) -> tuple[int, int] | None:
+        compact_parts: list[str] = []
+        token_by_character: list[int] = []
+        for index, token in enumerate(tokens):
+            value = compact_text(token.text)
+            compact_parts.append(value)
+            token_by_character.extend([index] * len(value))
+        haystack = "".join(compact_parts)
+        needle = compact_text(phrase)
+        offset = haystack.find(needle)
+        if offset < 0 or not needle:
+            return None
+        first = tokens[token_by_character[offset]]
+        last = tokens[token_by_character[offset + len(needle) - 1]]
+        return first.start_sample, last.end_sample
 
     def reset(self) -> None:
         self._recognizer.Reset()
         self._rolling_finals.clear()
+        self._recognizer_base_sample = self._samples_seen
+        self.last_detection = None
 
 
 @dataclass(slots=True)
@@ -487,7 +640,14 @@ def _resolve_model_path(value: str, base_dir: Path) -> Path:
 class LocalSpeechSession:
     """High-level half-duplex speech session used by the runtime state machine."""
 
-    def __init__(self, settings: SpeechSettings, *, base_dir: Path, phrases: list[str]) -> None:
+    def __init__(
+        self,
+        settings: SpeechSettings,
+        *,
+        base_dir: Path,
+        phrases: list[str],
+        marker_phrases: list[str] | None = None,
+    ) -> None:
         self.settings = settings
         self.source = MicrophoneSource(
             sample_rate=settings.sample_rate,
@@ -501,6 +661,19 @@ class LocalSpeechSession:
             phrases=phrases,
             grammar=[str(item) for item in settings.wake.get("grammar", phrases)],
             phrase_window_seconds=float(settings.wake.get("phrase_window_seconds", 5.0)),
+        )
+        marker_values = list(marker_phrases or ())
+        delimiter = settings.delimiter
+        self.marker = (
+            VoskWakeDetector(
+                model_path=_resolve_model_path(str(delimiter["model_path"]), base_dir),
+                sample_rate=settings.sample_rate,
+                phrases=marker_values,
+                grammar=[str(item) for item in delimiter.get("grammar", marker_values)],
+                phrase_window_seconds=float(delimiter.get("phrase_window_seconds", 2.0)),
+            )
+            if marker_values
+            else None
         )
         vad = settings.vad
         if str(vad.get("backend", "silero")).lower() == "silero":
@@ -527,6 +700,9 @@ class LocalSpeechSession:
                 ),
             )
         self.transcriber = build_transcriber(settings, base_dir=base_dir)
+        self.last_marker_phrase: str | None = None
+        self.last_marker_events: tuple[PhraseDetection, ...] = ()
+        self.last_marker_audio_segments: tuple[Any, ...] = ()
 
     def __enter__(self) -> LocalSpeechSession:
         self.source.__enter__()
@@ -563,26 +739,116 @@ class LocalSpeechSession:
         *,
         timeout_seconds: float | None = None,
         interrupt_phrases: Iterable[str] = (),
+        marker_phrases: Iterable[str] = (),
     ) -> Any:
-        phrases = tuple(interrupt_phrases)
+        interrupts = tuple(interrupt_phrases)
+        markers = tuple(marker_phrases)
+        self.last_marker_phrase = None
+        self.last_marker_events = ()
+        self.last_marker_audio_segments = ()
+        marker_detector = getattr(self, "marker", None)
+        if markers and marker_detector is None:
+            raise AudioError("Prompt delimiter detector is not initialized")
+        captured_blocks: list[Any] = []
+        marker_events: list[PhraseDetection] = []
+        capture_origin = int(getattr(marker_detector, "samples_seen", 0))
+        captured_sample_count = 0
 
         def observe(block: Any) -> None:
+            nonlocal captured_sample_count
+            block_size = int(getattr(block, "size", len(block)))
+            block_start = capture_origin + captured_sample_count
+            block_end = block_start + block_size
+            captured_sample_count += block_size
+            captured_blocks.append(block)
             if (
-                phrases
+                interrupts
                 and (matched := self.wake.accept(block))
-                and phrase_in_text(matched, phrases)
+                and phrase_in_text(matched, interrupts)
             ):
                 raise ControlPhraseDetected(matched)
+            if markers and marker_detector is not None:
+                if hasattr(marker_detector, "accept_detection"):
+                    detection = marker_detector.accept_detection(block)
+                else:  # Compatibility with simple injected/test detectors.
+                    marker = marker_detector.accept(block)
+                    detection = (
+                        PhraseDetection(marker, block_start, block_end) if marker else None
+                    )
+                if detection is None or not phrase_in_text(detection.phrase, list(markers)):
+                    return
+                # A prompt delimiter is a marker, not an emergency interrupt.
+                # Continue recording so command audio before the marker is not lost.
+                marker_events.append(detection)
 
         try:
-            return self.endpoint.record(
+            audio = self.endpoint.record(
                 timeout_seconds=timeout_seconds,
-                block_observer=observe if phrases else None,
+                block_observer=observe if interrupts or markers else None,
             )
+            if (
+                markers
+                and marker_detector is not None
+                and hasattr(marker_detector, "finalize_detection")
+            ):
+                final_detection = marker_detector.finalize_detection()
+                if final_detection is not None and phrase_in_text(
+                    final_detection.phrase, list(markers)
+                ):
+                    marker_events.append(final_detection)
+            if marker_events:
+                self._store_marker_capture(
+                    captured_blocks,
+                    marker_events,
+                    capture_origin=capture_origin,
+                )
+            return audio
         except (AudioError, ControlPhraseDetected):
             raise
         except Exception as exc:
             raise AudioError("Endpoint processing failed") from exc
+
+    def _store_marker_capture(
+        self,
+        captured_blocks: list[Any],
+        marker_events: list[PhraseDetection],
+        *,
+        capture_origin: int,
+    ) -> None:
+        import numpy as np
+
+        captured = (
+            np.concatenate(
+                [np.asarray(block, dtype=np.float32).reshape(-1) for block in captured_blocks]
+            )
+            if captured_blocks
+            else np.empty(0, dtype=np.float32)
+        )
+        ordered = sorted(marker_events, key=lambda item: (item.start_sample, item.end_sample))
+        segments: list[Any] = []
+        cursor = 0
+        total_samples = int(captured.size)
+        retained_events: list[PhraseDetection] = []
+        for event in ordered:
+            marker_start = min(
+                total_samples,
+                max(cursor, event.start_sample - capture_origin),
+            )
+            marker_end = min(
+                total_samples,
+                max(marker_start, event.end_sample - capture_origin),
+            )
+            if marker_end <= cursor:
+                continue
+            segments.append(captured[cursor:marker_start].copy())
+            cursor = marker_end
+            retained_events.append(event)
+        if not retained_events:
+            return
+        segments.append(captured[cursor:].copy())
+        self.last_marker_events = tuple(retained_events)
+        self.last_marker_phrase = retained_events[-1].phrase
+        self.last_marker_audio_segments = tuple(segments)
 
     def transcribe(self, samples: Any) -> str:
         try:
@@ -592,8 +858,18 @@ class LocalSpeechSession:
         except Exception as exc:
             raise TranscriptionError("Local command transcription failed") from exc
 
+    def transcribe_marked_segments(self) -> list[str]:
+        if not self.last_marker_events:
+            raise AudioError("No prompt delimiter boundary is available")
+        return [
+            self.transcribe(samples) if int(getattr(samples, "size", len(samples))) else ""
+            for samples in self.last_marker_audio_segments
+        ]
+
     def reset_control_detector(self) -> None:
         self.wake.reset()
+        if self.marker is not None:
+            self.marker.reset()
 
 
 def list_audio_devices() -> list[dict[str, Any]]:

@@ -188,7 +188,7 @@ class PersistentMcpClient:
                 {
                     "protocolVersion": "2025-03-26",
                     "capabilities": {},
-                    "clientInfo": {"name": "HandsFreePC", "version": "0.3.0"},
+                    "clientInfo": {"name": "HandsFreePC", "version": "0.3.1"},
                 },
             )
             if not isinstance(result.get("capabilities"), dict):

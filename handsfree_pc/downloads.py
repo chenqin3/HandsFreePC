@@ -41,6 +41,22 @@ MODEL_ASSETS = (
         ),
     ),
     ModelAsset(
+        name="Vosk small English US 0.15",
+        directory="vosk-model-small-en-us-0.15",
+        url="https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+        archive_type="zip",
+        expected_files=("am/final.mdl", "conf/model.conf"),
+        attribution=(
+            "Vosk model Copyright 2020 Alpha Cephei Inc.; the official Vosk model "
+            "listing licenses small-en-us-0.15 under Apache-2.0."
+        ),
+        license_url="https://alphacephei.com/vosk/models",
+        sha256="30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498",
+        extra_files=(
+            ("https://raw.githubusercontent.com/alphacep/vosk-api/v0.3.45/COPYING", "COPYING"),
+        ),
+    ),
+    ModelAsset(
         name="sherpa-onnx SenseVoice Chinese/English/Japanese/Korean/Cantonese",
         directory="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
         url=(

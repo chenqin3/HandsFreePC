@@ -190,6 +190,46 @@ def test_command_worker_pauses_after_failure_and_resumes_fifo() -> None:
     assert worker.stop(cancel_pending=False, timeout=1)
 
 
+def test_command_worker_continue_policy_runs_later_fifo_after_ordinary_failure() -> None:
+    calls: list[int] = []
+
+    def handler(command: QueuedCommand, _cancel: threading.Event) -> JobOutcome:
+        calls.append(command.sequence)
+        return JobOutcome(command, success=command.sequence != 1)
+
+    worker = CommandWorker(handler, failure_policy="continue")
+    worker.start()
+    assert worker.enqueue(QueuedCommand("fails", sequence=1))
+    assert worker.enqueue(QueuedCommand("still runs", sequence=2))
+
+    assert worker.drain(timeout=1)
+    assert calls == [1, 2]
+    assert worker.state == WorkerState.IDLE
+    assert worker.stop(cancel_pending=False, timeout=1)
+
+
+def test_command_worker_continue_policy_still_pauses_for_confirmation() -> None:
+    calls: list[int] = []
+
+    def handler(command: QueuedCommand, _cancel: threading.Event) -> JobOutcome:
+        calls.append(command.sequence)
+        return JobOutcome(
+            command,
+            success=False,
+            error_type="NeedsConfirmation",
+        )
+
+    worker = CommandWorker(handler, failure_policy="continue")
+    worker.start()
+    assert worker.enqueue(QueuedCommand("confirm first", sequence=1))
+    assert worker.enqueue(QueuedCommand("must wait", sequence=2))
+
+    wait_for_state(worker, WorkerState.PAUSED)
+    assert calls == [1]
+    assert worker.unfinished_count == 1
+    assert worker.stop(timeout=1)
+
+
 def test_control_command_runs_before_ordinary_fifo_after_confirmation_pause() -> None:
     calls: list[str] = []
 

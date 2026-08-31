@@ -1625,6 +1625,73 @@ class WindowsUiaDriver:
             return "ValuePattern.SetValue"
         raise WindowsUiaDriverError("target element does not expose a writable value pattern")
 
+    def clear_app_doctor_draft(
+        self,
+        before: DesktopObservation,
+        element: DesktopElement,
+        *,
+        expected_text: str,
+    ) -> str:
+        """Clear only the exact random draft created by ``app-doctor``.
+
+        This diagnostic cleanup is intentionally outside the planner action
+        vocabulary. It cannot clear arbitrary user text: both the fixed token
+        shape and the freshly observed exact value must match.
+        """
+
+        if re.fullmatch(r"HandsFreePC-DRAFT-[0-9a-f]{10}-中文", expected_text) is None:
+            raise WindowsUiaDriverError("refusing to clear text that is not an app-doctor draft")
+        normalized = self._normalize_app(before.app)
+        with self._lock:
+            snapshot = self._snapshots.get(normalized)
+            if (
+                snapshot is None
+                or snapshot.observation.generation != before.generation
+                or before.app.casefold() != normalized
+            ):
+                raise WindowsUiaStaleObservation("draft cleanup used a stale observation")
+            if normalized in self._pending_observation:
+                raise WindowsUiaStaleObservation(
+                    "a fresh observation is required before draft cleanup"
+                )
+            observed = [item for item in before.elements if item.index == element.index]
+            if len(observed) != 1 or observed[0] != element:
+                raise WindowsUiaStaleObservation("draft cleanup target is not uniquely bound")
+            if (
+                element.value != expected_text
+                or not element.value_observed
+                or element.focused is not True
+                or element.password
+                or not element.composer
+                or not element.addressable
+                or element_plane(element) != ElementPlane.INPUT
+                or element.editable is False
+            ):
+                raise WindowsUiaDriverError(
+                    "draft cleanup requires the exact focused non-password app composer"
+                )
+            wrapper = snapshot.wrappers.get(element.index)
+            if wrapper is None:
+                raise WindowsUiaStaleObservation("draft cleanup target is not addressable")
+            self._pending_observation.add(normalized)
+        try:
+            native = self._native_backend()
+            native.assert_interactive_desktop()
+            window = self._resolve_window(before.app)
+            if window.hwnd != snapshot.hwnd:
+                raise WindowsUiaStaleObservation("the draft composer window changed")
+            native.activate_window(snapshot.hwnd)
+            native.assert_foreground(snapshot.hwnd)
+            self._assert_element_usable(wrapper)
+            self._assert_element_still_bound(wrapper, element, require_focus=True)
+            method = self._set_value(wrapper, "")
+            native.assert_foreground(snapshot.hwnd)
+            return method
+        except Exception:
+            with self._lock:
+                self._snapshots.pop(normalized, None)
+            raise
+
     def execute(
         self,
         action: DesktopAction,

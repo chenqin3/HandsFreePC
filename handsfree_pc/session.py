@@ -145,6 +145,14 @@ class PromptAssembler:
     def has_pending(self) -> bool:
         return bool(self.pending_text)
 
+    def contains_delimiter(self, fragment: str) -> bool:
+        """Return whether a fragment contains a configured delimiter without mutating state."""
+
+        if not isinstance(fragment, str):
+            raise ValueError("Prompt fragment must be a string")
+        value = unicodedata.normalize("NFKC", fragment)
+        return self._pattern.search(value) is not None
+
     def feed(self, fragment: str) -> list[str]:
         """Append one ASR fragment and return every newly completed prompt."""
 
@@ -177,7 +185,7 @@ class PromptAssembler:
     def finalize(self) -> str | None:
         """Finish the current prompt at an out-of-band delimiter event.
 
-        A future keyword spotter can call this after its timestamped audio
+        The local delimiter spotter calls this after its sample-bounded audio
         prefix has been transcribed, without injecting the delimiter word into
         the command text.
         """
@@ -210,6 +218,7 @@ class CommandWorker:
         *,
         max_queue_size: int = 20,
         max_control_queue_size: int = 4,
+        failure_policy: str = "pause",
         on_outcome: OutcomeCallback | None = None,
         on_state_change: StateCallback | None = None,
         thread_name: str = "HandsFreePC-command-worker",
@@ -224,11 +233,14 @@ class CommandWorker:
             raise ValueError("max_control_queue_size must be an integer")
         if max_control_queue_size <= 0:
             raise ValueError("max_control_queue_size must be positive")
+        if failure_policy not in {"pause", "continue"}:
+            raise ValueError("failure_policy must be pause or continue")
         self._handler = handler
         self._queue: deque[QueuedCommand] = deque()
         self._control_queue: deque[QueuedCommand] = deque()
         self._max_queue_size = max_queue_size
         self._max_control_queue_size = max_control_queue_size
+        self._failure_policy = failure_policy
         self._on_outcome = on_outcome
         self._on_state_change = on_state_change
         self._thread = threading.Thread(target=self._run, name=thread_name, daemon=True)
@@ -519,7 +531,14 @@ class CommandWorker:
                 self._notify_state(WorkerState.RUNNING)
 
                 outcome = self._invoke_handler(command, cancel_event, started_at)
-                pause_after_failure = not outcome.success and not outcome.cancelled
+                pause_after_failure = bool(
+                    not outcome.success
+                    and not outcome.cancelled
+                    and (
+                        self._failure_policy == "pause"
+                        or outcome.error_type == "NeedsConfirmation"
+                    )
+                )
                 with self._condition:
                     self._active_command = None
                     self._active_cancel_event = None

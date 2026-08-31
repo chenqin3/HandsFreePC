@@ -599,6 +599,42 @@ def run_app_doctor(
             last_action_result=action_verification,
         )
         verified = action_verification.verified and expectation_verification.verified
+        cleanup = getattr(driver, "clear_app_doctor_draft", None)
+        if not callable(cleanup):
+            raise AppDoctorFailure(
+                "DRAFT_CLEANUP_UNAVAILABLE",
+                "The desktop driver cannot safely remove its exact app-doctor draft",
+            )
+        try:
+            cleanup(after, after_composer, expected_text=token)
+            cleaned = driver.observe(normalized_app)
+            if not _fresh_same_window(after, cleaned):
+                raise AppDoctorFailure(
+                    "DRAFT_CLEANUP_OBSERVATION_STALE",
+                    "Draft cleanup was not verified in a fresh observation of the same window",
+                )
+            # Verify cleanup against the same stable composer identity that held
+            # the random draft. Re-selecting the "best" empty composer here can
+            # produce a false PASS if focus moved to a different blank field while
+            # the original field still contains the token.
+            cleaned_composer = _matching_composer(after_composer, cleaned)
+            cleanup_verified = bool(
+                cleaned_composer.focused is True
+                and cleaned_composer.value_observed
+                and not (cleaned_composer.value or "").strip()
+            )
+            if not cleanup_verified:
+                raise AppDoctorFailure(
+                    "DRAFT_CLEANUP_FAILED",
+                    "The exact app-doctor draft was not verified as removed",
+                )
+        except AppDoctorFailure:
+            raise
+        except Exception as exc:
+            raise AppDoctorFailure(
+                "DRAFT_CLEANUP_FAILED",
+                "The exact app-doctor draft could not be safely removed",
+            ) from exc
         report["draft_smoke"] = {
             "requested": True,
             "performed": True,
@@ -608,6 +644,7 @@ def run_app_doctor(
             "action_verified": action_verification.verified,
             "expectation_verified": expectation_verification.verified,
             "verified": verified,
+            "cleanup_verified": cleanup_verified,
             "draft_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
             "draft_chars": len(token),
             "composer": {

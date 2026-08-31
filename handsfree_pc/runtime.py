@@ -154,6 +154,7 @@ class VoiceRuntime:
             self.command_worker = CommandWorker(
                 self._run_queued_control,
                 max_queue_size=settings.computer_control.max_queue_size,
+                failure_policy=settings.computer_control.failure_policy,
                 on_outcome=self._on_control_outcome,
                 on_state_change=self._on_worker_state,
             )
@@ -473,6 +474,14 @@ class VoiceRuntime:
             if self.command_worker.state == WorkerState.PAUSED:
                 self.command_worker.resume()
             self._set_session_state(SessionState.ACTIVE)
+            session_id = self._voice_session_id
+        self._record_diagnostic(
+            stage="runtime",
+            error_code="VOICE_SESSION_STARTED",
+            safe_message="Continuous voice command session started",
+            level="info",
+            session_id=session_id,
+        )
         self._emit_continuous(
             "持续语音操作已开始。每条指令说完请说 over。",
             kind="listening",
@@ -555,13 +564,24 @@ class VoiceRuntime:
         ):
             return self._set_continuous_feedback_mode(feedback_mode)
 
+        self._record_diagnostic(
+            stage="runtime",
+            error_code="COMMAND_FRAGMENT_ACCEPTED",
+            safe_message="A local command transcript fragment was accepted",
+            level="info",
+            session_id=self._voice_session_id,
+        )
+
         projected = len(self.prompt_assembler.pending_text) + len(value)
         if projected > self.settings.computer_control.max_prompt_chars:
             self.prompt_assembler.discard_pending()
             self._emit_continuous("当前指令过长，已丢弃，请拆成多条", kind="error")
             return TurnOutcome(True, self.state, "指令过长", success=False)
 
+        delimiter_detected = self.prompt_assembler.contains_delimiter(value)
         completed = self.prompt_assembler.feed(value)
+        if delimiter_detected:
+            self._record_prompt_delimiter()
         if not completed:
             pending = self.prompt_assembler.pending_text
             message = "已记录，等待 over" if pending else "没有可入队的指令"
@@ -569,6 +589,18 @@ class VoiceRuntime:
                 self._emit_continuous(message, kind="recognized", allow_voice=False)
             return TurnOutcome(True, self.state, message)
 
+        return self._accept_completed_prompts(completed)
+
+    def _record_prompt_delimiter(self) -> None:
+        self._record_diagnostic(
+            stage="runtime",
+            error_code="PROMPT_DELIMITER_DETECTED",
+            safe_message="A configured prompt delimiter was detected locally",
+            level="info",
+            session_id=self._voice_session_id,
+        )
+
+    def _accept_completed_prompts(self, completed: list[str]) -> TurnOutcome:
         accepted = 0
         local = 0
         for prompt in completed:
@@ -585,6 +617,54 @@ class VoiceRuntime:
             self._emit_continuous(message, kind="recognized")
         else:
             message = f"已完成 {local} 条本地设置"
+        return TurnOutcome(True, self.state, message)
+
+    def _handle_marked_session_utterance(
+        self,
+        transcript: str,
+        marker: str,
+        *,
+        had_pending_before: bool,
+    ) -> TurnOutcome:
+        """Compatibility wrapper for one already boundary-separated marker prefix."""
+
+        del marker, had_pending_before
+        return self._handle_marked_session_segments([transcript, ""], marker_count=1)
+
+    def _handle_marked_session_segments(
+        self,
+        transcripts: list[str],
+        *,
+        marker_count: int,
+    ) -> TurnOutcome:
+        """Apply ordered ASR segments separated by local sample-bound marker events."""
+
+        if marker_count < 1 or len(transcripts) != marker_count + 1:
+            raise ValueError("Marker transcripts must contain one more segment than markers")
+        last_outcome: TurnOutcome | None = None
+        first_failure: TurnOutcome | None = None
+        for index, transcript in enumerate(transcripts):
+            value = transcript.strip()
+            if value:
+                last_outcome = self.handle_session_text(value)
+                if self.session_state != SessionState.ACTIVE:
+                    return last_outcome
+                if not last_outcome.success and first_failure is None:
+                    first_failure = last_outcome
+            if index >= marker_count:
+                continue
+            self._record_prompt_delimiter()
+            completed = self.prompt_assembler.finalize()
+            if completed is not None:
+                last_outcome = self._accept_completed_prompts([completed])
+                if not last_outcome.success and first_failure is None:
+                    first_failure = last_outcome
+        if first_failure is not None:
+            return first_failure
+        if last_outcome is not None:
+            return last_outcome
+        message = "已听到 over，但当前没有可入队的指令"
+        self._emit_continuous(message, kind="recognized", allow_voice=False)
         return TurnOutcome(True, self.state, message)
 
     def _enqueue_control_prompt(
@@ -608,14 +688,41 @@ class VoiceRuntime:
                 confirmation_id=confirmation_id,
             )
         if control and hasattr(worker, "enqueue_control"):
-            return bool(worker.enqueue_control(command))
-        enqueue = getattr(worker, "enqueue", worker.submit)
-        return bool(enqueue(command))
+            accepted = bool(worker.enqueue_control(command))
+        else:
+            enqueue = getattr(worker, "enqueue", worker.submit)
+            accepted = bool(enqueue(command))
+        if accepted:
+            self._record_diagnostic(
+                stage="runtime",
+                error_code="COMMAND_ENQUEUED",
+                safe_message="A voice command entered the local FIFO queue",
+                level="info",
+                session_id=command.session_id,
+                command_id=command.command_id,
+                sequence=command.sequence,
+            )
+        return accepted
 
     def _run_queued_control(
         self, command: QueuedCommand, cancel_event: threading.Event
     ) -> JobOutcome:
         started_at = time.monotonic()
+        self._record_diagnostic(
+            stage="runtime",
+            error_code="CONTROL_STARTED",
+            safe_message="A queued command started local computer control",
+            level="info",
+            session_id=command.session_id,
+            command_id=command.command_id,
+            sequence=command.sequence,
+        )
+        self._emit_continuous(
+            f"第 {command.sequence} 条正在规划并观察屏幕，请稍候…",
+            kind="executing",
+            duration=0,
+            voice_text=f"第 {command.sequence} 条开始执行",
+        )
         controller = self._ensure_computer_controller(command.session_id)
         if controller is None:
             return JobOutcome(
@@ -701,6 +808,15 @@ class VoiceRuntime:
                 return
             sequence = outcome.command.sequence
             if outcome.success:
+                self._record_diagnostic(
+                    stage="runtime",
+                    error_code="CONTROL_VERIFIED",
+                    safe_message="A computer-control command passed local verification",
+                    level="info",
+                    session_id=outcome.command.session_id,
+                    command_id=outcome.command.command_id,
+                    sequence=sequence,
+                )
                 self._emit_continuous(f"第 {sequence} 条已完成本地验收", kind="success")
             elif outcome.cancelled:
                 self._emit_continuous(f"第 {sequence} 条已取消", kind="error")
@@ -738,15 +854,25 @@ class VoiceRuntime:
                     generation=outcome.generation,
                 )
                 stage_name = stage_display_name(status.stage)
+                queue_paused = self.settings.computer_control.failure_policy == "pause"
+                queue_status = (
+                    "队列已暂停。说继续队列或取消所有操作。"
+                    if queue_paused
+                    else "后续已入队指令会继续执行。"
+                )
                 self._emit_continuous(
                     f"第 {sequence} 条失败\n"
                     f"[{status.stage} / {status.error_code}]\n"
                     f"{status.safe_message}\n"
                     "日志：handsfreepc.jsonl\n"
-                    "队列已暂停。说继续队列或取消所有操作。",
+                    f"{queue_status}",
                     kind="error",
                     duration=0,
-                    voice_text=f"第 {sequence} 条在{stage_name}阶段失败，队列已暂停",
+                    voice_text=(
+                        f"第 {sequence} 条在{stage_name}阶段失败，队列已暂停"
+                        if queue_paused
+                        else f"第 {sequence} 条在{stage_name}阶段失败，后续队列继续"
+                    ),
                 )
         if outcome.success:
             self._finish_draining_if_idle()
@@ -872,7 +998,14 @@ class VoiceRuntime:
         self._set_session_state(SessionState.DRAINING)
         worker = self.command_worker
         remaining = worker.unfinished_count if worker is not None else 0
-        message = f"已停止接收新指令，仍监听控制口令；剩余 {remaining} 条继续执行"
+        paused = worker is not None and worker.state == WorkerState.PAUSED and remaining > 0
+        if paused:
+            message = (
+                f"已停止接收新指令，仍监听控制口令；剩余 {remaining} 条处于暂停状态，"
+                "请说继续队列或完成待确认操作"
+            )
+        else:
+            message = f"已停止接收新指令，仍监听控制口令；剩余 {remaining} 条继续执行"
         if discarded:
             message += "；未说 over 的半条指令已丢弃"
         self._emit_continuous(message, kind="executing", duration=0)
@@ -1494,11 +1627,27 @@ class VoiceRuntime:
         ]
         base_dir = self.settings.config_path.parent
         self._emit_continuous(
-            "HandsFreePC 已就绪。说开始语音操作进入持续控制。",
-            kind="armed",
+            "正在加载本地语音模型并打开麦克风…",
+            kind="executing",
             duration=0,
         )
-        with LocalSpeechSession(self.settings.speech, base_dir=base_dir, phrases=phrases) as speech:
+        with LocalSpeechSession(
+            self.settings.speech,
+            base_dir=base_dir,
+            phrases=phrases,
+            marker_phrases=self.settings.app.prompt_delimiters,
+        ) as speech:
+            self._record_diagnostic(
+                stage="runtime",
+                error_code="MICROPHONE_READY",
+                safe_message="Local speech models and microphone are ready",
+                level="info",
+            )
+            self._emit_continuous(
+                "HandsFreePC 已就绪。说开始语音操作进入持续控制。",
+                kind="armed",
+                duration=0,
+            )
             while not self.stop_event.is_set():
                 try:
                     if self._voice_feedback_event.is_set():
@@ -1506,10 +1655,32 @@ class VoiceRuntime:
                         if self.stop_event.is_set():
                             break
                     if self.session_state == SessionState.ACTIVE:
-                        audio = speech.listen_utterance(interrupt_phrases=interrupts)
-                        transcript = speech.transcribe(audio)
-                        if transcript:
-                            self.handle_session_text(transcript)
+                        had_pending_before = self.prompt_assembler.has_pending
+                        audio = speech.listen_utterance(
+                            interrupt_phrases=interrupts,
+                            marker_phrases=self.settings.app.prompt_delimiters,
+                        )
+                        marker_events = tuple(getattr(speech, "last_marker_events", ()))
+                        marker = getattr(speech, "last_marker_phrase", None)
+                        if marker_events:
+                            transcripts = speech.transcribe_marked_segments()
+                            self._handle_marked_session_segments(
+                                transcripts,
+                                marker_count=len(marker_events),
+                            )
+                        else:
+                            transcript = speech.transcribe(audio)
+                            if marker:
+                                # Compatibility for injected speech sessions which only
+                                # expose the legacy single-marker attribute. Production
+                                # LocalSpeechSession always supplies sample-bound events.
+                                self._handle_marked_session_utterance(
+                                    transcript,
+                                    marker,
+                                    had_pending_before=had_pending_before,
+                                )
+                            elif transcript:
+                                self.handle_session_text(transcript)
                         continue
 
                     matched, audio = speech.wait_for_phrase(
@@ -1517,6 +1688,12 @@ class VoiceRuntime:
                         feedback_event=self._voice_feedback_event,
                     )
                     transcript = speech.transcribe(audio)
+                    self._record_diagnostic(
+                        stage="runtime",
+                        error_code="WAKE_OR_CONTROL_PHRASE_DETECTED",
+                        safe_message="A configured local wake or control phrase was detected",
+                        level="info",
+                    )
                     control_text = _merge_control_phrase_transcript(matched, transcript)
                     self.handle_session_text(control_text or matched)
                 except ControlPhraseDetected as exc:

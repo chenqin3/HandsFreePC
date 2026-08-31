@@ -44,7 +44,7 @@
 - `computer_control.enabled` 是否为 `true`；
 - `execution.dry_run` 是否为 `false`；
 - backend 是否为 `local_agent`，不是旧 `legacy_codex_cli`；
-- 指令尾部的 `over` 是否真的出现在 SenseVoice 正文转写；
+- `doctor` 中 `models.delimiter.ready` 是否为 `true`，日志中是否出现 `PROMPT_DELIMITER_DETECTED`；
 - 队列是否已满、暂停或等待确认；
 - 云 planner 开启时，两项许可和 CLI 登录是否齐全；
 - planner miss/失败后是否明确显示 `FAILURE`；0.3 不会静默换成另一套 controller；
@@ -54,16 +54,17 @@
 
 ## `over` 经常漏掉
 
-这是当前已知架构边界：0.3 的 `over` 仍来自正文 SenseVoice ASR，而不是独立 KWS。`PromptAssembler.finalize()` 只是未来 KWS 的代码 seam，运行时没有调用它。
+当前版本用独立英文 Vosk 模型检测 `over`，同时保留 SenseVoice 正文识别作为后备。先检查：
 
-临时建议：
-
-- 把 `over` 作为一个清晰、独立的英文词说出，前后留一个很短的自然停顿；
-- 用 `overlay` 查看转写和队列数；没有入队就再说完整 `over`，不要继续堆很多正文；
+- 升级代码后重新执行 `./scripts/download-models.ps1`；
+- `doctor --strict` 的 `models.delimiter.path` 指向 `vosk-model-small-en-us-0.15` 且 `ready: true`；
+- 把 `over` 作为一个清晰、独立的英文词说出；很短的自然停顿有助于识别和样本边界稳定，但不是协议强制要求；
+- 用 `overlay` 查看队列数；没有显示“已入队”时不要继续堆很多正文；
+- 用 `logs --tail 50` 查 `PROMPT_DELIMITER_DETECTED`。有该事件但无 `COMMAND_ENQUEUED`，说明 marker 前没有形成非空正文；两者都没有则是 KWS/麦克风层；
 - 不要在配置中增加过多常见中文短词作为 delimiter，容易在正文误切；
 - `mouseover`、`voiceover` 不会切分，这是预期行为。
 
-正确修复需要单麦克风 audio fan-out、统一 timestamp、ASR prefix flush 和去重。简单地让 KWS 命中就抛异常或另开麦克风会丢掉 delimiter 前正文。候选 sherpa-onnx KWS 模型许可仍待澄清，0.3 不自动下载。
+检测器使用同一麦克风 block，不会另开音频设备；命中后继续录到 VAD 终点。运行时优先用 Vosk 词级/partial 词级时间形成 marker 样本区间，没有可用词时间时退回到命中 block；随后按 marker 区间切分本轮内存音频，marker 本身不进入 SenseVoice，前后非空段分别转写。它支持同一个 VAD 话语内的多个 `over` 和紧随其后的下一条正文，但边界只是识别结果，不保证在所有口音和噪声下精确；异常时先放慢并短暂停顿，再结合 `PROMPT_DELIMITER_DETECTED`、`COMMAND_ENQUEUED` 与 overlay 判断发生在哪一层。
 
 ## 任务显示成功，但屏幕没有变化
 
@@ -133,7 +134,7 @@ execution:
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --draft-smoke
 ```
 
-该命令只向唯一、安全绑定的非密码编辑框写入随机 token，并 fresh observe 后本地读回；不会点击发送。成功后界面会留下未发送草稿，需人工清除。出现 `ComposerNotUnique`、没有可靠焦点、敏感输入框或读回失败时，应调整窗口/焦点或应用 profile 后重试，不要打开坐标 fallback。
+该命令只向唯一、安全绑定的非密码编辑框写入随机 token，并 fresh observe 后本地读回；不会点击发送。成功路径仅在字段仍精确等于本轮固定格式 token 时自动清空，并报告 `cleanup_verified: true`。出现 `ComposerNotUnique`、没有可靠焦点、敏感输入框、读回或清理失败时，应调整窗口/焦点或应用 profile 后重试，不要打开坐标 fallback。
 
 ## `strict` 与 `personal_trusted` 表现不同
 

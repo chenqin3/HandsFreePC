@@ -74,6 +74,21 @@ def test_parse_explicit_app_surface_without_created_mode(
     assert plan.actions[1].mode == surface
 
 
+def test_chat_and_cowork_product_label_is_a_complete_native_chat_surface() -> None:
+    parser = DeterministicIntentParser()
+    command = "切换到 Claude，打开 Chat and Cowork"
+
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert [action.type for action in plan.actions] == [
+        ActionType.ACTIVATE_APP,
+        ActionType.OPEN_MODE,
+    ]
+    assert plan.actions[1].mode == "chat"
+    assert parser.covers_full_text(command, plan)
+
+
 def test_codex_name_is_not_mistaken_for_code_surface() -> None:
     plan = DeterministicIntentParser().parse("打开 Codex")
 
@@ -111,6 +126,7 @@ def test_app_prefix_match_does_not_claim_full_text_coverage(command: str) -> Non
     [
         "打开 Codex",
         "打开 Claude 到 Chat 选项卡",
+        "切换到 Claude，打开 Chat and Cowork",
         "切换到桌面上的codex app，打开其中的演示项目下的语音设计对话，打开语音输入",
         "打开claude app，到chat选项卡里面，开启一个design，接下来我会语音输入",
         "打开D盘的项目文件夹里的说明.txt",

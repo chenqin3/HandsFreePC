@@ -19,6 +19,7 @@ from handsfree_pc.desktop.safety import (
     action_matches_next_user_step,
     expectation_matches_user_step,
     observation_credential_summary,
+    user_action_step_count,
 )
 
 
@@ -133,6 +134,82 @@ def test_literal_click_is_bound_when_fresh_uia_can_verify_target_selected() -> N
         task,
         completed_steps=0,
     )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "在 Claude 中点击 Code 选项卡",
+        "In Claude, click the Code tab",
+        "在 Claude 中点击 Code 选项卡，然后点击 Chat 选项卡",
+    ],
+)
+def test_selected_expectation_accepts_exact_control_role_suffix(task: str) -> None:
+    action = _action(DesktopActionType.CLICK, index="25")
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.ELEMENT_SELECTED,
+        text="Code",
+    )
+
+    assert user_action_step_count(task) >= 1
+    assert action_matches_next_user_step(
+        action,
+        "Code",
+        task,
+        completed_steps=0,
+    )
+    assert expectation_matches_user_step(
+        action,
+        "Code",
+        expectation,
+        task,
+        completed_steps=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("task", "target", "expectation_text"),
+    [
+        ("在 Claude 中点击 Code 选项卡并显示管理员页面", "Code", "Code"),
+        ("在 Claude 中点击 Code Review 选项卡", "Code Review", "Code"),
+    ],
+)
+def test_selected_role_suffix_does_not_swallow_unverified_text_or_target_prefix(
+    task: str,
+    target: str,
+    expectation_text: str,
+) -> None:
+    action = _action(DesktopActionType.CLICK, index="25")
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.ELEMENT_SELECTED,
+        text=expectation_text,
+    )
+
+    assert action_matches_next_user_step(
+        action,
+        target,
+        task,
+        completed_steps=0,
+    )
+    assert not expectation_matches_user_step(
+        action,
+        target,
+        expectation,
+        task,
+        completed_steps=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "在输入框输入 请回复一句测试成功 不要发送",
+        "请在输入框里输入 X",
+        "在 Claude 的 Prompt 输入 DRAFT_SAMPLE",
+    ],
+)
+def test_input_box_noun_does_not_hide_the_real_text_entry_verb(task: str) -> None:
+    assert user_action_step_count(task) == 1
 
 
 def test_duplicate_semantic_labels_are_neither_exposed_nor_actionable() -> None:

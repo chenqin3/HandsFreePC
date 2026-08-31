@@ -39,22 +39,21 @@ Voice Access 很适合作为系统级故障后备，但不作为本项目核心�
 | 候选 | 已核实能力 | 适合位置 | 本项目选择 |
 |---|---|---|---|
 | Vosk `vosk-model-small-cn-0.22` | 离线中文模型约 42 MB；Vosk 支持运行时 grammar/短语集合；模型列表标注 Apache-2.0 | 低资源、常开、有限词表的开始/结束/急停/确认等控制词检测 | 首选控制词层 |
-| sherpa-onnx SenseVoiceSmall INT8 | 官方预训练页列出普通话、粤语、英语、日语、韩语，支持 `use_itn` 标点/文本归一化以及麦克风/VAD 示例；INT8 包约 228 MB | 连续会话中的正文片段与 `over` 转写 | 首选正文 ASR |
+| Vosk `vosk-model-small-en-us-0.15` | 官方模型表标约 40 MB、Apache-2.0、轻量 wideband；运行时 grammar 可限制为 `over` | 独立本地 delimiter 检测 | 首选 `over` KWS |
+| sherpa-onnx SenseVoiceSmall INT8 | 官方预训练页列出普通话、粤语、英语、日语、韩语，支持 `use_itn` 标点/文本归一化以及麦克风/VAD 示例；INT8 包约 228 MB | 连续会话中的正文片段；正文 `over` 是 KWS 后备 | 首选正文 ASR |
 | faster-whisper | 基于 CTranslate2 的本地 Whisper 实现，支持 CPU/GPU 和量化配置；资源消耗明显高于小型 KWS | 可作为另一种本地 ASR 或异常后备 | 默认不安装、不启用；当前兼容后备只在 SenseVoice `transcribe()` 抛异常时触发 |
 | Silero VAD v6.2.1 | 本地 ONNX 语音活动检测，上游 MIT 许可；sherpa-onnx 可直接加载模型 | 更稳的起止点检测、减少环境噪声误切句 | 默认起止点检测；自适应能量门限作为无模型后备 |
 
 官方资料与下载入口：
 
-- [Vosk 模型列表与许可](https://alphacephei.com/vosk/models)；[small-cn-0.22 模型包](https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip)；[Vosk grammar API](https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h)
+- [Vosk 模型列表与许可](https://alphacephei.com/vosk/models)；[small-cn-0.22 模型包](https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip)；[small-en-us-0.15 模型包](https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip)；[Vosk grammar API](https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h)
 - [sherpa-onnx SenseVoice 预训练模型](https://k2-fsa.github.io/sherpa/onnx/sense-voice/pretrained.html)；[2024-07-17 INT8 模型包](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2)
 - [SYSTRAN faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 - [Silero VAD v6.2.1](https://github.com/snakers4/silero-vad/tree/v6.2.1)
 
 ### 工程选择
 
-0.3 仍使用 16 kHz、单声道 PCM，但会话协议已经不是“唤醒后只转写一条命令”。单一音频采集在本机同时支持控制词检测和正文切句：“开始语音操作”进入持续 `ACTIVE` 会话，SenseVoice fragment 交给 `PromptAssembler`；只有正文 ASR 识别到独立 `over` 后，前面的非空 prompt 才进入有界 FIFO。执行线程与采集线程分离，因此前一条执行时仍可继续接收下一条，普通任务由一个 worker 串行执行。
-
-当前 `over` 仍依赖正文 SenseVoice，不是独立 KWS。0.3 只提供 `PromptAssembler.finalize()` 这一未来 KWS 可调用的 out-of-band seam；真正接入时必须在单一采集流后做 audio block fan-out、统一时间戳、命中前音频回灌和去重，不能另开第二个麦克风流。候选 sherpa-onnx KWS 模型的许可归属仍待澄清，所以 0.3 不自动下载或声称已经启用。
+0.3.1 仍使用 16 kHz、单声道 PCM，但会话协议已经不是“唤醒后只转写一条命令”。“开始语音操作”进入持续 `ACTIVE` 会话；同一个采集 block 同时送给中文控制词 Vosk、英文 `over` Vosk 和 Silero VAD。英文 detector 请求词级及 partial 词级时间并保存单调样本区间，没有可用词时间时退回到命中 block 的近似区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入 SenseVoice，其余非空段分别转写，每个 marker 依次完成前一条 prompt，末段保留给下一条。若 KWS 漏掉而正文 ASR 含独立 `over`，仍按正文切分。执行线程与采集线程分离，因此前一条执行时仍可继续接收下一条，普通任务由一个 worker 串行执行。
 
 默认由 sherpa-onnx 加载固定为 v6.2.1 的 Silero ONNX 做话语起止点检测；若用户明确把 `speech.vad.backend` 配成 `energy`，则使用可校准的自适应能量门限后备。这一分层比“让大模型一直听”更省资源，也让原始音频默认不必离开机器。公开默认 `speech.fallback.backend: none`，普通安装只装 `audio` 与 `windows` extras；`-WithWhisper` 才安装 faster-whisper。启用者应先显式预下载 `large-v3-turbo`，因为它会产生 GB 级网络下载/缓存和明显资源开销。当前实现不按空文本、低置信度或长句自动切换，只在已经构造 SenseVoice 后、某次 `transcribe()` 抛异常时延迟构造 Whisper；SenseVoice 启动/模型加载失败不能由这条后备补救，自动化套件也尚未覆盖该分支。
 
@@ -64,7 +63,7 @@ Voice Access 很适合作为系统级故障后备，但不作为本项目核心�
 
 ### 模型许可提醒
 
-Vosk 官方模型页把 small-cn-0.22 标为 Apache-2.0，但该模型 zip 可能只有 README、没有完整许可文本；再分发时应同时保存 [Vosk v0.3.45 COPYING](https://raw.githubusercontent.com/alphacep/vosk-api/v0.3.45/COPYING)、模型来源和下载哈希。
+Vosk 官方模型页把 small-cn-0.22 与 small-en-us-0.15 标为 Apache-2.0，但模型 zip 可能只有 README、没有完整许可文本；下载器同时保存 [Vosk v0.3.45 COPYING](https://raw.githubusercontent.com/alphacep/vosk-api/v0.3.45/COPYING)、模型来源和固定下载哈希。英文包当前固定 SHA-256 为 `30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498`。
 
 sherpa-onnx 运行时代码与 SenseVoice 权重不是同一许可对象。发布脚本不得把 SenseVoice 权重打包成项目自有资产；模型包内的短 LICENSE 可能只是链接，下载后应额外保存完整 [FunASR Model License](https://raw.githubusercontent.com/modelscope/FunASR/main/MODEL_LICENSE)，注明 SenseVoiceSmall、FunASR/FunAudioLLM 和 Alibaba Group，并保留模型名。
 

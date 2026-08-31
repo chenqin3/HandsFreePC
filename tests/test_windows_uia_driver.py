@@ -497,6 +497,52 @@ def test_generic_click_on_input_plane_uses_physical_focus_not_invoke():
     assert side_effect["invoked"] is False
 
 
+def test_app_doctor_cleanup_clears_only_the_exact_bound_random_draft():
+    class ClearingEdit(FakeElement):
+        def set_edit_text(self, value):
+            super().set_edit_text(value)
+            self._value = value
+
+    token = "HandsFreePC-DRAFT-0123456789-中文"
+    window = _window()
+    composer = ClearingEdit("Prompt", "Edit", value=token, focused=True)
+    native = FakeNative([window])
+    driver = _driver(
+        native=native,
+        desktop=FakeDesktop({window.hwnd: FakeRoot([composer])}),
+        profile=_bounded_chat_profile(composer_names=["Prompt"]),
+    )
+    before = driver.observe("claude")
+    target = before.elements[0]
+
+    method = driver.clear_app_doctor_draft(before, target, expected_text=token)
+    after = driver.observe("claude")
+
+    assert method == "set_edit_text"
+    assert composer.values_set == [""]
+    assert after.elements[0].value in {None, ""}
+
+
+def test_app_doctor_cleanup_rejects_non_diagnostic_text_before_mutation():
+    window = _window()
+    composer = FakeElement("Prompt", "Edit", value="user draft", focused=True)
+    driver = _driver(
+        native=FakeNative([window]),
+        desktop=FakeDesktop({window.hwnd: FakeRoot([composer])}),
+        profile=_bounded_chat_profile(composer_names=["Prompt"]),
+    )
+    before = driver.observe("claude")
+
+    with pytest.raises(WindowsUiaDriverError, match="not an app-doctor draft"):
+        driver.clear_app_doctor_draft(
+            before,
+            before.elements[0],
+            expected_text="user draft",
+        )
+
+    assert composer.values_set == []
+
+
 @pytest.mark.parametrize(
     ("container_type", "aria_role", "dialog_label", "button_label", "inspection", "action"),
     [

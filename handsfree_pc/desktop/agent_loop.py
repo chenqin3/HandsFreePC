@@ -126,12 +126,14 @@ _EXPLICIT_APP_SCOPE_SLOT_PATTERNS = (
     re.compile(
         r"(?<!\w)(?:在|于)\s*(?P<app>[\w.+ -]{1,64}?)"
         r"(?:\s*(?:app|应用))?\s*(?:里面|里|中|内|上)?"
+        r"\s*(?:的\s*)?"
         r"(?=\s*(?:点击|打开|切换|选择|进入|输入|按|滚动))",
         re.IGNORECASE,
     ),
     re.compile(
         r"(?<!\w)(?:在|于)\s*(?P<app>[\w.+ -]{1,64}?)"
         r"(?:\s*(?:app|应用))?\s*(?:里面|里|中|内|上)?"
+        r"\s*(?:的\s*)?"
         r"\s*(?=$|[,，。；;:：]|(?:以便|然后|并且|并|来|从而))",
         re.IGNORECASE,
     ),
@@ -290,10 +292,18 @@ def _unsupported_explicit_app_scopes(
         for alias in _APP_ALIASES.get(app, (app,))
     }
     unknown: list[str] = []
+    anaphoric_references = frozenset(
+        {"其", "其中", "这", "这个", "那", "那个", "该", "本", "此", "上述", "前述"}
+    )
 
     for pattern in _EXPLICIT_APP_SCOPE_SLOT_PATTERNS:
         for match in pattern.finditer(task):
             candidate = " ".join(match.group("app").strip().casefold().split())
+            if re.sub(r"\s+", "", candidate) in anaphoric_references:
+                # These words refer back to an already named object/app.  They are
+                # not a new explicit application scope and must never be guessed or
+                # fuzzy-mapped to one.
+                continue
             if (
                 candidate
                 and _APP_SCOPE_CANDIDATE_ACTION_RE.search(candidate) is None

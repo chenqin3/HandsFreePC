@@ -9,6 +9,7 @@ from dataclasses import replace
 import pytest
 
 import handsfree_pc.runtime as runtime_module
+from handsfree_pc.audio import PhraseDetection
 from handsfree_pc.computer_control import ComputerControlResult
 from handsfree_pc.desktop.agent_loop import DesktopAgentLoopController
 from handsfree_pc.desktop.native_skills import NativeRouteStatus, NativeSkillResult
@@ -156,6 +157,256 @@ def test_continuous_session_queues_only_at_over_and_stays_active(settings) -> No
         runtime.stop()
 
 
+@pytest.mark.parametrize(
+    ("pending_fragment", "prefix_transcript", "expected"),
+    [
+        ("", "打开记事本", "打开记事本"),
+        ("", "搜索欧文", "搜索欧文"),
+        ("搜索", "欧文", "搜索 欧文"),
+    ],
+)
+def test_sample_bound_prompt_marker_preserves_all_prefix_text(
+    settings,
+    pending_fragment,
+    prefix_transcript,
+    expected,
+) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+        if pending_fragment:
+            runtime.handle_session_text(pending_fragment)
+
+        outcome = runtime._handle_marked_session_utterance(
+            prefix_transcript,
+            "over",
+            had_pending_before=bool(pending_fragment),
+        )
+
+        assert outcome.success
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == [expected]
+    finally:
+        runtime.stop()
+
+
+def test_marker_before_text_keeps_suffix_for_the_next_prompt(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+
+        runtime._handle_marked_session_segments(["", "打开记事本"], marker_count=1)
+
+        assert controller.calls == []
+        assert runtime.prompt_assembler.pending_text == "打开记事本"
+
+        runtime._handle_marked_session_segments(["", ""], marker_count=1)
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["打开记事本"]
+    finally:
+        runtime.stop()
+
+
+def test_multiple_sample_bound_markers_preserve_fifo_and_unfinished_suffix(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+
+        runtime._handle_marked_session_segments(
+            ["第一条", "第二条", "第三条"],
+            marker_count=2,
+        )
+        assert runtime.prompt_assembler.pending_text == "第三条"
+        runtime._handle_marked_session_segments(["", ""], marker_count=1)
+
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["第一条", "第二条", "第三条"]
+    finally:
+        runtime.stop()
+
+
+def test_textual_and_sample_bound_marker_never_enqueue_the_same_prompt_twice(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+
+        runtime._handle_marked_session_segments(["打开记事本 over", ""], marker_count=1)
+
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["打开记事本"]
+    finally:
+        runtime.stop()
+
+
+def test_sample_bound_marker_does_not_mask_an_oversized_prefix_error(settings) -> None:
+    enable_computer_control(settings)
+    settings.computer_control.max_prompt_chars = 4
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+
+        outcome = runtime._handle_marked_session_segments(["超过最大长度", ""], marker_count=1)
+
+        assert not outcome.success
+        assert outcome.message == "指令过长"
+        assert controller.calls == []
+        assert not runtime.prompt_assembler.has_pending
+    finally:
+        runtime.stop()
+
+
+def test_continuous_microphone_reports_ready_only_after_models_and_mic_enter(
+    settings,
+    monkeypatch,
+) -> None:
+    enable_computer_control(settings)
+    feedback = FakeFeedback()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=feedback,
+        controller=FakeController(),
+    )
+
+    class Speech:
+        def __init__(self, *_args, phrases, marker_phrases, **_kwargs):
+            assert "over" not in phrases
+            assert marker_phrases == ["over"]
+
+        def __enter__(self):
+            feedback.events.append(("MIC_ENTERED", {}))
+            runtime.stop_event.set()
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(runtime_module, "LocalSpeechSession", Speech)
+    try:
+        runtime._run_continuous_microphone()
+
+        messages = [text for text, _kwargs in feedback.events]
+        assert messages[0] == "正在加载本地语音模型并打开麦克风…"
+        assert messages.index("MIC_ENTERED") < messages.index(
+            "HandsFreePC 已就绪。说开始语音操作进入持续控制。"
+        )
+    finally:
+        runtime.stop()
+
+
+def test_continuous_microphone_routes_post_marker_audio_to_next_prompt(
+    settings,
+    monkeypatch,
+) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    runtime.handle_session_text("开始语音操作")
+
+    class Speech:
+        last_marker_phrase = "over"
+        last_marker_events = (PhraseDetection("over", 1600, 3200),)
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def listen_utterance(self, **_kwargs):
+            return object()
+
+        def transcribe_marked_segments(self):
+            runtime.stop_event.set()
+            return ["打开记事本", "然后打开计算器"]
+
+    monkeypatch.setattr(runtime_module, "LocalSpeechSession", Speech)
+    try:
+        runtime._run_continuous_microphone()
+
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["打开记事本"]
+        assert runtime.prompt_assembler.pending_text == "然后打开计算器"
+    finally:
+        runtime.stop()
+
+
+def test_runtime_continue_policy_keeps_later_voice_command_moving(settings) -> None:
+    enable_computer_control(settings)
+    settings.computer_control.failure_policy = "continue"
+    controller = FakeController(
+        responses=[
+            ComputerControlResult(
+                False,
+                "bounded failure",
+                stage="plan",
+                error_code="PLANNER_NO_SAFE_STEP",
+                safe_message="No safe local step was available",
+            ),
+            ComputerControlResult(True, "verified completion"),
+        ]
+    )
+    feedback = FakeFeedback()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=feedback,
+        controller=controller,
+    )
+    try:
+        runtime.handle_session_text("开始语音操作")
+        runtime.handle_session_text("第一条 over")
+        runtime.handle_session_text("第二条 over")
+
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["第一条", "第二条"]
+        assert any("后续已入队指令会继续执行" in text for text, _ in feedback.events)
+    finally:
+        runtime.stop()
+
+
 def test_control_failure_overlay_and_log_show_bounded_stage_without_raw_content(settings) -> None:
     class FakeDiagnostics:
         def __init__(self) -> None:
@@ -265,20 +516,22 @@ def test_structured_controller_diagnostic_survives_queue_boundary(settings) -> N
 
         runtime._on_control_outcome(outcome)
 
-        assert diagnostics.events == [
-            {
-                "stage": "reobserve",
-                "error_code": "FRESH_OBSERVATION_FAILED",
-                "safe_message": "动作后无法刷新目标应用的界面状态",
-                "level": "error",
-                "session_id": "session-structured",
-                "command_id": "command-structured",
-                "sequence": 3,
-                "exception_type": "WindowsUiaDriverError",
-                "app": "claude",
-                "generation": 7,
-            }
+        assert [event["error_code"] for event in diagnostics.events] == [
+            "CONTROL_STARTED",
+            "FRESH_OBSERVATION_FAILED",
         ]
+        assert diagnostics.events[-1] == {
+            "stage": "reobserve",
+            "error_code": "FRESH_OBSERVATION_FAILED",
+            "safe_message": "动作后无法刷新目标应用的界面状态",
+            "level": "error",
+            "session_id": "session-structured",
+            "command_id": "command-structured",
+            "sequence": 3,
+            "exception_type": "WindowsUiaDriverError",
+            "app": "claude",
+            "generation": 7,
+        }
         assert "private UIA body" not in feedback.events[-1][0]
     finally:
         runtime.stop()
@@ -332,11 +585,13 @@ def test_real_controller_failure_reaches_runtime_jsonl_with_stage_and_code(
         assert outcome.error_code == "PLANNER_NOT_CONFIGURED"
         diagnostics.close()
         events = tail_events(path)
-        assert len(events) == 1
-        assert events[0]["stage"] == "plan"
-        assert events[0]["error_code"] == "PLANNER_NOT_CONFIGURED"
-        assert events[0]["session_id"] == "session-real-controller"
-        assert events[0]["command_id"] == "command-real-controller"
+        assert [event["error_code"] for event in events] == [
+            "CONTROL_STARTED",
+            "PLANNER_NOT_CONFIGURED",
+        ]
+        assert events[-1]["stage"] == "plan"
+        assert events[-1]["session_id"] == "session-real-controller"
+        assert events[-1]["command_id"] == "command-real-controller"
     finally:
         runtime.stop()
         diagnostics.close()

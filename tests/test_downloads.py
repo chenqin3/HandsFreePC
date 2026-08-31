@@ -8,6 +8,19 @@ import handsfree_pc.downloads as downloads
 from handsfree_pc.downloads import DownloadError, ModelAsset
 
 
+def test_english_delimiter_model_metadata_is_pinned() -> None:
+    asset = next(
+        item for item in downloads.MODEL_ASSETS if item.directory == "vosk-model-small-en-us-0.15"
+    )
+
+    assert asset.url == "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+    assert asset.sha256 == "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498"
+    assert asset.expected_files == ("am/final.mdl", "conf/model.conf")
+    assert asset.extra_files == (
+        ("https://raw.githubusercontent.com/alphacep/vosk-api/v0.3.45/COPYING", "COPYING"),
+    )
+
+
 def test_license_failure_never_leaves_a_half_installed_model(tmp_path, monkeypatch) -> None:
     content = b"model"
     asset = ModelAsset(

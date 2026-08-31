@@ -270,15 +270,22 @@ def command_doctor(args: argparse.Namespace) -> int:
         return path if path.is_absolute() else (base_dir / path).resolve()
 
     wake_path = resolve_model_path(settings.speech.wake["model_path"])
+    delimiter_path = resolve_model_path(settings.speech.delimiter["model_path"])
     command_path = resolve_model_path(settings.speech.command["model_path"])
     vad_path = resolve_model_path(settings.speech.vad["model_path"])
-    wake_ready = (wake_path / "am" / "final.mdl").is_file()
+
+    def vosk_model_ready(path: Path) -> bool:
+        return all((path / name).is_file() for name in ("am/final.mdl", "conf/model.conf"))
+
+    wake_ready = vosk_model_ready(wake_path)
+    delimiter_ready = vosk_model_ready(delimiter_path)
     command_ready = (command_path / "tokens.txt").is_file() and any(
         (command_path / name).is_file() for name in ("model.int8.onnx", "model.onnx")
     )
     vad_ready = vad_path.is_file()
     report["models"] = {
         "wake": {"path": str(wake_path), "ready": wake_ready},
+        "delimiter": {"path": str(delimiter_path), "ready": delimiter_ready},
         "command": {"path": str(command_path), "ready": command_ready},
         "vad": {"path": str(vad_path), "ready": vad_ready},
     }

@@ -441,6 +441,34 @@ def test_open_mode_selects_tab_then_named_mode(settings):
     assert result.evidence["postcondition_verified"] is True
 
 
+def test_open_mode_retries_a_transient_uia_snapshot_failure(settings):
+    class TransientSnapshotUIA(FakeUIA):
+        def __init__(self) -> None:
+            super().__init__()
+            self.click_attempts = 0
+
+        def click_named_exact(self, hwnd, names, *, control_types):
+            self.click_attempts += 1
+            if self.click_attempts == 1:
+                raise UIAError("Could not snapshot UI elements")
+            return super().click_named_exact(hwnd, names, control_types=control_types)
+
+    delays: list[float] = []
+    uia = TransientSnapshotUIA()
+    executor = WindowsExecutor(
+        settings,
+        native=FakeNative(),
+        uia=uia,
+        sleeper=delays.append,
+    )
+
+    result = executor.execute(Action(ActionType.OPEN_MODE, app="claude", mode="Code"))
+
+    assert result.success
+    assert uia.click_attempts == 2
+    assert delays == [0.15]
+
+
 def test_open_mode_does_not_treat_focus_only_as_selected(settings):
     class FocusOnlyUIA(FakeUIA):
         def click_named(self, hwnd, names, *, control_types):

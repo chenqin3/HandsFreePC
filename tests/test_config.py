@@ -21,10 +21,16 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.computer_control.allow_screen_context_to_cloud is False
     assert settings.computer_control.allow_codex_cli_host_read is False
     assert settings.computer_control.allow_legacy_codex_computer_use is False
+    assert settings.computer_control.failure_policy == "pause"
     assert settings.execution.dry_run is True
     assert settings.speech.fallback["backend"] == "none"
     assert settings.app.feedback_mode == FeedbackMode.OVERLAY
     assert settings.speech.vad["backend"] == "silero"
+    assert settings.speech.delimiter["backend"] == "vosk"
+    assert settings.speech.delimiter["grammar"] == ["over"]
+    assert settings.speech.delimiter["model_path"].endswith(
+        "vosk-model-small-en-us-0.15"
+    )
     assert settings.apps["codex"].voice_button_names == []
     assert settings.apps["claude"].voice_button_names == []
     assert settings.apps["codex"].mode_names["chat"] == ["Chat"]
@@ -55,6 +61,35 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.apps["claude"].max_content_nodes == 80
     assert "Prompt" in settings.apps["codex"].composer_names
     assert "Ask Claude" in settings.apps["claude"].composer_names
+
+
+def test_personal_runtime_can_continue_fifo_after_an_ordinary_failure(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "computer_control:\n  failure_policy: continue\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.computer_control.failure_policy == "continue"
+
+
+def test_legacy_config_without_delimiter_section_uses_safe_defaults(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "speech:\n  wake:\n    phrase_window_seconds: 4\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.speech.wake["phrase_window_seconds"] == 4
+    assert settings.speech.delimiter["backend"] == "vosk"
+    assert settings.speech.delimiter["grammar"] == ["over"]
+    assert settings.speech.delimiter["model_path"].endswith(
+        "vosk-model-small-en-us-0.15"
+    )
 
 
 def test_cloud_planner_requires_explicit_privacy_opt_in(tmp_path: Path) -> None:
@@ -229,6 +264,8 @@ def test_open_computer_use_requires_explicit_experimental_opt_in(tmp_path: Path)
         ("execution:\n  confirmation_timeout_seconds: 0\n", "must be positive"),
         ("computer_control:\n  max_prompt_chars: 8001\n", "between 1 and 8000"),
         ("speech:\n  wake:\n    phrase_window_seconds: 0\n", "positive number"),
+        ("speech:\n  delimiter:\n    phrase_window_seconds: 0\n", "positive number"),
+        ("speech:\n  delimiter:\n    backend: none\n", "backend must be vosk"),
     ],
 )
 def test_local_control_phrases_and_window_cannot_be_disabled(
@@ -252,6 +289,7 @@ def test_local_control_phrases_and_window_cannot_be_disabled(
         "execution:\n  confirmation_phrases: 确认执行\n",
         "execution:\n  cancellation_phrases: 取消所有操作\n",
         "speech:\n  wake:\n    grammar: 开始语音操作\n",
+        "speech:\n  delimiter:\n    grammar: over\n",
         "apps:\n  codex:\n    process_names: Codex.exe\n",
         "apps:\n  codex:\n    title_patterns: Codex\n",
         "apps:\n  codex:\n    voice_button_names: 语音\n",

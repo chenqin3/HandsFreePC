@@ -7,13 +7,17 @@ HandsFreePC 是本地优先、常开麦克风的 Windows 辅助工具。公开�
 ## 默认本地数据流
 
 ```text
-麦克风 PCM（内存）
-  +-> 本地 Vosk：开始/结束/急停/确认/恢复等控制词
-  +-> 本地 Silero VAD：切句
-      -> 本地 SenseVoice：正文转写
-      -> PromptAssembler：正文中的 over
+麦克风 PCM block（内存）
+  +-> 本地中文 Vosk：开始/结束/急停/确认/恢复等控制词
+  +-> 本地英文 Vosk：检测 over，并绑定本地样本区间
+  +-> 本地 Silero VAD：形成完整话语
+      -> 按每个 over 样本区间把本轮原始捕获切成 n+1 段（marker 音频不进入正文 ASR）
+      -> 本地 SenseVoice：逐段转写
+      -> PromptAssembler：每个 marker 完成其前一段 prompt，尾段留作下一条
       -> 本地有界 FIFO
 ```
+
+中文控制词 Vosk、英文 `over` Vosk、Silero VAD 和 SenseVoice 复用同一个麦克风采集流中的内存音频 block；英文 detector 不会另开麦克风，也不会因此保存音频。模型不会由常驻运行时后台下载：只有用户以 `scripts/install.ps1 -DownloadModels` 安装，或显式运行 `handsfreepc download-models` / `scripts/download-models.ps1` 时，才会从文档列出的 Vosk 上游下载 `vosk-model-small-en-us-0.15`，并核对项目钉住的归档 SHA-256、预期文件与许可元数据。
 
 默认：
 
@@ -31,7 +35,11 @@ HandsFreePC 是本地优先、常开麦克风的 Windows 辅助工具。公开�
 
 说“开始语音操作”后，SenseVoice 的正文转写被拼到内存。只有识别到独立 `over` 后，完整 prompt 才进入队列。说“结束语音操作”会丢弃未完成半条并排空已接受任务；它不会关闭麦克风。急停会请求取消当前任务并清队列，也不会删除已经送往 provider 的数据或撤回外部副作用。
 
-当前 `over` 仍依赖正文 ASR。`PromptAssembler.finalize()` 只是未来 KWS seam，没有第二个关键词模型在后台运行或下载。未来 KWS 应复用同一个音频采集流并携带 timestamp；候选模型许可待澄清。
+0.3.1 使用独立的本地英文 Vosk small-en-us 0.15 小词表 detector 识别 `over`，同时保留 SenseVoice 正文识别作为后备。运行时请求 Vosk 的词级及 partial 词级时间，把每次命中绑定为当前麦克风流中的单调样本区间；若某次识别结果没有可用词时间，则只退回到命中所在音频 block 的区间，不把这个近似写成精确词边界。
+
+detector 命中不会用异常提前截断 VAD。VAD 返回后，程序使用本轮保存在内存中的原始捕获，按一个或多个 marker 区间切成 n+1 段；marker 区间本身不送入正文 SenseVoice，其他非空段分别在本地转写。每个 marker 依次调用 `PromptAssembler.finalize()` 完成它前面的 prompt，最后一段则保留为下一条 pending prompt，因此同一 VAD 话语中的多个 `over` 可以按顺序形成多条 FIFO 任务。样本边界减少了把 marker 或后一条正文混入前一条的风险，但仍不保证所有口音、噪声、设备和语速下都能正确识别或精确切分，用户仍应以入队反馈确认结果。
+
+安装或从 0.3.0 升级到 0.3.1 后需要重新运行 `download-models`，否则本地语音会话会因缺少英文 delimiter 模型而无法初始化；可用 `doctor --strict` 检查 `models.delimiter.ready`。这是一次显式的本地模型下载，不表示运行时会后台联网，也不改变默认“不保存音频或转写”的设置。
 
 ## NativeSkillRouter
 

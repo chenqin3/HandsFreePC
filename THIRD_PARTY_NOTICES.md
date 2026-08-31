@@ -16,6 +16,20 @@ HandsFreePC 源代码使用根目录 `LICENSE` 中的 MIT License。默认模型
 
 The upstream Vosk model list identifies `vosk-model-small-cn-0.22` as Apache-2.0. If redistributed, include the Apache-2.0 license and retain applicable copyright, attribution and notice material as required by that license.
 
+## Vosk small English US model 0.15
+
+- Model name: `vosk-model-small-en-us-0.15`
+- Copyright: Copyright 2020 Alpha Cephei Inc.
+- Upstream / author: Alpha Cephei, Vosk
+- Purpose in HandsFreePC: independent local limited-grammar recognition of the `over` prompt delimiter
+- Source: https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+- Pinned archive SHA-256: `30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498`
+- Model listing and license: https://alphacephei.com/vosk/models
+- License: Apache License 2.0
+- License text used by the downloader: https://raw.githubusercontent.com/alphacep/vosk-api/v0.3.45/COPYING
+
+The upstream archive contains its model README but no standalone license file. The Vosk model list identifies `vosk-model-small-en-us-0.15` as Apache-2.0, so the downloader saves the fixed Vosk 0.3.45 Apache-2.0 `COPYING` file beside the model together with its exact source and archive hash.
+
 ## SenseVoiceSmall INT8 model
 
 - Model name retained by HandsFreePC: `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17`
@@ -56,14 +70,10 @@ HandsFreePC does not bundle, auto-install, or auto-update this package. Users wh
 
 Version 0.2.3 has an unresolved Windows Chinese encoding boundary documented in [upstream Issue #5](https://github.com/QwenLM/open-computer-use/issues/5); [PR #6](https://github.com/QwenLM/open-computer-use/pull/6) is not part of the supported release. This is a compatibility and correctness warning, not a change to the MIT license. See [docs/OPEN_COMPUTER_USE.md](docs/OPEN_COMPUTER_USE.md).
 
-## Future keyword-spotting models are not included
-
-HandsFreePC 0.3 contains only an out-of-band `PromptAssembler.finalize()` seam. It does not download or run a separate keyword-spotting model for `over`. Candidate sherpa-onnx KWS model licensing and attribution remain to be clarified upstream; see [sherpa-onnx Issue #3802](https://github.com/k2-fsa/sherpa-onnx/issues/3802). No KWS weight should be added to the default downloader or redistributed until its exact source and governing terms are recorded here and enforced by the model installer.
-
 ## Runtime packages
 
 HandsFreePC also depends on separately distributed Python packages such as Vosk, sherpa-onnx, PyYAML, psutil, sounddevice, NumPy, pywin32 and pywinauto. Those packages remain under their own licenses as published in their distributions. A binary redistributor should generate and review a complete dependency license inventory for the exact locked build rather than treating this model notice as exhaustive.
 
 The default installer does **not** install the optional [faster-whisper](https://github.com/SYSTRAN/faster-whisper) extra. `install.ps1 -WithWhisper` installs its Python package and transitive dependencies, but does not install model weights. Constructing `WhisperModel("large-v3-turbo")` resolves to the separately hosted [mobiuslabsgmbh/faster-whisper-large-v3-turbo](https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo) repository and may download/cache those weights during an explicit preload or the first exception fallback.
 
-These optional weights are not one of HandsFreePC's three default model assets. They are outside `handsfreepc download-models`, its pinned SHA-256 list, and its per-model `HANDSFREEPC_MODEL_SOURCE.txt` / license-copy workflow. Review and retain the exact code, repository and model terms that apply when you download or redistribute them; do not infer that the default-model notices above cover this optional cache.
+These optional weights are not one of HandsFreePC's four default model assets. They are outside `handsfreepc download-models`, its pinned SHA-256 list, and its per-model `HANDSFREEPC_MODEL_SOURCE.txt` / license-copy workflow. Review and retain the exact code, repository and model terms that apply when you download or redistribute them; do not infer that the default-model notices above cover this optional cache.

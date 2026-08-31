@@ -57,6 +57,15 @@ speech:
       - "继续 队列"
       - "恢复 队列"
     phrase_window_seconds: 5.0
+  # A separate English Vosk model listens for the short delimiter. It consumes
+  # the same microphone blocks as wake detection and ASR; it does not open a
+  # second microphone stream or save audio.
+  delimiter:
+    backend: vosk
+    model_path: models/vosk-model-small-en-us-0.15
+    grammar:
+      - over
+    phrase_window_seconds: 2.0
   command:
     backend: sensevoice
     model_path: models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17

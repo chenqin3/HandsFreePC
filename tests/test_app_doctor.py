@@ -167,13 +167,14 @@ def test_run_app_doctor_draft_smoke_freshly_verifies_without_sending(tmp_path) -
     class FakeDriver:
         def __init__(self, _profiles) -> None:
             self.action = None
+            self.cleared = False
             self.closed = False
 
         def observe(self, app):
-            value = self.action.text if self.action is not None else ""
+            value = self.action.text if self.action is not None and not self.cleared else ""
             return _observation(
                 app,
-                generation=2 if self.action is not None else 1,
+                generation=3 if self.cleared else 2 if self.action is not None else 1,
                 elements=(
                     DesktopElement("1", "Chat", "Button"),
                     DesktopElement(
@@ -194,6 +195,12 @@ def test_run_app_doctor_draft_smoke_freshly_verifies_without_sending(tmp_path) -
             self.action = action
             return ActionReceipt(action, True, before.generation, "accepted")
 
+        def clear_app_doctor_draft(self, before, element, *, expected_text):
+            assert before.generation == 2
+            assert element.value == expected_text == self.action.text
+            self.cleared = True
+            return "fake exact cleanup"
+
         def close(self):
             self.closed = True
 
@@ -212,7 +219,91 @@ def test_run_app_doctor_draft_smoke_freshly_verifies_without_sending(tmp_path) -
     assert smoke["action_verified"] is True
     assert smoke["expectation_verified"] is True
     assert smoke["verified"] is True
+    assert smoke["cleanup_verified"] is True
     assert "HandsFreePC-DRAFT" not in json.dumps(report)
+
+
+def test_draft_cleanup_never_accepts_a_different_blank_focused_composer(tmp_path) -> None:
+    settings = _settings(tmp_path)
+
+    class MisleadingCleanupDriver:
+        def __init__(self, _profiles) -> None:
+            self.action = None
+            self.cleanup_attempted = False
+
+        def observe(self, app):
+            if self.action is None:
+                elements = (
+                    DesktopElement(
+                        "2",
+                        "Prompt",
+                        "Edit",
+                        value="",
+                        focused=True,
+                        composer=True,
+                        local_identity=_IDENTITY_A,
+                    ),
+                )
+                generation = 1
+            elif not self.cleanup_attempted:
+                elements = (
+                    DesktopElement(
+                        "2",
+                        "Prompt",
+                        "Edit",
+                        value=self.action.text,
+                        focused=True,
+                        composer=True,
+                        local_identity=_IDENTITY_A,
+                    ),
+                )
+                generation = 2
+            else:
+                elements = (
+                    DesktopElement(
+                        "2",
+                        "Prompt",
+                        "Edit",
+                        value=self.action.text,
+                        focused=False,
+                        composer=True,
+                        local_identity=_IDENTITY_A,
+                    ),
+                    DesktopElement(
+                        "3",
+                        "Message",
+                        "Edit",
+                        value="",
+                        focused=True,
+                        composer=True,
+                        local_identity=_IDENTITY_B,
+                    ),
+                )
+                generation = 3
+            return _observation(app, generation=generation, elements=elements)
+
+        def execute(self, action, before):
+            self.action = action
+            return ActionReceipt(action, True, before.generation, "accepted")
+
+        def clear_app_doctor_draft(self, before, element, *, expected_text):
+            assert element.value == expected_text == self.action.text
+            self.cleanup_attempted = True
+            return "reported success without clearing the original composer"
+
+        @staticmethod
+        def close():
+            pass
+
+    with pytest.raises(AppDoctorFailure) as caught:
+        run_app_doctor(
+            settings,
+            app="claude",
+            draft_smoke=True,
+            driver_factory=MisleadingCleanupDriver,
+        )
+
+    assert caught.value.error_code == "DRAFT_CLEANUP_FAILED"
 
 
 def test_draft_smoke_requires_explicit_personal_profile_before_action(tmp_path) -> None:
@@ -691,6 +782,11 @@ def test_focus_uses_click_fallback_then_types_only_after_fresh_verification(tmp_
                 self.value = action.text or ""
             return ActionReceipt(action, True, before.generation, "accepted")
 
+        def clear_app_doctor_draft(self, before, element, *, expected_text):
+            assert element.value == expected_text == self.value
+            self.value = ""
+            return "fake exact cleanup"
+
         @staticmethod
         def close():
             pass
@@ -747,6 +843,11 @@ def test_partial_setfocus_success_is_reobserved_without_physical_click(tmp_path)
             if action.type == DesktopActionType.TYPE_TEXT:
                 self.value = action.text or ""
             return ActionReceipt(action, True, before.generation, "accepted")
+
+        def clear_app_doctor_draft(self, before, element, *, expected_text):
+            assert element.value == expected_text == self.value
+            self.value = ""
+            return "fake exact cleanup"
 
         @staticmethod
         def close():
