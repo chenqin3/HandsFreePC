@@ -68,7 +68,9 @@ class _PendingConfirmation:
 
 _APP_ALIASES: dict[str, tuple[str, ...]] = {
     "codex": ("codex", "科德克斯", "代码助手"),
-    "claude": ("claude", "克劳德"),
+    # Scoped aliases for common SenseVoice renderings of ``Claude``.  They are
+    # still subject to the affirmative app-scope gate below.
+    "claude": ("claude", "克劳德", "cloud", "cloloud"),
 }
 
 _EXPLICIT_APP_SCOPE_SLOT_PATTERNS = (
@@ -271,9 +273,26 @@ def _explicitly_named_apps(task: str, visible_apps: tuple[str, ...]) -> frozense
     matched: set[str] = set()
     for app in visible_apps:
         aliases = _APP_ALIASES.get(app, (app,))
-        if any(_app_scope_is_affirmative(alias, task) for alias in aliases):
+        if any(
+            _app_scope_is_affirmative(alias, task)
+            or _app_scope_is_affirmative(alias, _repair_asr_app_scope_prefix(task, alias))
+            for alias in aliases
+        ):
             matched.add(app)
     return frozenset(matched)
+
+
+def _repair_asr_app_scope_prefix(task: str, alias: str) -> str:
+    """Repair one observed ASR homophone only before a known app alias."""
+
+    escaped = re.escape(alias)
+    suffix_boundary = r"(?![a-z0-9_-])" if alias.isascii() else ""
+    return re.sub(
+        rf"切换道(?=\s*{escaped}{suffix_boundary})",
+        "切换到",
+        task,
+        flags=re.IGNORECASE,
+    )
 
 
 def _unsupported_explicit_app_scopes(

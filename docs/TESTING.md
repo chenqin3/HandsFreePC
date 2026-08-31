@@ -162,7 +162,7 @@ ASCII 文本出现不算 Unicode PASS。退出码非 0、字段缺失或 verifie
 6. 测试急停、失败暂停、恢复和队列满反馈；
 7. 分别测试 `overlay`、`voice`、`both`、`silent`。
 
-当前 `over` 同时有独立英文 Vosk KWS 主路径和正文 SenseVoice 后备路径。KWS 验收还要确认词时间与无词时间 block fallback：marker 音频不送入正文 ASR，marker 前后非空片段分别转写，每个 marker 只完成它前面的 prompt，末段进入下一条 pending；同一 VAD 内单个/多个 marker 都不得丢前缀、吞后缀、重复入队或把 `over` 混入正文。分别记录 `PROMPT_DELIMITER_DETECTED` 与 `COMMAND_ENQUEUED`。
+当前 `over` 同时有独立英文 Vosk KWS 主路径和所选正文 ASR 后备路径。KWS 验收还要确认词时间与无词时间 block fallback：marker 音频不送入正文 ASR，marker 前后有声片段分别转写，纯静音 padding 不得调用 ASR 或幻听成新 prompt；每个 marker 只完成它前面的 prompt，末段进入下一条 pending。同一 VAD 内单个/多个 marker 都不得丢前缀、吞后缀、重复入队或把 `over` 混入正文。分别记录 `PROMPT_DELIMITER_DETECTED` 与 `COMMAND_ENQUEUED`。
 
 TTS 为半双工：播放期间说话可能被丢弃，也不能靠语音急停打断正在播放的 SAPI。确认测试必须等确认提示实际显示或完整播报后，再说提示中的完整“确认执行 + 随机四位码”。还要断言静态“确认执行”、错误码、旧码、超时码和已使用码全部无效；同一进程内取消/超时码也不得重新签发，并测试有界生成空间耗尽会 fail closed。去重集合不跨进程持久化，重启后不保证绝对不复用。随机码不是持久化防重放凭证或说话人认证；另记录旁人/扬声器实时听到并转述本轮码的残余风险，不要把该测试写成防声学重放证明。
 

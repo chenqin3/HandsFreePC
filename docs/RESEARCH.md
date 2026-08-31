@@ -8,7 +8,7 @@
 
 HandsFreePC 不应把“常开麦克风、理解命令、操控桌面、判断成功”全部交给一个云端 Agent。0.3 采用的组合是：
 
-1. 单一麦克风采集留在本机，由 Vosk 识别控制词，Silero VAD 与 SenseVoice 转写正文；
+1. 单一麦克风采集留在本机，由 Vosk 识别控制词，Silero VAD 与可配置的本地正文 ASR 处理命令；
 2. “开始语音操作”进入连续会话，正文中的独立 `over` 完成一条 prompt，并进入有界 FIFO；
 3. 完整命中的常见命令先走 `NativeSkillRouter`、确定性解析和本地白名单执行器；
 4. 只有确定性 miss、用户在原句中肯定且只指定一个应用、并显式允许转写与屏幕上下文离机时，默认 Claude CLI 才规划**下一步**；Codex CLI 只作额外同意主机读取风险后的 best-effort 备选；
@@ -40,8 +40,9 @@ Voice Access 很适合作为系统级故障后备，但不作为本项目核心�
 |---|---|---|---|
 | Vosk `vosk-model-small-cn-0.22` | 离线中文模型约 42 MB；Vosk 支持运行时 grammar/短语集合；模型列表标注 Apache-2.0 | 低资源、常开、有限词表的开始/结束/急停/确认等控制词检测 | 首选控制词层 |
 | Vosk `vosk-model-small-en-us-0.15` | 官方模型表标约 40 MB、Apache-2.0、轻量 wideband；运行时 grammar 可限制为 `over` | 独立本地 delimiter 检测 | 首选 `over` KWS |
-| sherpa-onnx SenseVoiceSmall INT8 | 官方预训练页列出普通话、粤语、英语、日语、韩语，支持 `use_itn` 标点/文本归一化以及麦克风/VAD 示例；INT8 包约 228 MB | 连续会话中的正文片段；正文 `over` 是 KWS 后备 | 首选正文 ASR |
-| faster-whisper | 基于 CTranslate2 的本地 Whisper 实现，支持 CPU/GPU 和量化配置；资源消耗明显高于小型 KWS | 可作为另一种本地 ASR 或异常后备 | 默认不安装、不启用；当前兼容后备只在 SenseVoice `transcribe()` 抛异常时触发 |
+| sherpa-onnx SenseVoiceSmall INT8 | 官方预训练页列出普通话、粤语、英语、日语、韩语，支持 `use_itn` 标点/文本归一化以及麦克风/VAD 示例；INT8 包约 228 MB | 低延迟正文基线；正文 `over` 是 KWS 后备 | 快速 CPU 默认；不承担专名必须精确的唯一保障 |
+| faster-whisper `large-v3-turbo` | 基于 CTranslate2 的本地 Whisper 实现，支持 CPU/GPU、量化、`initial_prompt` 与 `hotwords`；资源消耗明显高于 SenseVoice | 中英混说、应用名和 mode 名较多的正文 ASR，也可作为异常后备 | 可选高精度主路径；公开默认不安装，本机基准通过后启用 |
+| FunASR Contextual/SeACo Paraformer | Paraformer 官方模型支持中英混合；Contextual/SeACo 系列面向实体和热词偏置 | 后续动态注入项目名、对话名、路径末级名的候选主 ASR | 尚未集成；应先核对具体权重许可并做本机语料 A/B |
 | Silero VAD v6.2.1 | 本地 ONNX 语音活动检测，上游 MIT 许可；sherpa-onnx 可直接加载模型 | 更稳的起止点检测、减少环境噪声误切句 | 默认起止点检测；自适应能量门限作为无模型后备 |
 
 官方资料与下载入口：
@@ -49,13 +50,19 @@ Voice Access 很适合作为系统级故障后备，但不作为本项目核心�
 - [Vosk 模型列表与许可](https://alphacephei.com/vosk/models)；[small-cn-0.22 模型包](https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip)；[small-en-us-0.15 模型包](https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip)；[Vosk grammar API](https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h)
 - [sherpa-onnx SenseVoice 预训练模型](https://k2-fsa.github.io/sherpa/onnx/sense-voice/pretrained.html)；[2024-07-17 INT8 模型包](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2)
 - [SYSTRAN faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+- [OpenAI Whisper 模型表](https://github.com/openai/whisper/blob/main/README.md#available-models-and-languages)
+- [FunASR](https://github.com/modelscope/FunASR)；[Paraformer 中文模型卡](https://huggingface.co/funasr/paraformer-zh)；[SeACo 论文](https://arxiv.org/abs/2308.03266)
 - [Silero VAD v6.2.1](https://github.com/snakers4/silero-vad/tree/v6.2.1)
 
 ### 工程选择
 
-0.3.1 仍使用 16 kHz、单声道 PCM，但会话协议已经不是“唤醒后只转写一条命令”。“开始语音操作”进入持续 `ACTIVE` 会话；同一个采集 block 同时送给中文控制词 Vosk、英文 `over` Vosk 和 Silero VAD。英文 detector 请求词级及 partial 词级时间并保存单调样本区间，没有可用词时间时退回到命中 block 的近似区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入 SenseVoice，其余非空段分别转写，每个 marker 依次完成前一条 prompt，末段保留给下一条。若 KWS 漏掉而正文 ASR 含独立 `over`，仍按正文切分。执行线程与采集线程分离，因此前一条执行时仍可继续接收下一条，普通任务由一个 worker 串行执行。
+0.3.1 仍使用 16 kHz、单声道 PCM，但会话协议已经不是“唤醒后只转写一条命令”。“开始语音操作”进入持续 `ACTIVE` 会话；同一个采集 block 同时送给中文控制词 Vosk、英文 `over` Vosk 和 Silero VAD。英文 detector 请求词级及 partial 词级时间并保存单调样本区间，没有可用词时间时退回到命中 block 的近似区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入正文 ASR，其余片段先做低门槛分窗能量检查，明显静音直接返回空串，真实有声段再转写。每个 marker 依次完成前一条 prompt，末段保留给下一条。若 KWS 漏掉而正文 ASR 含独立 `over`，仍按正文切分。执行线程与采集线程分离，因此前一条执行时仍可继续接收下一条，普通任务由一个 worker 串行执行。
 
-默认由 sherpa-onnx 加载固定为 v6.2.1 的 Silero ONNX 做话语起止点检测；若用户明确把 `speech.vad.backend` 配成 `energy`，则使用可校准的自适应能量门限后备。这一分层比“让大模型一直听”更省资源，也让原始音频默认不必离开机器。公开默认 `speech.fallback.backend: none`，普通安装只装 `audio` 与 `windows` extras；`-WithWhisper` 才安装 faster-whisper。启用者应先显式预下载 `large-v3-turbo`，因为它会产生 GB 级网络下载/缓存和明显资源开销。当前实现不按空文本、低置信度或长句自动切换，只在已经构造 SenseVoice 后、某次 `transcribe()` 抛异常时延迟构造 Whisper；SenseVoice 启动/模型加载失败不能由这条后备补救，自动化套件也尚未覆盖该分支。
+默认由 sherpa-onnx 加载固定为 v6.2.1 的 Silero ONNX 做话语起止点检测；若用户明确把 `speech.vad.backend` 配成 `energy`，则使用可校准的自适应能量门限后备。这一分层比“让大模型一直听”更省资源，也让原始音频默认不必离开机器。公开默认仍为 SenseVoice 且 `speech.fallback.backend: none`；普通安装只装 `audio` 与 `windows` extras，`-WithWhisper` 才安装 faster-whisper。现在可直接把 `speech.command.backend` 设为 `faster-whisper`，并配置模型、设备、精度、语言、beam、`initial_prompt` 和 `hotwords`。模型权重首次使用会产生 GB 级下载/缓存。兼容 fallback 仍只在主转写器抛异常时调用，不把低置信度自动切换伪装成已经可靠完成的候选融合。
+
+### 2026-09-01 本机中英命令 A/B
+
+在同一批 16 kHz Windows TTS 控制句上，SenseVoice 把“切换到 Claude，打开 Chat and Cowork”转成“切换到 cloud，打开 chat and cowork”，并把另一条 `Claude` 转成 `cloloud`；这会导致应用范围无法唯一绑定。`large-v3-turbo` 配合上述 prompt/hotwords 保留了目标长句中的 `Claude` 与 `Chat and Cowork`。本机 RTX 5000 Ada 在模型已缓存并载入后，短句约 0.16–0.25 秒；首次下载及载入明显更久。这只是合成语音回归，不代表抱娃距离、婴儿声、口音和真实麦克风已经通过。发布验收仍应采集授权的本机真人语音，分别统计应用名/mode 槽位正确率、整句可执行解析率、`APP_SCOPE_REQUIRED` 比率和 P50/P95 延迟。
 
 ### 历史验证记录（2026-08-30，早期运行时）
 

@@ -12,12 +12,12 @@ HandsFreePC 是本地优先、常开麦克风的 Windows 辅助工具。公开�
   +-> 本地英文 Vosk：检测 over，并绑定本地样本区间
   +-> 本地 Silero VAD：形成完整话语
       -> 按每个 over 样本区间把本轮原始捕获切成 n+1 段（marker 音频不进入正文 ASR）
-      -> 本地 SenseVoice：逐段转写
+      -> 本地正文 ASR：SenseVoice（默认）或显式启用的 faster-whisper
       -> PromptAssembler：每个 marker 完成其前一段 prompt，尾段留作下一条
       -> 本地有界 FIFO
 ```
 
-中文控制词 Vosk、英文 `over` Vosk、Silero VAD 和 SenseVoice 复用同一个麦克风采集流中的内存音频 block；英文 detector 不会另开麦克风，也不会因此保存音频。模型不会由常驻运行时后台下载：只有用户以 `scripts/install.ps1 -DownloadModels` 安装，或显式运行 `handsfreepc download-models` / `scripts/download-models.ps1` 时，才会从文档列出的 Vosk 上游下载 `vosk-model-small-en-us-0.15`，并核对项目钉住的归档 SHA-256、预期文件与许可元数据。
+中文控制词 Vosk、英文 `over` Vosk、Silero VAD 和所选正文 ASR 复用同一个麦克风采集流中的内存音频 block；英文 detector 不会另开麦克风，也不会因此保存音频。项目固定下载器只会在用户运行 `scripts/install.ps1 -DownloadModels`、`handsfreepc download-models` 或 `scripts/download-models.ps1` 时下载所列 Vosk/Silero/SenseVoice 工件并核对固定哈希、文件和许可元数据。若用户另行把正文 backend 设为 `faster-whisper`，上游库可能在第一次构造模型时从模型托管站下载权重；这项额外网络与缓存边界必须单独知情启用。
 
 默认：
 
@@ -29,15 +29,17 @@ HandsFreePC 是本地优先、常开麦克风的 Windows 辅助工具。公开�
 - `execution.dry_run: true`；
 - `speech.fallback.backend: none`。
 
-0.3 没有受支持的音频/转写持久化器；把前两个布尔值改为 `true` 也不应被理解为已经启用录音功能。未来若增加诊断保存，必须有独立的单次 opt-in、明确目录和删除提示。
+`privacy.save_audio` 当前没有受支持的录音持久化器，设置为 `true` 也不会保存 PCM。`privacy.save_transcripts` 则是独立的显式 opt-in：为 `true` 时，送入会话层的本地 ASR 文本会写入 `%LOCALAPPDATA%\HandsFreePC\transcripts\asr-transcripts.jsonl`。内容、标点和大小写不再经过 prompt 归一化，但模型 adapter 会去掉首尾空白。它包括 wake utterance、普通 command utterance，以及按 `over` 样本边界形成的每个 segment；调用 ASR 后返回空和被静音门控跳过都会记录，后者带 `transcribed: false` 与 `skip_reason: silence_energy_gate`。记录带 UTC timestamp、source，可带 session ID 和 segment index/count；单文件最大 5 MiB，保留 5 个备份。
+
+原文日志与 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl` 的隐私受限诊断事件完全分开，后者仍不接受 prompt/transcript 字段。运行时启动会打印两者的绝对路径及原文启用状态；`handsfreepc transcripts --tail 50` 会原样显示最近记录。原文可能包含口述的姓名、路径、对话或其他敏感内容，启用前应确认本机账户、备份和同步目录的访问边界。该开关不保存 PCM，也不会补录启用前的内容。
 
 ## 连续语音会话
 
-说“开始语音操作”后，SenseVoice 的正文转写被拼到内存。只有识别到独立 `over` 后，完整 prompt 才进入队列。说“结束语音操作”会丢弃未完成半条并排空已接受任务；它不会关闭麦克风。急停会请求取消当前任务并清队列，也不会删除已经送往 provider 的数据或撤回外部副作用。
+说“开始语音操作”后，所选本地正文 ASR 的转写被拼到内存。只有识别到独立 `over` 后，完整 prompt 才进入队列。说“结束语音操作”会丢弃未完成半条并排空已接受任务；它不会关闭麦克风。急停会请求取消当前任务并清队列，也不会删除已经送往 provider 的数据或撤回外部副作用。
 
-0.3.1 使用独立的本地英文 Vosk small-en-us 0.15 小词表 detector 识别 `over`，同时保留 SenseVoice 正文识别作为后备。运行时请求 Vosk 的词级及 partial 词级时间，把每次命中绑定为当前麦克风流中的单调样本区间；若某次识别结果没有可用词时间，则只退回到命中所在音频 block 的区间，不把这个近似写成精确词边界。
+0.3.1 使用独立的本地英文 Vosk small-en-us 0.15 小词表 detector 识别 `over`，同时保留所选正文 ASR 的独立单词识别作为后备。运行时请求 Vosk 的词级及 partial 词级时间，把每次命中绑定为当前麦克风流中的单调样本区间；若某次识别结果没有可用词时间，则只退回到命中所在音频 block 的区间，不把这个近似写成精确词边界。
 
-detector 命中不会用异常提前截断 VAD。VAD 返回后，程序使用本轮保存在内存中的原始捕获，按一个或多个 marker 区间切成 n+1 段；marker 区间本身不送入正文 SenseVoice，其他非空段分别在本地转写。每个 marker 依次调用 `PromptAssembler.finalize()` 完成它前面的 prompt，最后一段则保留为下一条 pending prompt，因此同一 VAD 话语中的多个 `over` 可以按顺序形成多条 FIFO 任务。样本边界减少了把 marker 或后一条正文混入前一条的风险，但仍不保证所有口音、噪声、设备和语速下都能正确识别或精确切分，用户仍应以入队反馈确认结果。
+detector 命中不会用异常提前截断 VAD。VAD 返回后，程序使用本轮保存在内存中的原始捕获，按一个或多个 marker 区间切成 n+1 段；marker 区间本身不送入正文 ASR，其他片段先经过保守的分窗能量门控，明显静音返回空串，真实有声段再在本地转写。每个 marker 依次调用 `PromptAssembler.finalize()` 完成它前面的 prompt，最后一段则保留为下一条 pending prompt，因此同一 VAD 话语中的多个 `over` 可以按顺序形成多条 FIFO 任务。样本边界减少了把 marker 或后一条正文混入前一条的风险，但仍不保证所有口音、噪声、设备和语速下都能正确识别或精确切分，用户仍应以入队反馈确认结果。
 
 安装或从 0.3.0 升级到 0.3.1 后需要重新运行 `download-models`，否则本地语音会话会因缺少英文 delimiter 模型而无法初始化；可用 `doctor --strict` 检查 `models.delimiter.ready`。这是一次显式的本地模型下载，不表示运行时会后台联网，也不改变默认“不保存音频或转写”的设置。
 
@@ -129,7 +131,7 @@ Codex 的认证、传输、服务端留存、训练/数据控制、错误报告�
 
 启用云 planner 时，仅前述 task-authorized 子集进入 planner；完整 UIA 元数据仍只在本地 verifier 使用。使用 `planner_backend: none` 时不发送给 Codex/Claude，但 generic miss 无法规划，只能运行确定性 native skill。
 
-driver 不使用剪贴板，不读取 password value，不保存 screenshot/audio/transcript 文件。操作会占用前台窗口，并可能让旁人看到输入或使目标应用自己产生历史、草稿、审计日志和云同步；这些外部持久化不受 `save_transcripts` 控制。
+driver 不使用剪贴板，不读取 password value，也不保存 screenshot 或 PCM 音频。ASR 原文只有在 `privacy.save_transcripts: true` 时由独立本机 journal 保存；driver 自身不另建 transcript 文件。操作会占用前台窗口，并可能让旁人看到输入或使目标应用自己产生历史、草稿、审计日志和云同步；这些外部持久化不受 `save_transcripts` 控制。
 
 公开默认 `strict` 中，通用 agent 的 `type_text`/`set_value` 即使只写草稿，也必须先显示/播报本轮随机四位一次性确认口令。仅在本机忽略提交配置中显式启用的 `personal_trusted`，可把本句完整口述草稿免确认写入唯一聚焦、非密码输入框，但不会自动发送；发送、提交及其他副作用仍需确认。单独说静态“确认执行”无效。同一 `VoiceRuntime` 进程内已签发码在确认、取消或超时后都不回收，有界重抽耗尽时拒绝；去重集合不持久化，重启后不保证绝对不复用。挑战码不是持久化防重放凭证或说话人认证，也不能阻止同一房间的人、扬声器或实时转述/重放获取本轮口令后代说。
 
@@ -180,10 +182,11 @@ HandsFreePC 可能在本地保留：
 
 - 用户自己创建的 `config.local.yaml` 或本地应用配置；
 - 下载的 ASR/VAD 模型、来源与许可文件；
+- 显式设置 `privacy.save_transcripts: true` 后的轮转 ASR 原文日志；
 - Python/Windows/CLI 自己的安装缓存和诊断数据；
 - 用户主动重定向保存的 doctor/test 输出。
 
-HandsFreePC 0.3 自身不建立音频/转写历史库。prompt assembler、FIFO、confirmation ID 和 local agent task state 在进程内存中；退出后不会由本项目恢复。目标应用、Codex/Claude CLI、provider 和 optional MCP server 可能各自持久化数据。
+HandsFreePC 不建立 PCM 音频历史库。公开默认也不建立转写历史；显式 opt-in 后只保留上述会话层 ASR 文本 journal 与静音跳过标记，不保存 PromptAssembler 的归一化文本、planner context、UIA 内容或动作结果。prompt assembler、FIFO、confirmation ID 和 local agent task state 在进程内存中；退出后不会由本项目恢复。目标应用、Codex/Claude CLI、provider 和 optional MCP server 可能各自持久化数据。
 
 `doctor`、`test-asr`、pytest failure 或手工 UIA 检查输出可能包含路径、设备名或窗口内容。重定向、复制或上传后就形成新的持久副本；分享前人工脱敏。
 
@@ -191,7 +194,7 @@ HandsFreePC 0.3 自身不建立音频/转写历史库。prompt assembler、FIFO�
 
 ## 可选 faster-whisper
 
-默认 `speech.fallback.backend: none`，普通安装不包含 faster-whisper。显式安装和预载 `large-v3-turbo` 会访问模型托管站并产生 GB 级缓存。当前 fallback 只在已成功构造的 SenseVoice 某次 `transcribe()` 抛异常时触发，不处理空/低置信度结果，也不能补救 SenseVoice 启动/模型加载失败。
+默认 `speech.command.backend: sensevoice` 且 `speech.fallback.backend: none`，普通安装不包含 faster-whisper。显式安装并把 command backend 设为 `faster-whisper` 后，`large-v3-turbo` 可作为正文主 ASR；第一次构造可能访问模型托管站并产生 GB 级缓存。若仅把它配置为 fallback，仍只在已成功构造的主转写器某次 `transcribe()` 抛异常时触发，不处理空/低置信度结果，也不能补救主转写器启动/模型加载失败。
 
 若不接受首次触发联网、模型缓存或额外资源占用，保持 `none`。模型权重有独立许可与数据边界，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
@@ -199,6 +202,7 @@ HandsFreePC 0.3 自身不建立音频/转写历史库。prompt assembler、FIFO�
 
 - 停止采集：退出 HandsFreePC 或关闭 Windows 麦克风权限；
 - 删除本地配置：核对后删除项目中的 `config.local.yaml` 和你明确创建的本地配置；
+- 删除 ASR 原文：先退出 HandsFreePC，再核对并删除 `%LOCALAPPDATA%\HandsFreePC\transcripts\asr-transcripts.jsonl` 及同目录下它的 `.1` 至 `.5` 轮转备份；
 - 删除模型：仅删除你明确配置的 `models` 目录；下次使用需重新下载；
 - 撤销 Codex/Claude 登录、历史、缓存、app approval 和云端数据：使用各自产品的设置/命令；
 - 清理 optional Qwen 安装和缓存：按上游安装方式处理；HandsFreePC 不自动安装也不自动卸载。
@@ -219,4 +223,4 @@ HandsFreePC 0.3 自身不建立音频/转写历史库。prompt assembler、FIFO�
 
 ---
 
-**English summary:** Audio recognition is local by default; HandsFreePC does not save audio or transcripts and disables cloud planning and live control. With the 0.3 local agent enabled, the default Claude planner—or an explicitly consented Codex CLI best-effort planner—may receive a completed transcript, visible-app summary, task-named controls (`strict`) or locally classified safe navigation controls (`personal_trusted`), and recent local verification history. Content-plane nodes, raw window titles, process IDs, automation IDs, element values, PCM, screenshot bytes, and actual screenshot availability are excluded from the project-built step prompt; the full snapshot stays local for verification. CLI/provider account, host, connection, runtime, and diagnostic metadata remain separate boundaries.
+**English summary:** Audio recognition is local by default; HandsFreePC never persists PCM through the current `save_audio` setting and does not save transcripts by default. Explicitly setting `privacy.save_transcripts: true` writes model-adapter text before prompt normalization—including empty returns and sample-bound marker segments—to a separate rotating per-user JSONL journal. Adapters trim surrounding whitespace, and segments skipped by the silence gate are explicitly marked `transcribed: false`; the journal remains separate from privacy-bounded diagnostics. Cloud planning and live control remain disabled by public defaults. With the 0.3 local agent enabled, the default Claude planner—or an explicitly consented Codex CLI best-effort planner—may receive a completed transcript, visible-app summary, task-named controls (`strict`) or locally classified safe navigation controls (`personal_trusted`), and recent local verification history. Content-plane nodes, raw window titles, process IDs, automation IDs, element values, PCM, screenshot bytes, and actual screenshot availability are excluded from the project-built step prompt; the full snapshot stays local for verification. CLI/provider account, host, connection, runtime, and diagnostic metadata remain separate boundaries.

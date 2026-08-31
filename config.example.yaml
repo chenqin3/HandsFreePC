@@ -18,6 +18,7 @@ app:
 
 privacy:
   save_audio: false
+  # Explicit opt-in: stores verbatim local ASR returns in a separate per-user JSONL journal.
   save_transcripts: false
   redact_paths_in_logs: true
   allow_cloud_planner: false
@@ -67,17 +68,29 @@ speech:
       - over
     phrase_window_seconds: 2.0
   command:
+    # SenseVoice is the fast CPU default. For higher-accuracy Chinese/English
+    # commands, install with -WithWhisper and change backend to faster-whisper.
     backend: sensevoice
     model_path: models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17
+    model: large-v3-turbo
     language: auto
     use_itn: true
     num_threads: 4
     provider: cpu
+    device: auto
+    compute_type: auto
+    beam_size: 5
+    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chat and Cowork、Design 和 over。"
+    hotwords: "Claude Codex Chat and Cowork Design over"
   fallback:
     backend: none
     model: large-v3-turbo
     device: auto
     compute_type: auto
+    language: zh
+    beam_size: 5
+    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chat and Cowork、Design 和 over。"
+    hotwords: "Claude Codex Chat and Cowork Design over"
 
 planner:
   # Legacy one-shot VoiceRuntime fallback only. Cloud output is locally restricted

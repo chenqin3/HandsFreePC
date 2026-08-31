@@ -18,6 +18,7 @@ from handsfree_pc.audio import (
     MicrophoneSource,
     PhraseDetection,
     VoskWakeDetector,
+    has_transcribable_energy,
     rms,
 )
 
@@ -25,6 +26,86 @@ from handsfree_pc.audio import (
 def test_rms_silence_and_signal() -> None:
     assert rms(np.zeros(160, dtype=np.float32)) == 0
     assert 0.49 < rms(np.full(160, 0.5, dtype=np.float32)) < 0.51
+
+
+def test_marker_energy_gate_rejects_padding_but_keeps_quiet_speech() -> None:
+    padding = np.full(3200, 0.00003, dtype=np.float32)
+    time = np.arange(1600, dtype=np.float32) / 16000
+    quiet_speech = (0.0015 * np.sin(2 * np.pi * 220 * time)).astype(np.float32)
+
+    assert not has_transcribable_energy(
+        padding,
+        sample_rate=16000,
+        energy_threshold=0.012,
+        min_speech_seconds=0.25,
+    )
+    assert has_transcribable_energy(
+        quiet_speech,
+        sample_rate=16000,
+        energy_threshold=0.012,
+        min_speech_seconds=0.25,
+    )
+
+
+def test_marked_segments_do_not_transcribe_silent_suffix() -> None:
+    calls = []
+
+    class FakeTranscriber:
+        def transcribe(self, samples, sample_rate):
+            calls.append((samples, sample_rate))
+            return "打开记事本"
+
+    session = object.__new__(LocalSpeechSession)
+    session.settings = type(
+        "Settings",
+        (),
+        {
+            "sample_rate": 16000,
+            "energy_threshold": 0.012,
+            "min_speech_seconds": 0.25,
+        },
+    )()
+    session.transcriber = FakeTranscriber()
+    session.last_marker_events = (PhraseDetection("over", 1600, 2400),)
+    session.last_marker_audio_segments = (
+        np.full(1600, 0.01, dtype=np.float32),
+        np.zeros(3200, dtype=np.float32),
+    )
+
+    assert session.transcribe_marked_segments() == ["打开记事本", ""]
+    assert session.last_marker_segment_transcribed == (True, False)
+    assert len(calls) == 1
+    assert calls[0][1] == 16000
+
+
+def test_marked_segments_keep_real_quiet_suffix() -> None:
+    calls = []
+
+    class FakeTranscriber:
+        def transcribe(self, samples, _sample_rate):
+            calls.append(samples)
+            return "继续输入"
+
+    session = object.__new__(LocalSpeechSession)
+    session.settings = type(
+        "Settings",
+        (),
+        {
+            "sample_rate": 16000,
+            "energy_threshold": 0.012,
+            "min_speech_seconds": 0.25,
+        },
+    )()
+    session.transcriber = FakeTranscriber()
+    session.last_marker_events = (PhraseDetection("over", 1600, 2400),)
+    time = np.arange(1600, dtype=np.float32) / 16000
+    quiet_suffix = (0.0015 * np.sin(2 * np.pi * 220 * time)).astype(np.float32)
+    session.last_marker_audio_segments = (np.zeros(1600, dtype=np.float32), quiet_suffix)
+
+    assert session.transcribe_marked_segments() == ["", "继续输入"]
+    assert session.last_marker_segment_transcribed == (False, True)
+    assert len(calls) == 1
+    assert calls[0] is quiet_suffix
 
 
 class SilenceSource:
@@ -339,7 +420,7 @@ def test_vosk_reset_clears_rolling_slow_phrase_state(monkeypatch) -> None:
     assert recognizer.reset_count == 1
 
 
-def test_vosk_grammar_unions_configured_and_runtime_control_phrases(monkeypatch) -> None:
+def test_vosk_grammar_deduplicates_spaced_and_compact_control_phrases(monkeypatch) -> None:
     captured: list[list[str]] = []
 
     def recognizer_factory(_model, _sample_rate, grammar_json):
@@ -360,7 +441,7 @@ def test_vosk_grammar_unions_configured_and_runtime_control_phrases(monkeypatch)
         grammar=["开始 语音 操作"],
     )
 
-    assert captured == [["开始 语音 操作", "开始语音操作", "over", "[unk]"]]
+    assert captured == [["开始 语音 操作", "over", "[unk]"]]
 
 
 def test_vosk_detection_carries_monotonic_word_sample_boundaries(monkeypatch) -> None:

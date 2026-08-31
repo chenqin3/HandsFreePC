@@ -11,7 +11,8 @@ HandsFreePC 让 Windows 11 在双手被占用时继续接受语音操作：说�
 
 ```text
 麦克风
-  -> 中文 Vosk 控制词 + 英文 Vosk `over` 检测 + Silero VAD + SenseVoice 正文转写
+  -> 中文 Vosk 控制词 + 英文 Vosk `over` 检测 + Silero VAD
+  -> SenseVoice（快速默认）或 faster-whisper（中英专名高精度）正文转写
   -> “开始语音操作”会话 / over 分段 / 有界 FIFO
   -> NativeSkillRouter（确定性命令优先）
   -> StepPlanner（默认 Claude CLI；Codex CLI 仅为显式 best-effort 备选）
@@ -47,6 +48,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 安装脚本会创建 `.venv`、安装本地语音和 Windows 依赖，并复制一份不会提交的 `config.local.yaml`。默认不会安装 faster-whisper，也不会启用电脑控制。
+
+如果命令经常夹杂 `Claude`、`Codex`、`Chat and Cowork` 等英文专名，推荐安装可选的高精度 ASR：
+
+```powershell
+./scripts/install.ps1 -WithWhisper -DownloadModels
+```
+
+然后在不会提交的 `config.local.yaml` 中把 `speech.command.backend` 改为 `faster-whisper`。`model: large-v3-turbo` 支持 `initial_prompt` 和 `hotwords`；有可用的 NVIDIA CUDA 环境可设 `device: cuda`、`compute_type: float16`，否则保留 `auto`。模型权重第一次使用时会下载约 GB 级缓存，之后启动无需重复下载。完整字段见 `config.example.yaml`。
 
 先运行无桌面副作用检查：
 
@@ -185,9 +194,9 @@ Electron 应用的可访问标签会随版本变化。`apps.*.mode_names` 同时
 
 ### `over` 的独立本地检测
 
-`over` 现在由独立的英文 Vosk small-en-us 0.15 小词表检测器识别，不再要求中文 Vosk 词表或正文 SenseVoice 必须转写出这个短词。中文控制词检测、英文 delimiter 检测、Silero VAD 和正文 ASR 都消费同一次麦克风采集的音频 block；程序不会为 `over` 再打开一个麦克风，也不会保存原始音频。
+`over` 现在由独立的英文 Vosk small-en-us 0.15 小词表检测器识别，不再要求中文 Vosk 词表或正文 ASR 必须转写出这个短词。中文控制词检测、英文 delimiter 检测、Silero VAD 和正文 ASR 都消费同一次麦克风采集的音频 block；程序不会为 `over` 再打开一个麦克风，也不会保存原始音频。
 
-英文 detector 会请求 Vosk 的词级和 partial 词级时间，把命中的 `over` 绑定到当前麦克风流的样本区间；若没有可用词时间，则保守退回到命中所在音频 block 的近似区间。命中不会用异常截断 VAD，而是在话语结束后按 marker 区间切分本轮内存音频：marker 本身不送入 SenseVoice，前后非空片段分别转写，每个 marker 完成它前面的 prompt，最后一段保留为下一条 pending prompt。因此同一个 VAD 话语中的多个 `over` 也可依次入队；若 KWS 漏掉，正文 ASR 自己识别出的独立单词 `over` 仍是后备路径。安装或升级后必须重新运行 `download-models`；`doctor` 的 `models.delimiter.ready` 应为 `true`。样本边界不等于所有口音和噪声下都精确的词边界，清晰说出 `over` 并留一个很短的自然停顿仍有助于识别；最终以“已入队”反馈为准。
+英文 detector 会请求 Vosk 的词级和 partial 词级时间，把命中的 `over` 绑定到当前麦克风流的样本区间；若没有可用词时间，则保守退回到命中所在音频 block 的近似区间。命中不会用异常截断 VAD，而是在话语结束后按 marker 区间切分本轮内存音频：marker 本身不送入正文 ASR，前后片段先经过独立的分窗能量门控，明显静音不会再送给模型产生“嗯”等幻听；真实有声片段分别转写。每个 marker 完成它前面的 prompt，最后一段保留为下一条 pending prompt。因此同一个 VAD 话语中的多个 `over` 也可依次入队；若 KWS 漏掉，正文 ASR 自己识别出的独立单词 `over` 仍是后备路径。安装或升级后必须重新运行 `download-models`；`doctor` 的 `models.delimiter.ready` 应为 `true`。样本边界不等于所有口音和噪声下都精确的词边界，清晰说出 `over` 并留一个很短的自然停顿仍有助于识别；最终以“已入队”反馈为准。
 
 ## 屏幕与语音反馈
 
@@ -210,6 +219,18 @@ Electron 应用的可访问标签会随版本变化。`apps.*.mode_names` 同时
 ```
 
 默认文件位于 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl`，单文件最大 2 MiB，保留 5 个备份。事件只保留 `stage`、`error_code`、异常类型、应用代号、observation generation 和短安全说明等白名单字段；不记录原始语音 prompt、完整转写、UIA 正文/值、截图、provider stderr、绝对路径或凭据。它是定位 `plan`、`observe_driver`、`action_safety`、`execute`、`reobserve`、`verify_action`、`verify_completion` 等阶段的诊断线索，不是完整操作审计。
+
+### 可选的 ASR 原文日志
+
+如果需要排查正文 ASR 是否听对，可在本机配置中显式设置 `privacy.save_transcripts: true`。运行时会把送入会话层的 ASR 文本写入独立的 UTF-8 JSONL 轮转文件，包括唤醒话语、普通命令话语，以及按 `over` 样本边界切开的每个 segment；内容、标点和大小写不再经过 prompt 归一化，模型 adapter 只会去掉首尾空白。空 segment 也记录；若它因静音能量门控而根本没有调用 ASR，会明确带 `transcribed: false` 和 `skip_reason: silence_energy_gate`，从而与“调用了 ASR 但返回空”区分。它不会保存 PCM 音频，也不会把原文混进上述隐私受限诊断日志。
+
+启动时会打印诊断文件、原文文件的完整绝对路径及启用状态。也可直接查看最近原文：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml transcripts --tail 50
+```
+
+默认原文文件是 `%LOCALAPPDATA%\HandsFreePC\transcripts\asr-transcripts.jsonl`，单文件最大 5 MiB，保留 5 个备份。公开默认和 `config.example.yaml` 仍为 `false`；原文可能包含口述路径、姓名、聊天内容或其他敏感信息，启用者应自行控制该 Windows 用户账户和文件备份/同步范围。
 
 ## 可选 Qwen Open Computer Use 驱动
 
@@ -240,7 +261,7 @@ computer_control:
 
 ## 默认隐私与安全边界
 
-- 原始音频和转写默认不落盘；
+- 原始音频始终不由该功能落盘；转写默认不落盘，只有显式设置 `privacy.save_transcripts: true` 才写入独立的本机原文日志；
 - 云 planner、电脑控制、屏幕上下文许可和真实执行默认关闭；
 - 不允许任意 shell、PowerShell、Run 对话框或自定义脚本进入桌面动作 Schema；
 - 完整 UIA 名称、标题和页面文本只在本地观察/验收，但仍可能包含敏感信息；云 planner 只接收本句肯定且精确点名控件的最小子集。为降低本地旁观和规则漏检风险，首次验收仍应关闭无关窗口；

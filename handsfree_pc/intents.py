@@ -12,12 +12,19 @@ _APP_ALIASES = {
     "代码助手": "codex",
     "claude": "claude",
     "克劳德": "claude",
+    # SenseVoice commonly renders the product name this way in otherwise
+    # well-formed control commands.  These are app-entity aliases only; they
+    # are not global transcript rewrites.
+    "cloud": "claude",
+    "cloloud": "claude",
 }
 
 _APP_NAMES_BY_CANONICAL = {
     canonical: tuple(alias for alias, value in _APP_ALIASES.items() if value == canonical)
     for canonical in frozenset(_APP_ALIASES.values())
 }
+
+_SCOPED_ASR_APP_ALIASES = frozenset({"cloud", "cloloud"})
 
 _FEEDBACK_FULL_UTTERANCE_PATTERNS = (
     r"(?:切换到|切换成|使用|开启)?(?:屏幕反馈|大字模式|遮罩反馈)",
@@ -96,17 +103,31 @@ _APP_ENTITY_OPERATION_MARKERS = tuple(
     if marker not in {"打开", "然后", "接着", "随后", "再", "同时", "并且"}
 )
 
-_APP_SURFACE_PATTERN = r"(?<![a-z0-9_-])(chatandcowork|chat|code|cowork)(?![a-z0-9_-])"
+_APP_SURFACE_PATTERN = (
+    r"(?<![a-z0-9_-])"
+    r"(chatandcowork|chatincowork|聊天和协作|chat|code|cowork)"
+    r"(?![a-z0-9_-])"
+)
 
 
 def _canonical_app_surface(value: str) -> str:
-    return "chat" if value.casefold() == "chatandcowork" else value.casefold()
+    normalized = value.casefold()
+    return "chat" if normalized in {"chatandcowork", "chatincowork", "聊天和协作"} else normalized
 
 
 def _detect_app(text: str) -> str | None:
     lower = normalize_text(text)
     compact = compact_text(text)
     for alias, canonical in _APP_ALIASES.items():
+        if alias in _SCOPED_ASR_APP_ALIASES:
+            if re.search(
+                rf"(?:打开|启动|进入|切换到|切换至|切换道|切换|在|于)\s*"
+                rf"{re.escape(alias)}(?=$|[\s的里中内上]|app\b|应用)",
+                lower,
+                re.IGNORECASE,
+            ):
+                return canonical
+            continue
         if alias in lower or compact_text(alias) in compact:
             return canonical
     return None
@@ -263,7 +284,9 @@ class DeterministicIntentParser:
         app_pattern = "(?:" + "|".join(re.escape(compact_text(alias)) for alias in aliases) + ")"
         remainder = cls._consume_prefix(
             compact,
-            r"^(?:打开|启动|进入|切换到|切换至|切换)"
+            # ``切换道`` is a narrow ASR repair for ``切换到`` and is accepted
+            # only here, directly before an allow-listed application alias.
+            r"^(?:打开|启动|进入|切换到|切换至|切换道|切换)"
             r"(?:桌面上的?|桌面里(?:的)?|桌面)?" + app_pattern + r"(?:app|应用)?",
         )
         if remainder is None:
@@ -303,7 +326,9 @@ class DeterministicIntentParser:
                     )
                 elif mode in {"chat", "code", "cowork"}:
                     surface_pattern = (
-                        "(?:chatandcowork|chat)" if mode == "chat" else re.escape(mode)
+                        "(?:chatandcowork|chatincowork|聊天和协作|chat)"
+                        if mode == "chat"
+                        else re.escape(mode)
                     )
                     pattern = (
                         r"^[,，]?(?:并|然后)?"
@@ -401,7 +426,14 @@ class DeterministicIntentParser:
         )
         if match:
             project = _clean_entity(match.group(1))
-            project = re.sub(r"^.*?(?:codex|科德克斯|claude|克劳德)(?:app)?", "", project)
+            app_alias_pattern = "|".join(
+                re.escape(compact_text(alias)) for alias in _APP_NAMES_BY_CANONICAL[app]
+            )
+            project = re.sub(
+                rf"^.*?(?:{app_alias_pattern})(?:app)?",
+                "",
+                project,
+            )
             project = re.sub(r"^(?:app)?(?:打开其中的|打开|进入|其中的)", "", project)
             conversation = _clean_entity(match.group(2))
             actions.append(

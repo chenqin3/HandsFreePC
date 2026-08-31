@@ -48,6 +48,7 @@ from .session import (
     SessionState,
     WorkerState,
 )
+from .transcripts import TranscriptJournal
 
 _FEEDBACK_MODE_PHRASES: dict[FeedbackMode, tuple[str, ...]] = {
     FeedbackMode.OVERLAY: ("切换到屏幕反馈", "屏幕反馈", "大字模式", "遮罩反馈"),
@@ -110,6 +111,7 @@ class VoiceRuntime:
         controller_factory: Callable[[], Controller] | None = None,
         confirmation_challenge_factory: Callable[[], str] | None = None,
         diagnostics: Any | None = None,
+        transcript_journal: TranscriptJournal | Any | None = None,
     ) -> None:
         self.settings = settings
         self.executor = executor
@@ -147,6 +149,11 @@ class VoiceRuntime:
             confirmation_challenge_factory or _new_confirmation_code
         )
         self.diagnostics = diagnostics
+        self.transcript_journal: TranscriptJournal | Any | None = None
+        self._owns_transcript_journal = False
+        if settings.privacy.save_transcripts:
+            self.transcript_journal = transcript_journal or TranscriptJournal()
+            self._owns_transcript_journal = transcript_journal is None
         self._confirmation_challenge_lock = threading.Lock()
         self._issued_confirmation_challenges: set[str] = set()
         self.command_worker: CommandWorker | None = None
@@ -308,6 +315,30 @@ class VoiceRuntime:
                 {key: value for key, value in optional_fields.items() if value is not None}
             )
             self.diagnostics.event(**event_fields)
+
+    def _record_transcript(
+        self,
+        source: str,
+        text: str,
+        *,
+        segment_index: int | None = None,
+        segment_count: int | None = None,
+        transcribed: bool | None = None,
+        skip_reason: str | None = None,
+    ) -> None:
+        """Persist only the exact local ASR return when the user explicitly opted in."""
+
+        if self.transcript_journal is None:
+            return
+        self.transcript_journal.record(
+            source=source,
+            text=text,
+            session_id=self._voice_session_id,
+            segment_index=segment_index,
+            segment_count=segment_count,
+            transcribed=transcribed,
+            skip_reason=skip_reason,
+        )
 
     def _clear_voice_feedback(self) -> None:
         with self._voice_feedback_lock:
@@ -1664,12 +1695,37 @@ class VoiceRuntime:
                         marker = getattr(speech, "last_marker_phrase", None)
                         if marker_events:
                             transcripts = speech.transcribe_marked_segments()
+                            transcribed_flags = tuple(
+                                getattr(
+                                    speech,
+                                    "last_marker_segment_transcribed",
+                                    (True,) * len(transcripts),
+                                )
+                            )
+                            segment_count = len(transcripts)
+                            for index, transcript in enumerate(transcripts):
+                                was_transcribed = (
+                                    transcribed_flags[index]
+                                    if index < len(transcribed_flags)
+                                    else True
+                                )
+                                self._record_transcript(
+                                    "marker_segment",
+                                    transcript,
+                                    segment_index=index,
+                                    segment_count=segment_count,
+                                    transcribed=was_transcribed,
+                                    skip_reason=(
+                                        None if was_transcribed else "silence_energy_gate"
+                                    ),
+                                )
                             self._handle_marked_session_segments(
                                 transcripts,
                                 marker_count=len(marker_events),
                             )
                         else:
                             transcript = speech.transcribe(audio)
+                            self._record_transcript("command_utterance", transcript)
                             if marker:
                                 # Compatibility for injected speech sessions which only
                                 # expose the legacy single-marker attribute. Production
@@ -1688,6 +1744,7 @@ class VoiceRuntime:
                         feedback_event=self._voice_feedback_event,
                     )
                     transcript = speech.transcribe(audio)
+                    self._record_transcript("wake_utterance", transcript)
                     self._record_diagnostic(
                         stage="runtime",
                         error_code="WAKE_OR_CONTROL_PHRASE_DETECTED",
@@ -1757,6 +1814,7 @@ class VoiceRuntime:
                             self.handle_text(matched, require_wake=False)
                             continue
                         transcript = speech.transcribe(audio)
+                        self._record_transcript("wake_utterance", transcript)
                         control_text = _merge_control_phrase_transcript(matched, transcript)
                         self.handle_text(control_text or matched, require_wake=True)
                     elif self.state in {
@@ -1792,6 +1850,7 @@ class VoiceRuntime:
                             interrupt_phrases=self.settings.app.stop_phrases,
                         )
                         transcript = speech.transcribe(audio)
+                        self._record_transcript("command_utterance", transcript)
                         self.handle_text(transcript, require_wake=False)
                     else:
                         time.sleep(0.05)
@@ -1843,3 +1902,6 @@ class VoiceRuntime:
             self._controller = None
         self._clear_voice_feedback()
         self.feedback.close()
+        if self._owns_transcript_journal and self.transcript_journal is not None:
+            self.transcript_journal.close()
+            self.transcript_journal = None

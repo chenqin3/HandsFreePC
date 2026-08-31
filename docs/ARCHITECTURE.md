@@ -11,7 +11,7 @@ AudioCapture（单麦克风）
   +-> Vosk control detector：开始/结束/急停/确认/恢复
   +-> Vosk delimiter detector（small-en-us）：over
   +-> Silero VAD + delimiter 样本区间切分
-                    -> SenseVoice 分段 command ASR
+                    -> 可配置分段 command ASR（SenseVoice / faster-whisper）
                     -> PromptAssembler（逐 marker finalize；正文 ASR delimiter 后备）
                     -> bounded FIFO CommandWorker
                     -> DesktopAgentLoopController
@@ -30,7 +30,7 @@ AudioCapture（单麦克风）
 
 1. 平时本地监听控制词；
 2. “开始语音操作”进入连续 `ACTIVE` 会话；
-3. SenseVoice fragment 进入 `PromptAssembler.feed()`；
+3. 所选正文 ASR fragment 进入 `PromptAssembler.feed()`；
 4. 只有独立 delimiter `over` 前的非空文本成为一条任务；
 5. 任务进入有界普通队列，严格 FIFO；
 6. 安全确认进入独立控制队列并先于后续普通任务执行，但控制项之间仍 FIFO；
@@ -42,7 +42,7 @@ AudioCapture（单麦克风）
 
 ## `over` 的独立 KWS
 
-delimiter 有两条本地路径。主路径由 Vosk small-en-us 0.15 小词表检测器请求词级及 partial 词级时间，把命中的 `over` 绑定到单调递增的麦克风样本区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入 SenseVoice，各非空段分别转写，每个 marker 依次 `finalize()` 它前面的 prompt，最后一段保留为下一条 pending prompt。若某次 Vosk 结果没有可用词时间，则区间退化为命中所在 audio block，不能把这个近似当成精确词边界。若 KWS 没有命中而正文 SenseVoice 转写出独立单词 `over`，`PromptAssembler.feed()` 仍会按 ASCII 单词边界切分。中文 Vosk 不再加载它词表中不存在的英文 `over`。
+delimiter 有两条本地路径。主路径由 Vosk small-en-us 0.15 小词表检测器请求词级及 partial 词级时间，把命中的 `over` 绑定到单调递增的麦克风样本区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入正文 ASR，各段先经过低门槛分窗能量检查，明显静音不调用模型，真实有声段分别转写。每个 marker 依次 `finalize()` 它前面的 prompt，最后一段保留为下一条 pending prompt。若某次 Vosk 结果没有可用词时间，则区间退化为命中所在 audio block，不能把这个近似当成精确词边界。若 KWS 没有命中而正文 ASR 转写出独立单词 `over`，`PromptAssembler.feed()` 仍会按 ASCII 单词边界切分。中文 Vosk 不再加载它词表中不存在的英文 `over`。
 
 两套 Vosk 检测器与 VAD/ASR 都消费同一个 `MicrophoneSource` 的 block，不会各自打开麦克风：
 
@@ -55,7 +55,7 @@ delimiter KWS hit
   -> 继续录到本话语的 VAD 终点
   -> 用词时间或 block fallback 得到 marker 样本区间
   -> 按一个或多个 marker 区间切成 n+1 段
-  -> marker 音频不进 ASR；其他非空段分别由 SenseVoice 转写
+  -> marker 音频不进 ASR；其他片段先做静音门控，再由所选正文 ASR 转写
   -> 每个 marker finalize 前段；末段保留为下一条 pending prompt
 ```
 

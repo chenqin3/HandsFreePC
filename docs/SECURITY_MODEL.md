@@ -189,7 +189,7 @@ Windows UIA driver 的本地证据包括窗口 HWND、进程名/标题、当前 
 | 待确认界面变化 | 确认前 fresh observe + fingerprint | 应用仍可能在最终动作瞬间变化 |
 | KWS 双开麦克风或 delimiter 错切 | 两个 Vosk detector 复用同一 `MicrophoneSource` block；delimiter 请求词级/partial 词级时间并按样本区间切分 | 词时间或 block fallback 仍可能受口音、噪声和语速影响而产生近似边界；短暂停顿可提高稳健性，但仍需核对入队反馈 |
 
-英文 small-en-us 模型由安装器从 Vosk 官方地址下载并校验固定 SHA-256；模型不进 Git，安装目录保留来源、哈希和 Apache-2.0 COPYING。原始音频默认不保存。
+英文 small-en-us 模型由安装器从 Vosk 官方地址下载并校验固定 SHA-256；模型不进 Git，安装目录保留来源、哈希和 Apache-2.0 COPYING。PCM 音频不落盘。公开默认也不保存转写；只有显式设置 `privacy.save_transcripts: true` 才把送入会话层的 ASR 文本写入独立的 per-user 轮转 JSONL，保留内容、标点和大小写但去掉模型输出首尾空白，并标记被静音门控跳过的 segment；它不混入隐私受限诊断日志。
 
 ## 静态与 live 证据
 
@@ -197,7 +197,7 @@ Windows UIA driver 的本地证据包括窗口 HWND、进程名/标题、当前 
 
 `computer-doctor --live` 只对项目自有 fixture 做一次 Windows UIA Unicode round-trip，并由 `DesktopVerifier` 验收。通过仅能说明此机器的基础 driver 链路当时工作；不说明：
 
-- 麦克风、Vosk、VAD 或 SenseVoice 准确；
+- 麦克风、Vosk、VAD 或所选正文 ASR 准确；
 - Codex/Claude 认证、规划质量或服务可用；
 - Codex、Claude 或其他目标应用的 UIA selector 可用；
 - 发送、删除、上传、认证或其他高风险动作可安全执行；

@@ -80,16 +80,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "command": {
             "backend": "sensevoice",
             "model_path": "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
+            "model": "large-v3-turbo",
             "language": "auto",
             "use_itn": True,
             "num_threads": 4,
             "provider": "cpu",
+            "device": "auto",
+            "compute_type": "auto",
+            "beam_size": 5,
+            "initial_prompt": (
+                "语音控制命令可能包含 "
+                "Claude、Codex、Chat and Cowork、Design 和 over。"
+            ),
+            "hotwords": "Claude Codex Chat and Cowork Design over",
         },
         "fallback": {
             "backend": "none",
             "model": "large-v3-turbo",
             "device": "auto",
             "compute_type": "auto",
+            "language": "zh",
+            "beam_size": 5,
+            "initial_prompt": (
+                "语音控制命令可能包含 "
+                "Claude、Codex、Chat and Cowork、Design 和 over。"
+            ),
+            "hotwords": "Claude Codex Chat and Cowork Design over",
         },
     },
     "planner": {

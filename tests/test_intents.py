@@ -89,6 +89,49 @@ def test_chat_and_cowork_product_label_is_a_complete_native_chat_surface() -> No
     assert parser.covers_full_text(command, plan)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "切换到cloud，打开chat and cowork。",
+        "切换到cloud，打开chat in cowork。",
+        "切换道克劳德，打开聊天和协作。",
+    ],
+)
+def test_sensevoice_claude_aliases_and_surfaces_remain_complete_app_commands(
+    command: str,
+) -> None:
+    parser = DeterministicIntentParser()
+
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert [(action.type, action.app) for action in plan.actions] == [
+        (ActionType.ACTIVATE_APP, "claude"),
+        (ActionType.OPEN_MODE, "claude"),
+    ]
+    assert plan.actions[1].mode == "chat"
+    assert parser.covers_full_text(command, plan)
+
+
+def test_sensevoice_claude_alias_can_bind_a_non_deterministic_typed_text_command() -> None:
+    parser = DeterministicIntentParser()
+    command = "在cloloud的输入框输入，这是语音控制测试，不要发送。"
+
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert plan.actions[0].type == ActionType.ACTIVATE_APP
+    assert plan.actions[0].app == "claude"
+    assert parser.covers_full_text(command, plan) is False
+
+
+def test_sensevoice_cloud_alias_is_not_a_global_text_rewrite() -> None:
+    parser = DeterministicIntentParser()
+
+    assert parser.parse("cloud computing 很重要") is None
+    assert parser.parse("输入 cloud 到输入框") is None
+
+
 def test_codex_name_is_not_mistaken_for_code_surface() -> None:
     plan = DeterministicIntentParser().parse("打开 Codex")
 

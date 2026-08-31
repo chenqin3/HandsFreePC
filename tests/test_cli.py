@@ -121,6 +121,57 @@ speech:
     assert complete["ready_for_run"] is True
 
 
+def test_doctor_reports_faster_whisper_command_backend_without_sensevoice_weights(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+speech:
+  wake:
+    model_path: models/wake
+  delimiter:
+    model_path: models/delimiter
+  command:
+    backend: faster-whisper
+    model: large-v3-turbo
+  vad:
+    model_path: models/vad.onnx
+""",
+        encoding="utf-8",
+    )
+    for directory in ("wake/am", "wake/conf", "delimiter/am", "delimiter/conf"):
+        (tmp_path / "models" / directory).mkdir(parents=True, exist_ok=True)
+    for relative in (
+        "wake/am/final.mdl",
+        "wake/conf/model.conf",
+        "delimiter/am/final.mdl",
+        "delimiter/conf/model.conf",
+        "vad.onnx",
+    ):
+        (tmp_path / "models" / relative).touch()
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
+    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
+    monkeypatch.setattr(cli, "_check_command", lambda *_args, **_kwargs: {"found": False})
+
+    exit_code = cli.command_doctor(
+        SimpleNamespace(config=str(config), check_planner_auth=False, strict=True)
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["models"]["command"] == {
+        "backend": "faster-whisper",
+        "model": "large-v3-turbo",
+        "ready": True,
+        "weights_may_download_on_first_run": True,
+    }
+    assert report["modules"]["faster_whisper"] is True
+    assert report["ready_for_run"] is True
+
+
 def test_json_fallback_remains_valid_on_legacy_console(monkeypatch) -> None:
     class LegacyStdout:
         encoding = "ascii"
@@ -312,7 +363,7 @@ def test_logs_tail_outputs_only_bounded_diagnostic_events(tmp_path, capsys) -> N
 
     report = json.loads(capsys.readouterr().out)
     assert exit_code == 0
-    assert report["log_file"] == "handsfreepc.jsonl"
+    assert report["log_file"] == str(path.resolve())
     assert report["event_count"] == 1
     assert "prompt" not in report["events"][0]
 
@@ -367,8 +418,80 @@ def test_diagnostic_subcommands_accept_tail_and_empty_log(tmp_path, capsys) -> N
     diagnose_report = json.loads(capsys.readouterr().out)
     assert diagnose_report == {
         "found": False,
-        "log_file": "none",
+        "log_file": str((tmp_path / "none").resolve()),
         "event": None,
+    }
+
+
+def test_transcripts_tail_outputs_raw_text_and_absolute_path(tmp_path, capsys) -> None:
+    path = (tmp_path / "asr-transcripts.jsonl").resolve()
+    raw = "  切换到 Claude，打开 Chat and Cowork  "
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-09-01T00:00:00.000Z",
+                "source": "command_utterance",
+                "text": raw,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = cli.command_transcripts(
+        SimpleNamespace(config=None, path=str(path), tail=10)
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["transcript_file"] == str(path)
+    assert report["entry_count"] == 1
+    assert report["entries"][0]["text"] == raw
+
+
+def test_run_prints_diagnostic_and_transcript_locations(
+    settings,
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    diagnostic_path = (tmp_path / "diagnostics.jsonl").resolve()
+    transcript_path = (tmp_path / "transcripts.jsonl").resolve()
+
+    class FakeDiagnostics:
+        path = diagnostic_path
+
+        @staticmethod
+        def event(**_kwargs):
+            pass
+
+    class FakeRuntime:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def run_microphone() -> None:
+            pass
+
+        @staticmethod
+        def stop() -> None:
+            pass
+
+    monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+    monkeypatch.setattr(cli, "load_settings", lambda _config: settings)
+    monkeypatch.setattr(cli, "_build_executor", lambda _settings: object())
+    monkeypatch.setattr(cli, "default_transcript_path", lambda: transcript_path)
+    monkeypatch.setattr("handsfree_pc.runtime.VoiceRuntime", FakeRuntime)
+
+    assert cli.command_run(SimpleNamespace(config=None)) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "diagnostics_file": str(diagnostic_path),
+        "transcripts_enabled": False,
+        "transcript_file": str(transcript_path),
+        "audio_saved": False,
     }
 
 

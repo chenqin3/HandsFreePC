@@ -262,6 +262,38 @@ def test_app_scope_requires_one_affirmative_control_clause_and_rejects_denials()
         assert not _explicitly_named_apps(non_command, visible)
 
 
+@pytest.mark.parametrize(
+    "task",
+    [
+        "切换到cloud，打开chat and cowork。",
+        "在cloloud的输入框输入，这是语音控制测试，不要发送。",
+        "切换道克劳德，打开聊天和协作。",
+    ],
+)
+def test_sensevoice_claude_aliases_still_require_affirmative_app_scope(task: str) -> None:
+    assert _explicitly_named_apps(task, ("codex", "claude")) == {"claude"}
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "cloud computing 很重要",
+        "输入 cloud 到输入框",
+        "不要操作 cloud，只操作 Codex",
+    ],
+)
+def test_sensevoice_claude_aliases_do_not_bypass_app_scope_gate(task: str) -> None:
+    assert "claude" not in _explicitly_named_apps(task, ("codex", "claude"))
+
+
+def test_longer_cloud_product_name_remains_an_unsupported_explicit_scope() -> None:
+    task = "切换到 Cloud Storage，然后打开设置"
+
+    assert _unsupported_explicit_app_scopes(task, ("codex", "claude")) == (
+        "cloud storage",
+    )
+
+
 def test_app_scope_reuses_data_and_negation_boundaries() -> None:
     visible = ("codex", "claude")
     for task in (

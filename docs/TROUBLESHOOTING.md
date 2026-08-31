@@ -10,10 +10,13 @@
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml simulate --independent --file ./examples/demo_commands.txt
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml overlay-demo --text "我在听"
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml logs --tail 50
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml transcripts --tail 50
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml diagnose-last
 ```
 
-最后两条读取的是隐私受限的本地 JSONL 事件：`logs --tail 50` 展示最近 50 条，`diagnose-last` 只找最近一次失败。默认路径是 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl`；日志会轮转，且不含原始 prompt、UIA 正文/值、截图、provider stderr、绝对路径或凭据。优先看 `stage` 与 `error_code`，再定位下文对应层，不要只根据遮罩里的短句猜测原因。
+`logs --tail 50` 与 `diagnose-last` 读取隐私受限的本地 JSONL 事件。默认路径是 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl`；日志会轮转，且不含原始 prompt、UIA 正文/值、截图、provider stderr、绝对路径或凭据。优先看 `stage` 与 `error_code`，再定位下文对应层，不要只根据遮罩里的短句猜测原因。
+
+`transcripts --tail 50` 读取的是另一份、显式 opt-in 的 ASR 原文 journal；仅当 `privacy.save_transcripts: true` 时写入，默认路径为 `%LOCALAPPDATA%\HandsFreePC\transcripts\asr-transcripts.jsonl`。它显示送入会话层的 wake、普通 command 和 sample-bound marker segment 文本，保留内容、标点和大小写，但模型 adapter 会去掉首尾空白。若 marker segment 因静音门控未调用 ASR，会显示 `transcribed: false` 和 `skip_reason: silence_energy_gate`；真正调用 ASR 后返回空则为 `transcribed: true`。原文可能含敏感口述内容，不会保存 PCM。`transcripts` 输出给出原文文件的绝对路径；`run` 启动时会同时打印诊断路径、原文路径和启用状态。
 
 需要验证自有 UIA driver 时，再按 [TESTING.md](TESTING.md) 配置 `local_agent/windows_uia`、`planner_backend: none`，显式运行：
 
@@ -25,7 +28,7 @@
 
 ## “开始语音操作”说慢了不识别，说快反而成功
 
-控制词由本地 Vosk 小词表和 `phrase_window_seconds` 判断，不是正文 SenseVoice。检查：
+控制词由本地 Vosk 小词表和 `phrase_window_seconds` 判断，不是正文 ASR。检查：
 
 1. `app.wake_phrases` 中是完整“开始语音操作”；
 2. `speech.wake.grammar` 有带空格的 `"开始 语音 操作"`；
@@ -52,19 +55,54 @@
 
 `enabled: false` 时可以测试麦克风和兼容 parser，但不会启动连续桌面 agent。
 
+## `Claude` 被听成 `cloud`，或中英混说无法绑定应用
+
+先开启本地原文日志并复现一次：
+
+```yaml
+privacy:
+  save_transcripts: true
+```
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml transcripts --tail 50
+```
+
+当前确定性应用槽位会在明确的应用控制上下文中兼容已实测的 `cloud` / `cloloud`，也兼容 `chat in cowork`；它不会把普通 `cloud computing` 或要输入的 `cloud` 全局替换成 Claude。若项目名、对话名和英文 mode 仍频繁错字，安装并启用高精度正文 ASR：
+
+```powershell
+./scripts/install.ps1 -WithWhisper
+```
+
+```yaml
+speech:
+  command:
+    backend: faster-whisper
+    model: large-v3-turbo
+    language: zh
+    device: auto
+    compute_type: auto
+    beam_size: 5
+    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chat and Cowork、Design 和 over。"
+    hotwords: "Claude Codex Chat and Cowork Design over"
+```
+
+模型第一次使用会下载较大的权重；有已验证的 NVIDIA CUDA 环境可把 `device`/`compute_type` 改成 `cuda`/`float16`。先用授权的 16 kHz 单声道 WAV 跑 `test-asr`，再做真人麦克风验收。不要仅因为输出“操作成功”就认定 ASR 或 UI 已完成，仍要结合 `COMMAND_ENQUEUED`、`CONTROL_STARTED` 和本地 verifier 的最终事件。
+
 ## `over` 经常漏掉
 
-当前版本用独立英文 Vosk 模型检测 `over`，同时保留 SenseVoice 正文识别作为后备。先检查：
+当前版本用独立英文 Vosk 模型检测 `over`，同时保留所选正文 ASR 识别作为后备。先检查：
 
 - 升级代码后重新执行 `./scripts/download-models.ps1`；
 - `doctor --strict` 的 `models.delimiter.path` 指向 `vosk-model-small-en-us-0.15` 且 `ready: true`；
 - 把 `over` 作为一个清晰、独立的英文词说出；很短的自然停顿有助于识别和样本边界稳定，但不是协议强制要求；
 - 用 `overlay` 查看队列数；没有显示“已入队”时不要继续堆很多正文；
 - 用 `logs --tail 50` 查 `PROMPT_DELIMITER_DETECTED`。有该事件但无 `COMMAND_ENQUEUED`，说明 marker 前没有形成非空正文；两者都没有则是 KWS/麦克风层；
+- 若已显式启用 `save_transcripts`，再用 `transcripts --tail 50` 看对应 `marker_segment` 是否为空或错字；`transcribed: false` 表示静音门控跳过，`transcribed: true` 且文本为空才表示 ASR 返回空。这能判断正文 ASR 路径，但不能证明 VAD 样本边界本身正确；
 - 不要在配置中增加过多常见中文短词作为 delimiter，容易在正文误切；
 - `mouseover`、`voiceover` 不会切分，这是预期行为。
 
-检测器使用同一麦克风 block，不会另开音频设备；命中后继续录到 VAD 终点。运行时优先用 Vosk 词级/partial 词级时间形成 marker 样本区间，没有可用词时间时退回到命中 block；随后按 marker 区间切分本轮内存音频，marker 本身不进入 SenseVoice，前后非空段分别转写。它支持同一个 VAD 话语内的多个 `over` 和紧随其后的下一条正文，但边界只是识别结果，不保证在所有口音和噪声下精确；异常时先放慢并短暂停顿，再结合 `PROMPT_DELIMITER_DETECTED`、`COMMAND_ENQUEUED` 与 overlay 判断发生在哪一层。
+检测器使用同一麦克风 block，不会另开音频设备；命中后继续录到 VAD 终点。运行时优先用 Vosk 词级/partial 词级时间形成 marker 样本区间，没有可用词时间时退回到命中 block；随后按 marker 区间切分本轮内存音频，marker 本身不进入正文 ASR，前后片段先经过静音门控，真实有声段再转写。它支持同一个 VAD 话语内的多个 `over` 和紧随其后的下一条正文，但边界只是识别结果，不保证在所有口音和噪声下精确；异常时先放慢并短暂停顿，再结合 `PROMPT_DELIMITER_DETECTED`、`COMMAND_ENQUEUED` 与 overlay 判断发生在哪一层。
 
 ## 任务显示成功，但屏幕没有变化
 

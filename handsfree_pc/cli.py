@@ -31,6 +31,7 @@ from .feedback import FeedbackController
 from .intents import DeterministicIntentParser
 from .models import FeedbackMode, RuntimeState
 from .planner import _sanitized_env, build_planner
+from .transcripts import TranscriptJournal, default_transcript_path, tail_transcripts
 
 
 class _NoopSpeaker:
@@ -176,6 +177,8 @@ def _check_command(
 def command_doctor(args: argparse.Namespace) -> int:
     settings = load_settings(args.config, allow_missing=True)
     base_dir = settings.config_path.parent
+    command_asr_backend = str(settings.speech.command.get("backend", "sensevoice")).lower()
+    fallback_asr_backend = str(settings.speech.fallback.get("backend", "none")).lower()
     modules = [
         "yaml",
         "psutil",
@@ -186,6 +189,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         "win32api",
         "pywinauto",
     ]
+    if "faster-whisper" in {command_asr_backend, fallback_asr_backend}:
+        modules.append("faster_whisper")
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     computer_use_skill_discovered = any(
         codex_home.glob("plugins/**/computer-use/**/skills/computer-use/SKILL.md")
@@ -271,7 +276,6 @@ def command_doctor(args: argparse.Namespace) -> int:
 
     wake_path = resolve_model_path(settings.speech.wake["model_path"])
     delimiter_path = resolve_model_path(settings.speech.delimiter["model_path"])
-    command_path = resolve_model_path(settings.speech.command["model_path"])
     vad_path = resolve_model_path(settings.speech.vad["model_path"])
 
     def vosk_model_ready(path: Path) -> bool:
@@ -279,14 +283,37 @@ def command_doctor(args: argparse.Namespace) -> int:
 
     wake_ready = vosk_model_ready(wake_path)
     delimiter_ready = vosk_model_ready(delimiter_path)
-    command_ready = (command_path / "tokens.txt").is_file() and any(
-        (command_path / name).is_file() for name in ("model.int8.onnx", "model.onnx")
-    )
+    if command_asr_backend == "sensevoice":
+        command_path = resolve_model_path(settings.speech.command["model_path"])
+        command_ready = (command_path / "tokens.txt").is_file() and any(
+            (command_path / name).is_file() for name in ("model.int8.onnx", "model.onnx")
+        )
+        command_model = {
+            "backend": command_asr_backend,
+            "path": str(command_path),
+            "ready": command_ready,
+        }
+    elif command_asr_backend == "faster-whisper":
+        command_model_name = str(
+            settings.speech.command.get("model", "large-v3-turbo")
+        ).strip()
+        command_ready = bool(command_model_name) and report["modules"].get(
+            "faster_whisper", False
+        )
+        command_model = {
+            "backend": command_asr_backend,
+            "model": command_model_name,
+            "ready": command_ready,
+            "weights_may_download_on_first_run": True,
+        }
+    else:
+        command_ready = False
+        command_model = {"backend": command_asr_backend, "ready": False}
     vad_ready = vad_path.is_file()
     report["models"] = {
         "wake": {"path": str(wake_path), "ready": wake_ready},
         "delimiter": {"path": str(delimiter_path), "ready": delimiter_ready},
-        "command": {"path": str(command_path), "ready": command_ready},
+        "command": command_model,
         "vad": {"path": str(vad_path), "ready": vad_ready},
     }
     try:
@@ -298,6 +325,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         report["modules"].get(name, False) for name in ("yaml", "psutil")
     )
     runtime_modules = ("yaml", "psutil", "numpy", "sounddevice", "vosk", "sherpa_onnx")
+    if "faster-whisper" in {command_asr_backend, fallback_asr_backend}:
+        runtime_modules += ("faster_whisper",)
     if platform.system() == "Windows":
         runtime_modules += ("win32api", "pywinauto")
     ready_for_run = (
@@ -609,9 +638,28 @@ def command_logs(args: argparse.Namespace) -> int:
     events = tail_events(path, limit=args.tail)
     _json(
         {
-            "log_file": path.name,
+            "log_file": str(path),
             "event_count": len(events),
             "events": events,
+        }
+    )
+    return 0
+
+
+def command_transcripts(args: argparse.Namespace) -> int:
+    settings = load_settings(args.config, allow_missing=True)
+    path = (
+        Path(args.path).expanduser().resolve()
+        if args.path
+        else default_transcript_path().resolve()
+    )
+    entries = tail_transcripts(path, limit=args.tail)
+    _json(
+        {
+            "enabled": settings.privacy.save_transcripts,
+            "transcript_file": str(path),
+            "entry_count": len(entries),
+            "entries": entries,
         }
     )
     return 0
@@ -623,7 +671,7 @@ def command_diagnose_last(args: argparse.Namespace) -> int:
     _json(
         {
             "found": event is not None,
-            "log_file": path.name,
+            "log_file": str(path),
             "event": event,
         }
     )
@@ -635,9 +683,31 @@ def command_run(args: argparse.Namespace) -> int:
 
     diagnostics = configure_diagnostics()
     runtime: VoiceRuntime | None = None
+    transcript_journal: TranscriptJournal | None = None
     try:
         settings = load_settings(args.config)
-        runtime = VoiceRuntime(settings, _build_executor(settings), diagnostics=diagnostics)
+        transcript_path = default_transcript_path().resolve()
+        transcripts_enabled = bool(
+            getattr(getattr(settings, "privacy", None), "save_transcripts", False)
+        )
+        _json(
+            {
+                "diagnostics_file": str(
+                    getattr(diagnostics, "path", default_log_path().resolve())
+                ),
+                "transcripts_enabled": transcripts_enabled,
+                "transcript_file": str(transcript_path),
+                "audio_saved": False,
+            }
+        )
+        if transcripts_enabled:
+            transcript_journal = TranscriptJournal(transcript_path)
+        runtime = VoiceRuntime(
+            settings,
+            _build_executor(settings),
+            diagnostics=diagnostics,
+            transcript_journal=transcript_journal,
+        )
         diagnostics.event(
             stage="runtime",
             error_code="RUNTIME_STARTED",
@@ -675,8 +745,12 @@ def command_run(args: argparse.Namespace) -> int:
         )
         raise
     finally:
-        if runtime is not None:
-            runtime.stop()
+        try:
+            if runtime is not None:
+                runtime.stop()
+        finally:
+            if transcript_journal is not None:
+                transcript_journal.close()
     return 0
 
 
@@ -786,6 +860,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     logs.add_argument("--path", help=argparse.SUPPRESS)
     logs.set_defaults(func=command_logs)
+
+    transcripts = subparsers.add_parser(
+        "transcripts",
+        help="Read explicitly saved raw local ASR transcripts",
+    )
+    transcripts.add_argument(
+        "--tail",
+        type=int,
+        nargs="?",
+        const=DEFAULT_TAIL_COUNT,
+        default=DEFAULT_TAIL_COUNT,
+        choices=range(1, MAX_TAIL_COUNT + 1),
+        metavar="N",
+        help=f"Show the newest N transcript entries (default {DEFAULT_TAIL_COUNT})",
+    )
+    transcripts.add_argument("--path", help=argparse.SUPPRESS)
+    transcripts.set_defaults(func=command_transcripts)
 
     diagnose_last = subparsers.add_parser(
         "diagnose-last",

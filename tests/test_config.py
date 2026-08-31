@@ -24,6 +24,9 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.computer_control.failure_policy == "pause"
     assert settings.execution.dry_run is True
     assert settings.speech.fallback["backend"] == "none"
+    assert settings.speech.command["backend"] == "sensevoice"
+    assert settings.speech.command["model"] == "large-v3-turbo"
+    assert "Claude" in settings.speech.command["hotwords"]
     assert settings.app.feedback_mode == FeedbackMode.OVERLAY
     assert settings.speech.vad["backend"] == "silero"
     assert settings.speech.delimiter["backend"] == "vosk"

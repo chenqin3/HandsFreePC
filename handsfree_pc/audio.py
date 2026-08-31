@@ -65,6 +65,48 @@ def rms(samples: Any) -> float:
     return float(math.sqrt(float(np.mean(array * array))))
 
 
+def has_transcribable_energy(
+    samples: Any,
+    *,
+    sample_rate: int,
+    energy_threshold: float,
+    min_speech_seconds: float,
+) -> bool:
+    """Reject obvious silence without acting as a second full speech detector.
+
+    Marker splitting can leave a non-empty suffix containing only endpoint padding.
+    Neural ASR models may hallucinate a short utterance for that padding, so check
+    short-window energy before transcription.  The gate intentionally uses only a
+    small fraction of the endpoint threshold and caps its duration requirement to
+    preserve quiet speech and short words.
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - checked by doctor
+        raise AudioError("numpy is required for audio") from exc
+
+    array = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if array.size == 0 or sample_rate <= 0:
+        return False
+
+    frame_size = max(1, int(round(sample_rate * 0.02)))
+    # The endpoint threshold is tuned for deciding when an utterance starts, which
+    # is too strict for a post-marker fragment.  Five percent still separates the
+    # observed near-zero padding from genuinely quiet microphone speech.
+    frame_threshold = max(float(energy_threshold) * 0.05, 1e-5)
+    required_seconds = min(max(float(min_speech_seconds), 0.0), 0.06)
+    required_frames = max(1, math.ceil(required_seconds * sample_rate / frame_size))
+    active_frames = 0
+    for start in range(0, int(array.size), frame_size):
+        frame = array[start : start + frame_size]
+        if rms(frame) < frame_threshold:
+            continue
+        active_frames += 1
+        if active_frames >= required_frames:
+            return True
+    return False
+
+
 class MicrophoneSource:
     """A bounded, in-memory microphone stream. It never writes audio to disk."""
 
@@ -175,12 +217,19 @@ class VoskWakeDetector:
         self.last_detection: PhraseDetection | None = None
         grammar_items: list[str] = []
         seen_grammar: set[str] = set()
+        seen_compact_grammar: set[str] = set()
         for raw_phrase in [*(grammar or ()), *phrases]:
             phrase = str(raw_phrase).strip()
             key = phrase.casefold()
-            if phrase and key not in seen_grammar:
+            compact_key = compact_text(phrase).casefold()
+            if (
+                phrase
+                and key not in seen_grammar
+                and compact_key not in seen_compact_grammar
+            ):
                 grammar_items.append(phrase)
                 seen_grammar.add(key)
+                seen_compact_grammar.add(compact_key)
         grammar_json = json.dumps([*grammar_items, "[unk]"], ensure_ascii=False)
         self._recognizer = vosk.KaldiRecognizer(
             vosk.Model(str(model_path)), sample_rate, grammar_json
@@ -563,23 +612,62 @@ class SenseVoiceTranscriber(Transcriber):
 
 
 class FasterWhisperTranscriber(Transcriber):
-    def __init__(self, model: str, *, device: str = "auto", compute_type: str = "auto") -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        device: str = "auto",
+        compute_type: str = "auto",
+        language: str | None = "zh",
+        beam_size: int = 5,
+        initial_prompt: str | None = None,
+        hotwords: str | None = None,
+    ) -> None:
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:
             raise AudioError("Install HandsFreePC with the whisper extra") from exc
         self._model = WhisperModel(model, device=device, compute_type=compute_type)
+        normalized_language = str(language or "").strip().lower()
+        self._language = None if normalized_language in {"", "auto", "none"} else language
+        self._beam_size = beam_size
+        self._initial_prompt = initial_prompt or None
+        self._hotwords = hotwords or None
 
     def transcribe(self, samples: Any, sample_rate: int) -> str:
         del sample_rate  # faster-whisper accepts 16 kHz float arrays directly.
         segments, _ = self._model.transcribe(
             samples,
-            language="zh",
-            beam_size=5,
+            language=self._language,
+            beam_size=self._beam_size,
             vad_filter=False,
             condition_on_previous_text=False,
+            initial_prompt=self._initial_prompt,
+            hotwords=self._hotwords,
         )
         return "".join(segment.text for segment in segments).strip()
+
+
+def _whisper_text_option(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        text = " ".join(str(item).strip() for item in value if str(item).strip())
+    else:
+        text = str(value).strip()
+    return text or None
+
+
+def _build_faster_whisper(options: dict[str, Any]) -> FasterWhisperTranscriber:
+    return FasterWhisperTranscriber(
+        str(options.get("model", "large-v3-turbo")),
+        device=str(options.get("device", "auto")),
+        compute_type=str(options.get("compute_type", "auto")),
+        language=options.get("language", "zh"),
+        beam_size=int(options.get("beam_size", 5)),
+        initial_prompt=_whisper_text_option(options.get("initial_prompt")),
+        hotwords=_whisper_text_option(options.get("hotwords")),
+    )
 
 
 class FallbackTranscriber(Transcriber):
@@ -611,11 +699,7 @@ def build_transcriber(settings: SpeechSettings, *, base_dir: Path) -> Transcribe
             provider=str(command.get("provider", "cpu")),
         )
     elif backend == "faster-whisper":
-        primary = FasterWhisperTranscriber(
-            str(command.get("model", "large-v3-turbo")),
-            device=str(command.get("device", "auto")),
-            compute_type=str(command.get("compute_type", "auto")),
-        )
+        primary = _build_faster_whisper(command)
     else:
         raise AudioError(f"Unsupported command ASR backend: {backend}")
 
@@ -624,11 +708,7 @@ def build_transcriber(settings: SpeechSettings, *, base_dir: Path) -> Transcribe
         return primary
     return FallbackTranscriber(
         primary,
-        lambda: FasterWhisperTranscriber(
-            str(fallback.get("model", "large-v3-turbo")),
-            device=str(fallback.get("device", "auto")),
-            compute_type=str(fallback.get("compute_type", "auto")),
-        ),
+        lambda: _build_faster_whisper(fallback),
     )
 
 
@@ -703,6 +783,7 @@ class LocalSpeechSession:
         self.last_marker_phrase: str | None = None
         self.last_marker_events: tuple[PhraseDetection, ...] = ()
         self.last_marker_audio_segments: tuple[Any, ...] = ()
+        self.last_marker_segment_transcribed: tuple[bool, ...] = ()
 
     def __enter__(self) -> LocalSpeechSession:
         self.source.__enter__()
@@ -746,6 +827,7 @@ class LocalSpeechSession:
         self.last_marker_phrase = None
         self.last_marker_events = ()
         self.last_marker_audio_segments = ()
+        self.last_marker_segment_transcribed = ()
         marker_detector = getattr(self, "marker", None)
         if markers and marker_detector is None:
             raise AudioError("Prompt delimiter detector is not initialized")
@@ -861,10 +943,19 @@ class LocalSpeechSession:
     def transcribe_marked_segments(self) -> list[str]:
         if not self.last_marker_events:
             raise AudioError("No prompt delimiter boundary is available")
-        return [
-            self.transcribe(samples) if int(getattr(samples, "size", len(samples))) else ""
-            for samples in self.last_marker_audio_segments
-        ]
+        transcripts: list[str] = []
+        transcribed: list[bool] = []
+        for samples in self.last_marker_audio_segments:
+            has_energy = has_transcribable_energy(
+                samples,
+                sample_rate=self.settings.sample_rate,
+                energy_threshold=self.settings.energy_threshold,
+                min_speech_seconds=self.settings.min_speech_seconds,
+            )
+            transcripts.append(self.transcribe(samples) if has_energy else "")
+            transcribed.append(has_energy)
+        self.last_marker_segment_transcribed = tuple(transcribed)
+        return transcripts
 
     def reset_control_detector(self) -> None:
         self.wake.reset()

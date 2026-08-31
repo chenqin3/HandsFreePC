@@ -373,6 +373,144 @@ def test_continuous_microphone_routes_post_marker_audio_to_next_prompt(
         runtime.stop()
 
 
+def test_opted_in_runtime_records_every_sample_bound_asr_segment(
+    settings,
+    monkeypatch,
+) -> None:
+    enable_computer_control(settings)
+    settings.privacy.save_transcripts = True
+    saved = []
+
+    class Journal:
+        def record(self, **kwargs):
+            saved.append(kwargs)
+
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=FakeController(),
+        transcript_journal=Journal(),
+    )
+    runtime.handle_session_text("开始语音操作")
+
+    class Speech:
+        last_marker_phrase = "over"
+        last_marker_events = (PhraseDetection("over", 1600, 3200),)
+        last_marker_segment_transcribed = (True, False)
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def listen_utterance(self, **_kwargs):
+            return object()
+
+        def transcribe_marked_segments(self):
+            runtime.stop_event.set()
+            return ["  打开 Claude  ", ""]
+
+    monkeypatch.setattr(runtime_module, "LocalSpeechSession", Speech)
+    try:
+        runtime._run_continuous_microphone()
+    finally:
+        runtime.stop()
+
+    assert [entry["source"] for entry in saved] == ["marker_segment", "marker_segment"]
+    assert [entry["text"] for entry in saved] == ["  打开 Claude  ", ""]
+    assert [entry["segment_index"] for entry in saved] == [0, 1]
+    assert all(entry["segment_count"] == 2 for entry in saved)
+    assert all(entry["session_id"] for entry in saved)
+    assert [entry["transcribed"] for entry in saved] == [True, False]
+    assert saved[0]["skip_reason"] is None
+    assert saved[1]["skip_reason"] == "silence_energy_gate"
+
+
+def test_opted_in_runtime_records_wake_and_command_asr_returns(settings, monkeypatch) -> None:
+    enable_computer_control(settings)
+    settings.privacy.save_transcripts = True
+    saved = []
+
+    class Journal:
+        def record(self, **kwargs):
+            saved.append(kwargs)
+
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=FakeController(),
+        transcript_journal=Journal(),
+    )
+
+    class Speech:
+        class Source:
+            @staticmethod
+            def drain():
+                pass
+
+        source = Source()
+        last_marker_phrase = None
+        last_marker_events = ()
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def wait_for_phrase(self, **_kwargs):
+            return "开始语音操作", object()
+
+        def listen_utterance(self, **_kwargs):
+            return object()
+
+        def transcribe(self, _audio):
+            if runtime.session_state == SessionState.ARMED:
+                return "  开始语音操作  "
+            runtime.stop_event.set()
+            return "  切换到 Claude，打开 Chat and Cowork  "
+
+    monkeypatch.setattr(runtime_module, "LocalSpeechSession", Speech)
+    try:
+        runtime._run_continuous_microphone()
+    finally:
+        runtime.stop()
+
+    assert [entry["source"] for entry in saved] == [
+        "wake_utterance",
+        "command_utterance",
+    ]
+    assert [entry["text"] for entry in saved] == [
+        "  开始语音操作  ",
+        "  切换到 Claude，打开 Chat and Cowork  ",
+    ]
+    assert saved[0]["session_id"] is None
+    assert saved[1]["session_id"]
+
+
+def test_transcript_journal_is_not_constructed_without_opt_in(settings, monkeypatch) -> None:
+    settings.privacy.save_transcripts = False
+
+    def forbidden_journal():
+        raise AssertionError("transcript journal must remain disabled")
+
+    monkeypatch.setattr(runtime_module, "TranscriptJournal", forbidden_journal)
+    runtime = VoiceRuntime(settings, FakeExecutor(), feedback=FakeFeedback())
+    try:
+        assert runtime.transcript_journal is None
+    finally:
+        runtime.stop()
+
+
 def test_runtime_continue_policy_keeps_later_voice_command_moving(settings) -> None:
     enable_computer_control(settings)
     settings.computer_control.failure_policy = "continue"
