@@ -187,13 +187,56 @@ def test_claude_command_explicitly_disables_all_tools_and_session_persistence(mo
     assert args[args.index("--permission-mode") + 1] == "dontAsk"
     assert args[args.index("--tools") + 1] == ""
     assert args[args.index("--disallowedTools") + 1] == "mcp__*"
-    assert args[args.index("--max-turns") + 1] == "1"
+    # Claude implements --json-schema through an internal structured-output
+    # tool. Capping max turns at one terminates that protocol before the JSON
+    # result is returned, even though every external tool is disabled.
+    assert "--max-turns" not in args
     assert args[args.index("--output-format") + 1] == "json"
     system_prompt = args[args.index("--system-prompt") + 1]
     data_prompt = json.loads(process.inputs[0])
     assert "打开 Chat" not in system_prompt
     assert data_prompt["user_authored_task"] == "打开 Chat"
     assert data_prompt["observation"]["app"] == "claude"
+
+
+def test_personal_trusted_planner_policy_allows_only_safe_navigation_bridges(monkeypatch):
+    popen = RecordingPopen(_decision_payload(), claude=True)
+    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "claude-test.exe")
+    planner = ClaudeDesktopStepPlanner(
+        executable="claude",
+        model=None,
+        timeout_seconds=1,
+        safety_profile="personal_trusted",
+        popen_factory=popen,
+    )
+
+    planner.decide(
+        "打开旧对话",
+        apps="claude",
+        observation=_observation(),
+        history=(),
+    )
+
+    args = popen.processes[0].args
+    system_prompt = args[args.index("--system-prompt") + 1]
+    assert "ordinary enabled navigation control" in system_prompt
+    assert "necessary intermediate" in system_prompt
+    assert "Send, Submit, Delete, Upload, Install" in system_prompt
+    assert "does not authorize invented content" in system_prompt
+    assert "Strict navigation mode is enabled" not in system_prompt
+    assert "explicitly named in\nuser_authored_task" not in system_prompt
+
+
+def test_strict_and_personal_navigation_policies_are_mutually_exclusive():
+    strict = step_planner._planner_policy("strict")
+    personal = step_planner._planner_policy("personal_trusted")
+
+    assert "Strict navigation mode is enabled" in strict
+    assert "Never invent or infer an intermediate navigation target" in strict
+    assert "Personal-trusted local navigation mode is enabled" not in strict
+    assert "Personal-trusted local navigation mode is enabled" in personal
+    assert "This paragraph replaces the strict navigation\nrule" in personal
+    assert "Strict navigation mode is enabled" not in personal
 
 
 def test_desktop_step_schema_avoids_top_level_combinators_rejected_by_claude_cli():

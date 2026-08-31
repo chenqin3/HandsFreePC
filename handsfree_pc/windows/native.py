@@ -401,7 +401,7 @@ class NativeWindows:
         return result
 
     def get_foreground_window_info(self) -> WindowInfo | None:
-        hwnd = int(self.user32.GetForegroundWindow())
+        hwnd = int(self.user32.GetForegroundWindow() or 0)
         if not hwnd:
             return None
         for window in self.enumerate_windows():
@@ -410,10 +410,11 @@ class NativeWindows:
         return WindowInfo(hwnd=hwnd, title="", process_id=0, process_name=None)
 
     def is_foreground(self, hwnd: int) -> bool:
-        return bool(hwnd) and int(self.user32.GetForegroundWindow()) == int(hwnd)
+        actual = int(self.user32.GetForegroundWindow() or 0)
+        return bool(hwnd) and actual == int(hwnd)
 
     def assert_foreground(self, hwnd: int) -> None:
-        actual = int(self.user32.GetForegroundWindow())
+        actual = int(self.user32.GetForegroundWindow() or 0)
         if not hwnd or actual != int(hwnd):
             raise WindowActivationError(
                 f"Refusing input because foreground window is {actual}, expected {int(hwnd)}"
@@ -453,7 +454,7 @@ class NativeWindows:
         # before trying to join the foreground input queue.
         message = wintypes.MSG()
         self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, PM_NOREMOVE)
-        foreground_hwnd = int(self.user32.GetForegroundWindow())
+        foreground_hwnd = int(self.user32.GetForegroundWindow() or 0)
         current_thread = int(self.kernel32.GetCurrentThreadId())
         foreground_thread = (
             int(self.user32.GetWindowThreadProcessId(foreground_hwnd, None))
@@ -477,7 +478,8 @@ class NativeWindows:
                     continue
                 error = ctypes.get_last_error()
                 foreground_is_unchanged = (
-                    not foreground_hwnd or int(self.user32.GetForegroundWindow()) == foreground_hwnd
+                    not foreground_hwnd
+                    or int(self.user32.GetForegroundWindow() or 0) == foreground_hwnd
                 )
                 if error == ERROR_ACCESS_DENIED and foreground_is_unchanged:
                     raise ForegroundIntegrityBoundary(

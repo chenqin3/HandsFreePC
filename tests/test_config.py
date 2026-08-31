@@ -30,6 +30,31 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.apps["codex"].mode_names["chat"] == ["Chat"]
     assert settings.apps["claude"].mode_names["chat"] == ["Chat and Cowork", "Chat"]
     assert settings.apps["claude"].mode_names["design"] == ["Design"]
+    assert settings.apps["codex"].include_control_types == [
+        "Button",
+        "TabItem",
+        "MenuItem",
+        "ListItem",
+        "TreeItem",
+        "Edit",
+        "ComboBox",
+        "CheckBox",
+        "RadioButton",
+        "Dialog",
+        "Window",
+    ]
+    assert settings.apps["claude"].content_control_types == [
+        "Text",
+        "Document",
+        "Pane",
+        "Group",
+    ]
+    assert settings.apps["claude"].drop_long_content is True
+    assert settings.apps["claude"].max_control_name_chars == 500
+    assert settings.apps["claude"].max_content_chars == 1000
+    assert settings.apps["claude"].max_content_nodes == 80
+    assert "Prompt" in settings.apps["codex"].composer_names
+    assert "Ask Claude" in settings.apps["claude"].composer_names
 
 
 def test_cloud_planner_requires_explicit_privacy_opt_in(tmp_path: Path) -> None:
@@ -237,6 +262,47 @@ def test_phrase_fields_must_be_yaml_string_lists(tmp_path: Path, content: str) -
     config.write_text(content, encoding="utf-8")
 
     with pytest.raises(ValueError, match="must be a YAML list of strings"):
+        load_settings(config)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (
+            "apps:\n  codex:\n    include_control_types: Button\n",
+            "include_control_types must be a YAML list",
+        ),
+        (
+            "apps:\n  claude:\n    composer_names: ['']\n",
+            "composer_names must be a YAML list of non-empty strings",
+        ),
+        (
+            'apps:\n  codex:\n    drop_long_content: "true"\n',
+            "drop_long_content must be a YAML boolean",
+        ),
+        (
+            "apps:\n  codex:\n    max_control_name_chars: 0\n",
+            "max_control_name_chars must be between 1 and 1024",
+        ),
+        (
+            "apps:\n  codex:\n    max_content_chars: 16001\n",
+            "max_content_chars must be between 1 and 16000",
+        ),
+        (
+            "apps:\n  codex:\n    max_content_nodes: -1\n",
+            "max_content_nodes must be between 0 and 2000",
+        ),
+    ],
+)
+def test_app_observation_profiles_are_strictly_validated(
+    tmp_path: Path,
+    content: str,
+    expected: str,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=expected):
         load_settings(config)
 
 

@@ -77,10 +77,10 @@ HandsFreePC 当前处于 alpha：
 - 旧 `legacy_codex_cli` 还必须另设 `allow_legacy_codex_computer_use: true`；它没有 0.3 本地动作 verifier，不得作为新部署的可信完成路径。
 - 普通 `doctor` 不运行提供商认证检查；只有理解其可能联网并会显示诊断路径后，才使用 `doctor --check-planner-auth`，分享输出前先脱敏。
 - 每次 Codex/Claude/Windows 更新后先运行 dry-run 和 live smoke test，再允许听写或发送。
-- 通用任务只授权用户原句中肯定且唯一明确指定的一个应用。每个通用 planner 动作都必须有可本地检查的后置条件，并验证 false-before/true-after；无法建立这一证据时停止。确定性 native skill 使用动作特定证据，精确状态已成立时可幂等成功。
-- 所有通用 `type_text`/`set_value` 都要等待随机四位一次性口令；静态“确认执行”不授权。随机码不能替代说话人识别或人工看屏幕，旁人、扬声器和实时转述/重放仍可能捕获本轮口令。
+- `strict` 要求每条通用任务在原句中肯定且唯一明确指定一个应用；`personal_trusted` 仅可在同一控制器会话内沿用上一条已 fresh-verified 的应用/窗口。每个通用 planner 动作都必须有可本地检查的后置条件，并验证 false-before/true-after；无法建立这一证据时停止。确定性 native skill 使用动作特定证据，精确状态已成立时可幂等成功。
+- `strict` 的通用 `type_text`/`set_value` 要等待随机四位一次性口令；`personal_trusted` 只免确认写入本句完整口述的未发送草稿到唯一聚焦非密码输入框。发送及其他副作用仍需确认，静态“确认执行”不授权。随机码不能替代说话人识别或人工看屏幕，旁人、扬声器和实时转述/重放仍可能捕获本轮口令。
 - 四位码只保证当前 `VoiceRuntime` 进程运行期内不再签发；取消、超时和成功使用都不回收，有界重抽耗尽时必须拒绝。去重集合不持久化，重启后不保证绝对不复用，四位码不是持久化防重放凭证。
-- 点击/按键 surface 的发送、删除、安装、上传/分享、关闭等确认依赖已识别的本地词形和上下文，不是完整语义分类器；未知语言、同义词、自绘控件或伪装文案可能漏分，重要副作用必须人工监督。已识别的认证、凭据、付款、隐私/公开链接、终端和 OS 安全 surface 则 fail closed。
+- 点击/按键 surface 的发送、删除、安装、上传/分享、关闭等确认依赖已识别的本地词形和上下文，不是完整语义分类器；未知语言、同义词、自绘控件或伪装文案可能漏分，重要副作用必须人工监督。认证、密码属性、聚焦 secret/API-key 输入、付款、UAC 和 OS 安全 surface 仍 fail closed；聊天/文档内容里仅出现这些词或示例凭据不会阻断无关安全导航，且内容节点不会发送给 planner。
 - 通用 UI confirmation 摘要只可原文回显用户原句中已验证的 exact target label；未授权 sibling/window label 的原文和语义只在本地完整快照中分类，不进入摘要，摘要里的短 digest 仅作不可逆绑定元数据。
 - 旧单句确认绑定完整 plan/source 的规范深快照，不与返回给调用方的可变 `Action` 共享引用；已解析路径还绑定规范绝对路径和 stat 身份，普通文件再绑定 SHA-256。确认时必须 re-prepare、重新 safety、重建独占执行快照并重新 binding；安全目录无需确认时，runtime 和 deterministic native router 也必须执行 safety 前后双 binding。Windows 路径在最后绑定到执行/后置检查期间拒绝并发写入或删除共享，任一变化即取消。
 - 确认遮罩不抢焦点；测试通知弹窗、窗口切换、锁屏、UAC、管理员 Notepad 和密码框。

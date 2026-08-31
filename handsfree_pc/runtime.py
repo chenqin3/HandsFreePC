@@ -16,6 +16,7 @@ from typing import Any
 from .audio import AudioError, ControlPhraseDetected, FeedbackPending, LocalSpeechSession
 from .computer_control import Controller
 from .config import Settings
+from .diagnostics import classify_control_failure, stage_display_name
 from .feedback import FeedbackController
 from .intents import DeterministicIntentParser
 from .models import (
@@ -108,6 +109,7 @@ class VoiceRuntime:
         controller: Controller | None = None,
         controller_factory: Callable[[], Controller] | None = None,
         confirmation_challenge_factory: Callable[[], str] | None = None,
+        diagnostics: Any | None = None,
     ) -> None:
         self.settings = settings
         self.executor = executor
@@ -144,6 +146,7 @@ class VoiceRuntime:
         self._confirmation_challenge_factory = (
             confirmation_challenge_factory or _new_confirmation_code
         )
+        self.diagnostics = diagnostics
         self._confirmation_challenge_lock = threading.Lock()
         self._issued_confirmation_challenges: set[str] = set()
         self.command_worker: CommandWorker | None = None
@@ -250,6 +253,7 @@ class VoiceRuntime:
         kind: str,
         duration: float = 4.0,
         allow_voice: bool = True,
+        voice_text: str | None = None,
     ) -> bool:
         # Overlay feedback is immediate. Spoken feedback is deferred until the microphone thread
         # reaches an utterance boundary, so SAPI can never start halfway through user speech.
@@ -262,11 +266,47 @@ class VoiceRuntime:
         )
         if allow_voice and self.feedback.mode in {FeedbackMode.VOICE, FeedbackMode.BOTH}:
             with self._voice_feedback_lock:
-                entry = (kind, text)
+                entry = (kind, voice_text if voice_text is not None else text)
                 if not self._voice_feedback or self._voice_feedback[-1] != entry:
                     self._voice_feedback.append(entry)
                 self._voice_feedback_event.set()
         return displayed is not False
+
+    def _record_diagnostic(
+        self,
+        *,
+        stage: str,
+        error_code: str,
+        safe_message: str,
+        level: str = "error",
+        session_id: str | None = None,
+        command_id: str | None = None,
+        sequence: int | None = None,
+        exception_type: object = None,
+        app: str | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if self.diagnostics is None:
+            return
+        with suppress(Exception):
+            event_fields: dict[str, object] = {
+                "stage": stage,
+                "error_code": error_code,
+                "safe_message": safe_message,
+                "level": level,
+            }
+            optional_fields = {
+                "session_id": session_id,
+                "command_id": command_id,
+                "sequence": sequence,
+                "exception_type": exception_type,
+                "app": app,
+                "generation": generation,
+            }
+            event_fields.update(
+                {key: value for key, value in optional_fields.items() if value is not None}
+            )
+            self.diagnostics.event(**event_fields)
 
     def _clear_voice_feedback(self) -> None:
         with self._voice_feedback_lock:
@@ -646,6 +686,12 @@ class VoiceRuntime:
             message=result.message,
             cancelled=result.cancelled,
             error_type="NeedsConfirmation" if needs_confirmation else None,
+            stage=getattr(result, "stage", None),
+            error_code=getattr(result, "error_code", None),
+            safe_message=getattr(result, "safe_message", None),
+            exception_type=getattr(result, "exception_type", None),
+            app=getattr(result, "app", None),
+            generation=getattr(result, "generation", None),
             started_at=started_at,
         )
 
@@ -673,10 +719,34 @@ class VoiceRuntime:
                 if self.feedback.mode != FeedbackMode.VOICE and displayed:
                     self._mark_pending_controller_confirmation_announced(detail)
             else:
+                status = classify_control_failure(
+                    outcome.message,
+                    error_type=outcome.error_type,
+                    stage=outcome.stage,
+                    error_code=outcome.error_code,
+                    safe_message=outcome.safe_message,
+                )
+                self._record_diagnostic(
+                    stage=status.stage,
+                    error_code=status.error_code,
+                    safe_message=status.safe_message,
+                    session_id=outcome.command.session_id,
+                    command_id=outcome.command.command_id,
+                    sequence=sequence,
+                    exception_type=outcome.exception_type or outcome.error_type,
+                    app=outcome.app,
+                    generation=outcome.generation,
+                )
+                stage_name = stage_display_name(status.stage)
                 self._emit_continuous(
-                    f"第 {sequence} 条失败，队列已暂停。说继续队列或取消所有操作。",
+                    f"第 {sequence} 条失败\n"
+                    f"[{status.stage} / {status.error_code}]\n"
+                    f"{status.safe_message}\n"
+                    "日志：handsfreepc.jsonl\n"
+                    "队列已暂停。说继续队列或取消所有操作。",
                     kind="error",
                     duration=0,
+                    voice_text=f"第 {sequence} 条在{stage_name}阶段失败，队列已暂停",
                 )
         if outcome.success:
             self._finish_draining_if_idle()
@@ -1455,9 +1525,23 @@ class VoiceRuntime:
                     continue
                 except AudioError as exc:
                     if "No complete utterance detected" not in str(exc):
+                        self._record_diagnostic(
+                            stage="runtime",
+                            error_code="AUDIO_INPUT_FAILED",
+                            safe_message="本地音频输入或语音分段未能完成",
+                            session_id=self._voice_session_id,
+                            exception_type=exc,
+                        )
                         self._emit_continuous(str(exc), kind="error")
                     time.sleep(0.1)
-                except Exception:
+                except Exception as exc:
+                    self._record_diagnostic(
+                        stage="runtime",
+                        error_code="CONTINUOUS_VOICE_PROCESSING_FAILED",
+                        safe_message="持续语音处理发生内部错误并已暂停",
+                        session_id=self._voice_session_id,
+                        exception_type=exc,
+                    )
                     with suppress(Exception):
                         speech.source.drain()
                     self._set_session_state(SessionState.PAUSED)
@@ -1538,9 +1622,21 @@ class VoiceRuntime:
                     self.handle_text(exc.phrase, require_wake=False)
                 except AudioError as exc:
                     if self._expire_timeouts() is None:
+                        self._record_diagnostic(
+                            stage="runtime",
+                            error_code="AUDIO_INPUT_FAILED",
+                            safe_message="本地音频输入或语音分段未能完成",
+                            exception_type=exc,
+                        )
                         self.feedback.emit(str(exc), kind="error")
                     time.sleep(0.25)
-                except Exception:
+                except Exception as exc:
+                    self._record_diagnostic(
+                        stage="runtime",
+                        error_code="VOICE_PROCESSING_FAILED",
+                        safe_message="本地语音处理发生内部错误并已恢复监听",
+                        exception_type=exc,
+                    )
                     if self.state != RuntimeState.PAUSED:
                         self.state = RuntimeState.ARMED
                         self._clear_plan_confirmation(invalidate=True)

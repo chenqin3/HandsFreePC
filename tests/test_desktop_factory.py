@@ -38,6 +38,16 @@ def test_factory_can_choose_claude_as_step_planner(tmp_path):
     assert isinstance(controller.planner, ClaudeDesktopStepPlanner)
 
 
+def test_factory_propagates_personal_trusted_profile_to_step_planner(tmp_path):
+    settings = _settings(tmp_path)
+    settings.computer_control.safety_profile = "personal_trusted"
+
+    controller = build_computer_controller(settings, FakeExecutor())
+
+    assert isinstance(controller.planner, ClaudeDesktopStepPlanner)
+    assert controller.planner.safety_profile == "personal_trusted"
+
+
 def test_legacy_codex_controller_is_only_selected_explicitly(tmp_path):
     settings = _settings(tmp_path)
     settings.computer_control.backend = "legacy_codex_cli"

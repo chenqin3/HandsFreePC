@@ -91,6 +91,8 @@ computer_control:
   # claude is the default strict planner. Other accepted values are
   # codex_cli_best_effort (requires separate host-read consent) and none.
   planner_backend: claude
+  # Public default. Use personal_trusted only on a private, supervised machine.
+  safety_profile: strict
   allow_screen_context_to_cloud: false
   # Codex subscription CLI has no complete no-tools mode. This separate consent
   # is required for any enabled Codex CLI planner or legacy Codex controller.
@@ -151,6 +153,32 @@ apps:
     mode_names:
       chat: ["Chat"]
       code: ["Code"]
+    # Keep the semantic control plane small. Text/Document/Pane/Group are
+    # observed separately as non-clickable content for local freshness only.
+    include_control_types:
+      - "Button"
+      - "TabItem"
+      - "MenuItem"
+      - "ListItem"
+      - "TreeItem"
+      - "Edit"
+      - "ComboBox"
+      - "CheckBox"
+      - "RadioButton"
+      - "Dialog"
+      - "Window"
+    content_control_types: ["Text", "Document", "Pane", "Group"]
+    drop_long_content: true
+    max_control_name_chars: 500
+    max_content_chars: 1000
+    max_content_nodes: 80
+    composer_names:
+      - "Prompt"
+      - "Message"
+      - "Ask anything"
+      - "Type a message"
+      - "输入消息"
+      - "输入提示词"
   claude:
     process_names: ["claude.exe"]
     executable: null
@@ -163,3 +191,27 @@ apps:
       cowork: ["Chat and Cowork", "Cowork"]
       code: ["Code"]
       design: ["Design"]
+    include_control_types:
+      - "Button"
+      - "TabItem"
+      - "MenuItem"
+      - "ListItem"
+      - "TreeItem"
+      - "Edit"
+      - "ComboBox"
+      - "CheckBox"
+      - "RadioButton"
+      - "Dialog"
+      - "Window"
+    content_control_types: ["Text", "Document", "Pane", "Group"]
+    drop_long_content: true
+    max_control_name_chars: 500
+    max_content_chars: 1000
+    max_content_nodes: 80
+    composer_names:
+      - "Prompt"
+      - "Message"
+      - "Ask Claude"
+      - "Type a message"
+      - "输入消息"
+      - "询问 Claude"

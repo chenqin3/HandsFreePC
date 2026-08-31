@@ -108,6 +108,12 @@ class ComputerControlResult:
     returncode: int | None = None
     needs_confirmation: bool = False
     confirmation_id: str | None = None
+    stage: str | None = None
+    error_code: str | None = None
+    safe_message: str | None = None
+    exception_type: str | None = None
+    app: str | None = None
+    generation: int | None = None
 
 
 @runtime_checkable

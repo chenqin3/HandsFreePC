@@ -5,6 +5,7 @@ import json
 import pytest
 
 from handsfree_pc.desktop.protocol import (
+    BoundedUiText,
     DesktopAction,
     DesktopActionType,
     DesktopDecision,
@@ -13,6 +14,16 @@ from handsfree_pc.desktop.protocol import (
     DesktopExpectationKind,
     DesktopObservation,
 )
+
+
+@pytest.mark.parametrize("maximum", [1, 2, 3, 30, 80])
+def test_bounded_ui_text_never_exceeds_the_requested_maximum(maximum: int) -> None:
+    bounded = BoundedUiText.from_text("abcdef" * 100, maximum=maximum)
+
+    assert bounded.truncated is True
+    assert len(bounded.display) <= maximum
+    assert bounded.original_length == 600
+    assert len(bounded.sha256) == 64
 
 
 def _observation(*, app: str = "claude", generation: int = 7) -> DesktopObservation:
@@ -206,6 +217,7 @@ def test_automation_id_stays_local_but_remains_part_of_freshness_fingerprint():
     context = first.planner_context(max_chars=4000)
 
     assert "automation_id" not in context["elements"][0]
+    assert "local_identity" not in context["elements"][0]
     assert first.fingerprint != second.fingerprint
 
 

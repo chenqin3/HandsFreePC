@@ -93,9 +93,9 @@ KWS hit(t)
 
 动作集合只有 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。0.3 planner Schema 不含任意 shell、PowerShell、脚本、文件系统 API 或坐标字段。
 
-进入 planner 前，agent loop 会从用户原句中提取肯定、明确命名的已配置应用，并且要求结果恰好为一个。零个、多个、仅在否定句中出现或只是说明性顺带提及时都失败关闭；planner 不能自行把任务扩展到第二个应用。
+进入 planner 前，agent loop 会从用户原句中提取肯定、明确命名的已配置应用。`strict` 要求每条任务恰好命名一个应用；`personal_trusted` 可在同一控制器会话内沿用上一条已经本地验证成功的应用/窗口，但沿用前必须 fresh observe 并核对应用与窗口身份。新控制器、窗口变化、零个可验证上下文、多个应用、否定提及或说明性顺带提及时均失败关闭；planner 不能自行把任务扩展到第二个应用。
 
-规划上下文包括用户任务、唯一明确授权的可见应用摘要、task-authorized observation generation、最多 8 条本地已验收历史，以及由本地策略重建的 UI 子集：只有本句肯定且精确点名的控件及 index/control type/selected/focused/enabled 状态。原始窗口标题、进程 ID、未点名元素、automation ID、value、聊天正文、截图字节和真实截图可用性不进入 planner；完整 observation 只在本地做 freshness、动作重绑定与 after-state 验收。UI 子集仍被标记为 data，不能成为新指令。
+规划上下文包括用户任务、唯一明确授权的可见应用摘要、task-authorized observation generation、最多 8 条本地已验收历史，以及由本地策略重建的 UI 子集。`strict` 只包含本句肯定且精确点名的可寻址控件；`personal_trusted` 还可包含已授权应用内的安全导航控件与当前输入框。两者都只发送 index/control type/selected/focused/enabled 等最小状态；`CONTENT` plane 永不进入 planner。原始窗口标题、进程 ID、automation ID、value、聊天正文、截图字节和真实截图可用性不进入 planner；完整 observation 只在本地做 freshness、动作重绑定与 after-state 验收。UI 子集仍被标记为 data，不能成为新指令。
 
 ### Claude adapter（默认）
 
@@ -119,7 +119,8 @@ Codex 每一步使用 ephemeral 临时目录、忽略用户配置和规则、结
 - observation 为不可变快照，元素 index 绑定 `app + HWND + generation`；
 - 一次动作后必须重新 observe，旧 index 失效；
 - 密码元素值永不进入 observation，也不能被执行器操作；
-- planner-facing observation 只保留任务精确点名的元素；本地原始 observation 与其 fingerprint 不被该最小化替代；
+- UIA 元素先分为 `CONTROL`、`INPUT`、`CONTENT`、`DIALOG`；Claude/Codex profile 优先保留可操作控件，长内容节点只保留本地有界摘要/digest 或省略；单个属性读取失败和元素超限不会拖垮整个 observation；
+- planner-facing observation 按 safety profile 保留精确点名控件或安全导航控件，但永不包含 `CONTENT`；本地原始 observation 与其 fingerprint 不被该最小化替代；
 - click 是 UIA `invoke/select/toggle` 或已绑定元素的一次左键 activation，不接受纯坐标；
 - 输入优先 UIA value pattern，或对唯一焦点元素使用 Unicode `SendInput`；不使用剪贴板；
 - secondary action 只允许固定集合；drag 和坐标 click 默认关闭。
@@ -168,11 +169,11 @@ NativeSkillRouter
 
 ## 本地安全策略与 typed confirmation
 
-在把 task-authorized 子集发送给云 planner **之前**，本地策略先在完整快照上用已知词形和元素属性识别认证、UAC/Windows Security、password、terminal/shell、凭据、付款、隐私与公开链接 surface；命中即 fail closed。未点名的敏感旁支虽然不会进入子集，仍参与本地整步分类。每个 planner action 在执行前还会再次针对完整快照分类。
+在把 task-authorized 子集发送给云 planner **之前**，本地策略把三类判断分开：planner 数据最小化、当前敏感 surface 分类、具体动作风险。聊天正文等 `CONTENT` plane 即使讨论 password、terminal、payment 或示例 token，也不会把整个窗口判成敏感 surface，并且不会进入 planner。私钥头、已知服务 key、结构有效 JWT、明确 Bearer 等高置信度凭据会被删除/脱敏；普通 40--512 字符不透明标识只记为低置信度并从 planner view 排除，绝不单独阻断整窗。真正的密码属性、当前聚焦的 secret/API-key 输入框、认证/UAC/Windows Security/付款顶层界面仍 fail closed。每个 planner action 在执行前都会对目标元素和 fresh snapshot 重新分类。
 
 本地有限语法还要求 planner 动作与用户下一步逐字段一致：动作类型、完整目标边界、完整口述输入 payload、按键、单次左键、secondary `invoke`、滚动方向和显式页数都不能由 outcome 文本、后续文本动词的 payload、口述文本子串或较长标签的短前缀借出授权。`type/input/输入/键入` 只匹配 `type_text`，`fill/write/填写/写入` 只匹配 `set_value`；文本动作后若还有 payload 外的独立非空肯定 clause，payload-presence 特例整体关闭，必须验证真正的用户结果；明确否定的“不发送”等 side clause 不会被误当成结果。尚未实现本地条件求值的 `if/when/unless` 等条件命令整体 fail closed；不支持的 drag/hover/move/resize/double-click/right-click/download/copy/rename 等尾随动作仍计入用户步骤，不能被 planner 提前 `DONE` 隐去。同目标 `ELEMENT_SELECTED` 只可证明用户明确说出的 select/choose/switch；open/click/send/delete/close 等需要用户原句中独立、可观察的结果条件。
 
-通用 `type_text`/`set_value` 一律需要确认；点击/按键上下文命中本地已知的发送、提交、删除、安装、上传、共享、关闭等词形时也要求确认。后一个词表不是完整语义证明，未知语言/同义词、自绘控件或伪装文案可能漏分，重要副作用必须人工监督。需要确认的动作会产生由动作类型、应用、参数、包含本地 HWND identity 的 observation fingerprint 和 expectation 绑定的 ID。generation 在确认前 fresh observe 后重新绑定，不直接进入 digest。runtime 另外生成随机四位挑战码并提示“确认执行 4 8 2 7”这类一次性口令；只说静态“确认执行”永远不授权，也不会重新让模型解释确认意图。
+公开默认 `strict` 对通用 `type_text`/`set_value` 要求确认。只在本机忽略提交的配置中显式启用的 `personal_trusted`，可以免确认执行安全导航，以及把本句完整口述草稿写入唯一、聚焦、非密码输入框；它不会自动发送。点击/按键上下文命中本地已知的发送、提交、删除、安装、上传、共享、关闭等词形时，两种 profile 都要求确认。该词表不是完整语义证明，未知语言/同义词、自绘控件或伪装文案可能漏分，重要副作用必须人工监督。需要确认的动作会产生由动作类型、应用、参数、包含本地 HWND identity 的 observation fingerprint 和 expectation 绑定的 ID。generation 在确认前 fresh observe 后重新绑定，不直接进入 digest。runtime 另外生成随机四位挑战码并提示“确认执行 4 8 2 7”这类一次性口令；只说静态“确认执行”永远不授权，也不会重新让模型解释确认意图。
 
 通用 UI confirmation 摘要若原文显示 UI 标签，只使用从用户原句验证出的 exact target label。未授权 sibling/window label 的原文和语义仍保留在本地完整快照中做风险分类，不进入摘要；摘要中的短 digest 只是不可逆绑定元数据。输入 payload 则只来自用户亲口给出的 exact span。
 

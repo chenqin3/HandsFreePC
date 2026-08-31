@@ -230,15 +230,29 @@ apps:
       code: ["Code"]
 ```
 
+先运行只读 profile/裁剪检查；输出只能有统计、digest、控件类型和经过安全筛选的标签，不能包含聊天正文、字段 value、automation ID 或截图：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --observe-only
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --observe-only
+```
+
+只读观察成功后，才可显式运行未发送草稿 smoke。它必须写入唯一、聚焦、非密码 composer，fresh observe 后 exact read-back，并报告 `sent: false`；测试 token 会保留在输入框中，验收后人工清除：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --draft-smoke
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --draft-smoke
+```
+
 建议顺序：
 
-1. **最小观察**：用户原句只肯定命名一个 app 和目标控件；验证未命名、两个 app、否定提及和顺带提及都会拒绝。断言 planner 输入只含被点名控件，不含原始窗口标题、进程 ID、旁支 UI/value/automation ID、截图 bytes 或真实截图可用性；再选中唯一可见窗口，多窗口时验证前台唯一规则和歧义失败；
+1. **最小观察**：`strict` 下用户原句只肯定命名一个 app 和目标控件；验证未命名、两个 app、否定提及和顺带提及都会拒绝。`personal_trusted` 另验同一控制器可继承上一条 fresh-verified app/window，而新控制器、窗口变化和 strict 不继承。断言 `CONTENT` 永不进入 planner；strict 只含被点名控件，personal_trusted 最多再含安全导航控件与当前输入框；两者都不含原始窗口标题、进程 ID、value/automation ID、截图 bytes 或真实截图可用性；
 2. **无副作用导航**：切换一个已知 tab，要求 after UIA 中出现选中状态或特定文本；
-3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；确认它也必须等待随机四位码，静态“确认执行”无效；正确确认后要求 exact round-trip；
+3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；`strict` 必须等待随机四位码，静态“确认执行”无效；`personal_trusted` 只有本句完整口述、唯一聚焦非密码输入框可免确认。两种模式都要求 exact round-trip，且不能点击发送；
 4. **多步任务**：每步后核对 generation 增加、fingerprint 变化，并记录同一任务 expectation 的 false-before 和 true-after；
 5. **typed confirmation**：用测试草稿的“发送”按钮触发确认，但先取消；验证错 ID、错误/旧四位码、过期、重放和确认前界面变化都拒绝；
 6. **一次确认执行**：只在测试账户发送无害内容，说出本轮随机四位码，确认仅执行原动作一次；
-7. **阻断表面**：验证密码、付款、终端和 UAC 不会进入 planner/action；
+7. **阻断表面**：验证真实密码、聚焦 secret/API-key 输入、认证、付款和 UAC 不会进入 planner/action；同时验证聊天正文提到 password/terminal/payment、已知凭据示例或普通长 ID 不会阻断无关安全标签，正文与凭据原文也不会进入 planner；
 8. **急停**：在可重复任务中急停，记录当前动作是否已发生和后续队列是否清空。
 
 每一步 PASS 都必须同时有：用户意图、before state、实际 action、fresh after state、LocalVerifier 原因和人工屏幕核对。仅看到“操作成功”遮罩、planner prose 或 driver receipt 一律不算。

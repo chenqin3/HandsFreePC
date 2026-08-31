@@ -8,13 +8,17 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .protocol import (
+    CredentialConfidence,
     DesktopAction,
     DesktopActionType,
     DesktopElement,
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
-    contains_credential_like_value,
+    ElementPlane,
+    contains_high_confidence_credential,
+    credential_findings,
+    element_plane,
     is_allowed_desktop_key,
 )
 
@@ -23,6 +27,16 @@ class DesktopSafetyDisposition(StrEnum):
     ALLOW = "allow"
     CONFIRM = "confirm"
     BLOCK = "block"
+
+
+class DesktopSafetyProfile(StrEnum):
+    STRICT = "strict"
+    PERSONAL_TRUSTED = "personal_trusted"
+
+
+class DesktopActionBinding(StrEnum):
+    USER_STEP = "user_step"
+    NAVIGATION_BRIDGE = "navigation_bridge"
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,6 +441,66 @@ _CLOSE_TERMS = (
     "强制停止",
     "关机",
 )
+_PERSISTENT_MUTATION_TERMS = (
+    "save",
+    "save changes",
+    "apply",
+    "archive",
+    "create",
+    "enable sync",
+    "accept invitation",
+    "join workspace",
+    "approve",
+    "like",
+    "follow",
+    "pin",
+    "unpin",
+    "rename",
+    "move",
+    "mark as read",
+    "mark as unread",
+    "star",
+    "unstar",
+    "upvote",
+    "downvote",
+    "mute",
+    "unmute",
+    "enable",
+    "disable",
+    "turn on",
+    "turn off",
+    "toggle",
+    "favorite",
+    "unfavorite",
+    "保存",
+    "应用更改",
+    "归档",
+    "创建",
+    "启用同步",
+    "接受邀请",
+    "加入工作区",
+    "批准",
+    "点赞",
+    "关注",
+    "置顶",
+    "取消置顶",
+    "重命名",
+    "移动",
+    "标为已读",
+    "标为未读",
+    "加星",
+    "取消加星",
+    "赞成",
+    "反对",
+    "静音",
+    "取消静音",
+    "启用",
+    "禁用",
+    "开启",
+    "关闭功能",
+    "收藏",
+    "取消收藏",
+)
 _PRIVACY_SETTING_TERMS = (
     "telemetry",
     "analytics",
@@ -548,7 +622,22 @@ _CONFIRM_GROUPS = (
     ("install or uninstall software", _INSTALL_TERMS),
     ("upload or share a file", _UPLOAD_TERMS),
     ("close, dismiss, or discard application state", _CLOSE_TERMS),
+    ("persist or externally mutate application state", _PERSISTENT_MUTATION_TERMS),
+    (
+        "sign out of an account",
+        ("sign out", "log out", "logout", "退出登录", "退出账号", "退出账户", "注销登录"),
+    ),
 )
+
+
+def _mask_navigation_pin(context: str) -> str:
+    """Distinguish sidebar pin/unpin actions from a credential PIN field."""
+
+    return re.sub(
+        r"(?i)\b(?:unpin|pin)\s+(?=(?:conversation|chat|thread|project|item|message)\b)",
+        "sidebar-action ",
+        context,
+    )
 
 _CLAUSE_BOUNDARY_RE = re.compile(
     r"[，。；,;.!！？?\n]|但是|不过|然后|并且|而且|以及|但|\b(?:but|then|and)\b",
@@ -1428,17 +1517,25 @@ def _target_spans_for_verb(
     source = _normalized(user_text)
     boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
     payload_ranges = _text_payload_ranges(source)
-    clause_start = max(
-        (match.end() for match in boundaries if match.end() <= verb.start()),
-        default=0,
-    )
-    clause_end = min(
-        (match.start() for match in boundaries if match.start() >= verb.end()),
-        default=len(source),
-    )
-    intent_clause = _mask_text_payloads(source, clause_start, clause_end)
     results: list[tuple[int, int, int, int]] = []
     for start, end in _matching_spans(target, user_text):
+        # A literal UI label may itself contain a natural-language clause word
+        # (for example Claude's "Chat and Cowork"). Boundaries inside that
+        # exact target span are label data, not a second user action.
+        target_boundaries = tuple(
+            match
+            for match in boundaries
+            if not (start <= match.start() and match.end() <= end)
+        )
+        clause_start = max(
+            (match.end() for match in target_boundaries if match.end() <= verb.start()),
+            default=0,
+        )
+        clause_end = min(
+            (match.start() for match in target_boundaries if match.start() >= verb.end()),
+            default=len(source),
+        )
+        intent_clause = _mask_text_payloads(source, clause_start, clause_end)
         if start < clause_start or end > clause_end:
             continue
         if any(
@@ -1581,6 +1678,8 @@ def _expectation_suffix_is_complete(
     suffix = source[end:step_end]
     if has_next_action and _NEXT_ACTION_SEPARATOR_RE.fullmatch(suffix):
         suffix = ""
+    else:
+        suffix = re.sub(r"[，。；,;.!！？?]+\s*$", "", suffix)
     patterns = {
         DesktopExpectationKind.TEXT_PRESENT: re.compile(
             r"\s*(?:(?:(?:is|becomes?|remains?)\s+)?"
@@ -1777,7 +1876,17 @@ def expectation_matches_user_step(
             if start == target_start and end == target_end:
                 return (
                     expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
-                    and _SELECTION_ACTION_RE.fullmatch(verb.group()) is not None
+                    and (
+                        _SELECTION_ACTION_RE.fullmatch(verb.group()) is not None
+                        or (
+                            action.type
+                            in {
+                                DesktopActionType.CLICK,
+                                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                            }
+                            and _ACTIVATION_TARGET_RE.fullmatch(verb.group()) is not None
+                        )
+                    )
                 )
             if start < target_end:
                 continue
@@ -1896,6 +2005,38 @@ def affirmatively_authorized_app_scope(candidate: str, user_text: str) -> bool:
                     or _REFERENCE_BRIDGE_RE.search(scope_bridge)
                     or _EXCLUDED_REFERENCE_BRIDGE_RE.search(scope_bridge)
                 ):
+                    return True
+        # Speech transcription often inserts a pause/comma before a trailing
+        # app location: "click Code, in Notepad" / "点击 Code，在记事本里".
+        # Treat that immediately preceding affirmative clause as the action,
+        # while preserving the same quotation and negation gates.
+        if (
+            not scoped_suffix.strip()
+            and clause_start > 0
+            and _POLITE_IMPERATIVE_PREFIX_RE.fullmatch(preposed_prefix) is not None
+        ):
+            preceding_delimiter = max(
+                (match for match in boundaries if match.end() == clause_start),
+                key=lambda match: match.end(),
+                default=None,
+            )
+            if preceding_delimiter is not None:
+                preceding_start = max(
+                    (
+                        match.end()
+                        for match in boundaries
+                        if match.end() <= preceding_delimiter.start()
+                    ),
+                    default=0,
+                )
+                preceding = _mask_quoted_text(
+                    source,
+                    preceding_start,
+                    preceding_delimiter.start(),
+                )
+                if not _NEGATED_ACTION_RE.search(
+                    preceding
+                ) and _AFFIRMATIVE_ACTION_RE.search(preceding):
                     return True
         delimiter = next(
             (match for match in boundaries if match.start() == clause_end),
@@ -2095,6 +2236,247 @@ def _full_observation_context(observation: DesktopObservation) -> str:
     )
 
 
+def _surface_control_context(observation: DesktopObservation) -> str:
+    """Return structural surface cues without dynamic navigation titles.
+
+    AI chat sidebars expose project and conversation titles as Button/ListItem
+    controls. Their words describe user content, not the active security
+    surface, so only dialogs and inputs may classify the whole window here.
+    Focused or selected navigation controls are still dynamic user content; the
+    concrete action target is checked separately by ``evaluate``.
+    """
+
+    controls = [
+        {
+            "name": element.name,
+            "control_type": element.control_type,
+            "selected": element.selected,
+            "focused": element.focused,
+            "password": element.password,
+        }
+        for element in observation.elements
+        if element_plane(element) in {ElementPlane.DIALOG, ElementPlane.INPUT}
+    ]
+    return "\n".join(
+        (
+            observation.app,
+            observation.window_title or "",
+            json.dumps(controls, ensure_ascii=False, sort_keys=True),
+        )
+    )
+
+
+def _dialog_surface_context(observation: DesktopObservation) -> str:
+    """Return local modal cues, including retained text while a dialog is active.
+
+    UIA observations are intentionally flattened and do not always expose
+    parent/child ancestry. When a dialog exists, retained content may be its
+    title/body, so include it only in this local classifier. It remains absent
+    from the cloud planner view.
+    """
+
+    dialogs = [
+        {
+            "name": element.name,
+            "control_type": element.control_type,
+            "password": element.password,
+        }
+        for element in observation.elements
+        if element_plane(element) == ElementPlane.DIALOG
+    ]
+    content = (
+        [
+            {
+                "name": element.name,
+                "value": element.value,
+                "control_type": element.control_type,
+            }
+            for element in observation.elements
+            if element_plane(element) == ElementPlane.CONTENT
+        ]
+        if dialogs
+        else []
+    )
+    return json.dumps(
+        {"dialogs": dialogs, "retained_dialog_content": content},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _focused_secret_field(observation: DesktopObservation) -> bool:
+    for element in observation.elements:
+        if element.focused is not True or element_plane(element) != ElementPlane.INPUT:
+            continue
+        if element.password or element.secret_labeled or element.high_credential:
+            return True
+        identity = "\n".join((element.name, element.automation_id or ""))
+        if (
+            _contains_term(identity, _SECRET_TERMS)
+            or contains_high_confidence_credential(element.name)
+            or contains_high_confidence_credential(element.value)
+        ):
+            return True
+    return False
+
+
+_DYNAMIC_NAVIGATION_NOUNS = (
+    "conversation",
+    "chat",
+    "thread",
+    "task",
+    "project",
+    "session",
+    "dialogue",
+    "对话",
+    "聊天",
+    "任务",
+    "项目",
+    "会话",
+)
+_DYNAMIC_NAVIGATION_VERBS = (
+    "open",
+    "click",
+    "switch",
+    "select",
+    "go to",
+    "enter",
+    "打开",
+    "点击",
+    "切换",
+    "选择",
+    "进入",
+)
+_DYNAMIC_NAVIGATION_PREFIXES = (
+    "idle ",
+    "new session in ",
+)
+_DIRECT_SIDE_EFFECT_CONTROL_RE = re.compile(
+    r"^(?:"
+    r"(?:(?:sign|log)\s*out|logout)(?:\s+now)?|"
+    r"(?:permanently\s+)?(?:delete|remove|close|archive|rename|move|pin|unpin)"
+    r"(?:\s+(?:(?:this|the|all|current)\s+)?(?:accounts?|conversations?|chats?|"
+    r"threads?|projects?|workspaces?|messages?|data|files?|folders?|teams?))?|"
+    r"save(?:\s+changes)?|apply|approve(?:\s+request)?|like|follow|upvote|downvote|"
+    r"(?:accept\s+invitation|join\s+(?:workspace|team)|create\s+(?:project|workspace|"
+    r"account|link))|"
+    r"(?:enable|disable|mute|unmute|turn\s+(?:on|off))\s+(?:sync|notifications?|"
+    r"autosave|features?|modes?)|"
+    r"退出(?:登录|账号|账户)?|注销(?:账号|账户|登录)?|"
+    r"(?:永久)?(?:删除|移除|关闭|归档|重命名|移动|置顶|取消置顶)"
+    r"(?:(?:这个|该|全部|当前)?(?:账号|账户|对话|聊天|会话|项目|工作区|消息|数据|"
+    r"文件|文件夹|团队))?|保存(?:更改)?|应用更改?|批准(?:请求)?|点赞|关注|"
+    r"接受邀请|加入(?:工作区|团队)|创建(?:项目|工作区|账户|链接)|"
+    r"(?:启用|禁用|开启|关闭功能|静音|取消静音)(?:同步|通知|自动保存|功能|模式)"
+    r")$",
+    re.IGNORECASE,
+)
+_DYNAMIC_SENSITIVE_CONTROL_RE = re.compile(
+    r"^(?:payment(?:\s+(?:method|details?|settings?))?|billing(?:\s+information)?|"
+    r"account\s+settings?|data\s+controls?|privacy(?:\s+settings?)?|windows\s+security|"
+    r"user\s+account\s+control|uac|sign\s+in(?:\s+to\s+.+)?|log\s+in(?:\s+to\s+.+)?|"
+    r"api\s+key|password|passcode|verification\s+code|security\s+code|secret\s+key|"
+    r"付款方式|支付详情|账单信息|账户设置|数据控制|隐私设置|Windows\s*安全|"
+    r"登录(?:到.+)?|API\s*密钥|密码|验证码|安全码|密钥)$",
+    re.IGNORECASE,
+)
+_PERSONAL_BRIDGE_BUTTON_RE = re.compile(
+    r"^(?:home|back|next|previous|projects?|chats?|chat\s+and\s+cowork|code|history|"
+    r"library|settings|menu|sidebar|more|show\s+(?:menu|sidebar)|open\s+(?:menu|sidebar)|"
+    r"首页|主页|返回|下一步|上一步|项目|聊天|对话|代码|历史记录|资料库|设置|菜单|"
+    r"侧边栏|更多|显示(?:菜单|侧边栏)|打开(?:菜单|侧边栏))$",
+    re.IGNORECASE,
+)
+
+
+def _is_named_dynamic_navigation_target(
+    action: DesktopAction,
+    target: DesktopElement | None,
+    user_text: str,
+) -> bool:
+    """Treat an explicitly named chat/project title as data, not an action verb."""
+
+    if (
+        target is None
+        or action.type
+        not in {DesktopActionType.CLICK, DesktopActionType.PERFORM_SECONDARY_ACTION}
+    ):
+        return False
+    control_type = _normalized(target.control_type)
+    normalized_name = _normalized(target.name)
+    normalized_task = _normalized(user_text)
+    # A destructive, settings, or credential control must never gain the
+    # conversation-title exemption merely by adding modifiers such as
+    # ``this`` or ``now``. Match control-shaped phrases rather than every risk
+    # word so genuine titles such as "How to save money" remain navigation.
+    if (
+        _DIRECT_SIDE_EFFECT_CONTROL_RE.fullmatch(normalized_name)
+        or _DYNAMIC_SENSITIVE_CONTROL_RE.fullmatch(normalized_name)
+        or (
+            target.automation_id
+            and (
+                _DIRECT_SIDE_EFFECT_CONTROL_RE.fullmatch(
+                    _normalized(target.automation_id)
+                )
+                or _DYNAMIC_SENSITIVE_CONTROL_RE.fullmatch(
+                    _normalized(target.automation_id)
+                )
+            )
+        )
+    ):
+        return False
+    if control_type not in {"listitem", "treeitem"} and not normalized_name.startswith(
+        _DYNAMIC_NAVIGATION_PREFIXES
+    ):
+        return False
+    if not any(term in normalized_task for term in _DYNAMIC_NAVIGATION_NOUNS) or not any(
+        term in normalized_task for term in _DYNAMIC_NAVIGATION_VERBS
+    ):
+        return False
+    candidate_names = {normalized_name}
+    for prefix in _DYNAMIC_NAVIGATION_PREFIXES:
+        if normalized_name.startswith(prefix):
+            candidate_names.add(normalized_name.removeprefix(prefix).strip())
+    return any(candidate and candidate in normalized_task for candidate in candidate_names)
+
+
+def observation_credential_summary(observation: DesktopObservation) -> dict[str, int]:
+    """Return content-free diagnostic counts; never include matching text."""
+
+    if observation.high_credential_count is not None:
+        assert observation.low_credential_count is not None
+        assert observation.credential_affected_element_count is not None
+        return {
+            "high": observation.high_credential_count,
+            "low": observation.low_credential_count,
+            "affected_elements": observation.credential_affected_element_count,
+        }
+
+    counts = {"high": 0, "low": 0, "affected_elements": 0}
+    for element in observation.elements:
+        high_findings = 0
+        low_findings = 0
+        for field, value in (("name", element.name), ("value", element.value)):
+            for finding in credential_findings(
+                value,
+                field=field,
+                element_index=element.index,
+            ):
+                high_findings += int(finding.confidence == CredentialConfidence.HIGH)
+                low_findings += int(finding.confidence == CredentialConfidence.LOW)
+        # A raw driver flag can outlive bounded display text. In that case the
+        # exact raw finding count is unavailable to legacy observations, but
+        # the content-free minimum of one still preserves fail-closed safety.
+        if element.high_credential and high_findings == 0:
+            high_findings = 1
+        if element.low_credential and low_findings == 0:
+            low_findings = 1
+        counts["high"] += high_findings
+        counts["low"] += low_findings
+        counts["affected_elements"] += int(high_findings > 0 or low_findings > 0)
+    return counts
+
+
 def _element_line(observation: DesktopObservation, element_index: str) -> str | None:
     pattern = re.compile(rf"^\s*{re.escape(element_index)}(?:\s|$)")
     return next(
@@ -2220,6 +2602,180 @@ def _confirm(
 class DesktopSafetyPolicy:
     """Local, monotonic safety checks for one atomic desktop action."""
 
+    def __init__(self, profile: DesktopSafetyProfile | str = DesktopSafetyProfile.STRICT) -> None:
+        self.profile = DesktopSafetyProfile(profile)
+
+    def _personal_text_target(
+        self,
+        action: DesktopAction,
+        target: DesktopElement | None,
+    ) -> bool:
+        return bool(
+            self.profile == DesktopSafetyProfile.PERSONAL_TRUSTED
+            and action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
+            and target is not None
+            and target.enabled
+            and target.addressable
+            and not target.password
+            and target.focused is True
+            and element_plane(target) == ElementPlane.INPUT
+            and not _contains_term(
+                "\n".join((target.name, target.automation_id or "")),
+                _SECRET_TERMS,
+            )
+        )
+
+    def _personal_navigation_target(
+        self,
+        action: DesktopAction,
+        target: DesktopElement | None,
+    ) -> bool:
+        if (
+            self.profile != DesktopSafetyProfile.PERSONAL_TRUSTED
+            or target is None
+            or not target.enabled
+            or not target.addressable
+            or element_plane(target) != ElementPlane.CONTROL
+            or action.type
+            not in {
+                DesktopActionType.CLICK,
+                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                DesktopActionType.SCROLL,
+            }
+        ):
+            return False
+        normalized_type = _normalized(target.control_type)
+        if action.type == DesktopActionType.SCROLL:
+            if normalized_type != "scrollbar":
+                return False
+        elif not (
+            normalized_type == "tabitem"
+            or (
+                normalized_type == "button"
+                and _PERSONAL_BRIDGE_BUTTON_RE.fullmatch(_normalized(target.name))
+            )
+        ):
+            # CheckBox/RadioButton/Toggle controls are state mutations, while
+            # ListItem/TreeItem/MenuItem/Button labels are too ambiguous to
+            # invent as unspoken intermediate steps. Explicit user-bound steps
+            # remain available through the normal action binding path.
+            return False
+        context = "\n".join((target.name, target.control_type, action.action_name or ""))
+        if any(
+            (
+                _contains_term(context, _TERMINAL_TERMS),
+                _contains_term(context, _UAC_TERMS),
+                _looks_like_auth_surface(context),
+                _contains_term(context, _SECRET_TERMS),
+                _looks_like_payment_surface(context),
+                _looks_like_privacy_surface(context),
+            )
+        ):
+            return False
+        return not any(_contains_term(context, terms) for _, terms in _CONFIRM_GROUPS)
+
+    def classify_personal_action_binding(
+        self,
+        action: DesktopAction,
+        target: DesktopElement | None,
+        expectation: DesktopExpectation | None,
+        *,
+        user_text: str,
+        completed_steps: int,
+    ) -> DesktopActionBinding | None:
+        """Bind trusted local navigation without pretending it was user-spoken."""
+
+        if self.profile != DesktopSafetyProfile.PERSONAL_TRUSTED or target is None:
+            return None
+        if expectation is None:
+            return None
+        if action_matches_next_user_step(
+            action,
+            target.name,
+            user_text,
+            completed_steps=completed_steps,
+        ) and expectation_matches_user_step(
+            action,
+            target.name,
+            expectation,
+            user_text,
+            completed_steps=completed_steps,
+        ):
+            return DesktopActionBinding.USER_STEP
+        if self._personal_text_target(action, target):
+            verbs = _positive_user_action_verbs(user_text)
+            if 0 <= completed_steps < len(verbs):
+                verb = verbs[completed_steps]
+                payload = (
+                    action.text
+                    if action.type == DesktopActionType.TYPE_TEXT
+                    else action.value
+                )
+                expected = _normalized(expectation.text or "")
+                if (
+                    _verb_matches_action_type(verb, action.type)
+                    and _payload_belongs_to_verb(payload or "", user_text, verb)
+                    and expectation.kind
+                    in {
+                        DesktopExpectationKind.FOCUSED_CONTAINS,
+                        DesktopExpectationKind.TEXT_PRESENT,
+                    }
+                    and (
+                        expected == _normalized(payload or "")
+                        or _expectation_semantically_authorized(expectation, user_text)
+                    )
+                ):
+                    return DesktopActionBinding.USER_STEP
+        if self._personal_navigation_target(action, target):
+            expected = _normalized(expectation.text or "")
+            if (
+                expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
+                and expected == _normalized(target.name)
+            ):
+                return DesktopActionBinding.NAVIGATION_BRIDGE
+            if (
+                expectation.kind == DesktopExpectationKind.TEXT_PRESENT
+                and expected
+                and expected != _normalized(target.name)
+                and not _contains_term(expected, _SECRET_TERMS)
+                and not _looks_like_payment_surface(expected)
+                and not _looks_like_privacy_surface(expected)
+            ):
+                return DesktopActionBinding.NAVIGATION_BRIDGE
+        return None
+
+    def accepts_personal_terminal_condition(
+        self,
+        expectation: DesktopExpectation | None,
+        *,
+        user_text: str,
+        last_action: DesktopAction | None,
+    ) -> bool:
+        if (
+            self.profile != DesktopSafetyProfile.PERSONAL_TRUSTED
+            or expectation is None
+            or last_action is None
+            or last_action.type not in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
+            or expectation.kind
+            not in {
+                DesktopExpectationKind.FOCUSED_CONTAINS,
+                DesktopExpectationKind.TEXT_PRESENT,
+            }
+        ):
+            return False
+        payload = (
+            last_action.text
+            if last_action.type == DesktopActionType.TYPE_TEXT
+            else last_action.value
+        )
+        return bool(
+            payload
+            and (
+                _normalized(expectation.text or "") == _normalized(payload)
+                or _expectation_semantically_authorized(expectation, user_text)
+            )
+        )
+
     def planner_observation(
         self,
         observation: DesktopObservation,
@@ -2228,29 +2784,69 @@ class DesktopSafetyPolicy:
     ) -> DesktopObservation:
         """Return the minimal task-authorized UI subset that may cross a planner boundary."""
 
+        # CONTENT nodes describe chat history, document bodies, and other
+        # read-only UI text.  The local driver cannot address them, so they
+        # must not influence planner-visible label uniqueness or be assigned
+        # an index that a planner could try to execute.  A focused Document is
+        # classified as INPUT by ``element_plane`` and remains eligible.
+        addressable_elements = tuple(
+            element
+            for element in observation.elements
+            if element.addressable
+            and element_plane(element) in {ElementPlane.CONTROL, ElementPlane.INPUT}
+        )
         name_counts: dict[str, int] = {}
-        for element in observation.elements:
+        for element in addressable_elements:
             normalized_name = _normalized(element.name.strip())
             if normalized_name:
                 name_counts[normalized_name] = name_counts.get(normalized_name, 0) + 1
+        unique_focused_input = [
+            element.index
+            for element in addressable_elements
+            if element_plane(element) == ElementPlane.INPUT
+            and element.focused is True
+            and element.enabled
+            and not element.password
+        ]
 
         authorized: list[DesktopElement] = []
         competing_labels = tuple(
-            element.name for element in observation.elements if element.name.strip()
+            element.name for element in addressable_elements if element.name.strip()
         )
-        for element in observation.elements:
+        for element in addressable_elements:
             normalized_name = _normalized(element.name.strip())
+            plane = element_plane(element)
+            named_by_user = _affirmatively_authorized_span(
+                element.name,
+                user_text,
+                competing_labels=competing_labels,
+            )
+            safe_personal_navigation = self.profile == DesktopSafetyProfile.PERSONAL_TRUSTED and (
+                (plane == ElementPlane.CONTROL and element.enabled)
+                or (plane == ElementPlane.INPUT and element.focused is True and element.enabled)
+            )
+            unnamed_trusted_composer = bool(
+                self.profile == DesktopSafetyProfile.PERSONAL_TRUSTED
+                and not normalized_name
+                and element.composer
+                and unique_focused_input == [element.index]
+            )
             if (
                 element.password
-                or not normalized_name
-                or name_counts.get(normalized_name) != 1
-                or contains_credential_like_value(element.name)
-                or not _affirmatively_authorized_span(
-                    element.name,
-                    user_text,
-                    competing_labels=competing_labels,
-                )
+                or (not normalized_name and not unnamed_trusted_composer)
+                or (normalized_name and name_counts.get(normalized_name) != 1)
             ):
+                continue
+            # Both high-confidence credentials and low-confidence opaque IDs
+            # stay local. Low findings are privacy redactions, never a reason
+            # to block the whole application.
+            if element.high_credential or element.low_credential or credential_findings(
+                element.name,
+                field="name",
+                element_index=element.index,
+            ):
+                continue
+            if not named_by_user and not safe_personal_navigation:
                 continue
             authorized.append(
                 DesktopElement(
@@ -2261,6 +2857,11 @@ class DesktopSafetyPolicy:
                     focused=element.focused,
                     password=False,
                     enabled=element.enabled,
+                    plane=element.plane,
+                    editable=element.editable,
+                    addressable=True,
+                    composer=element.composer,
+                    name_metadata=element.name_metadata,
                 )
             )
         lines = [json.dumps({"app": observation.app, "task_authorized_subset": True})]
@@ -2282,6 +2883,10 @@ class DesktopSafetyPolicy:
             window_title=f"{observation.app} task-authorized UI subset",
             elements=tuple(authorized),
             captured_at=observation.captured_at,
+            total_element_count=observation.total_element_count,
+            elements_truncated=observation.elements_truncated,
+            skipped_long_content_count=observation.skipped_long_content_count,
+            property_error_count=observation.property_error_count,
         )
 
     def inspect_observation(
@@ -2305,43 +2910,75 @@ class DesktopSafetyPolicy:
             return _block("authentication windows cannot be sent to the desktop planner")
         if any(element.password for element in observation.elements):
             return _block("password-entry surfaces cannot be sent to the desktop planner")
-        # The raw UIA snapshot never leaves this process, but it must still be
-        # classified locally before a harmless-looking subset is sent or acted
-        # on.  Otherwise a generic "Next" button could advance a payment or
-        # credential surface hidden in an unmentioned sibling element.
-        local_context = _full_observation_context(observation)
-        if contains_credential_like_value(local_context):
-            return _block("credential-like value is present on the local desktop surface")
-        if _contains_term(local_context, _TERMINAL_TERMS):
+        if _focused_secret_field(observation):
+            return _block("the focused input is a credential or secret-entry field")
+        if any(
+            element_plane(element) == ElementPlane.DIALOG
+            and _normalized(element.name)
+            in {
+                "",
+                "dialog",
+                "window",
+                "alert",
+                "alertdialog",
+                "modal",
+                "popup",
+                "confirmation",
+                "confirmation dialog",
+                "untitled",
+                "对话框",
+                "窗口",
+                "提示",
+                "确认对话框",
+                "未命名",
+            }
+            for element in observation.elements
+        ):
+            return _block("a dialog identity could not be read safely")
+        if any(
+            element_plane(element) in {ElementPlane.DIALOG, ElementPlane.INPUT}
+            and element.name_metadata is not None
+            and element.name_metadata.truncated
+            for element in observation.elements
+        ):
+            return _block("a dialog or input identity was too long to classify safely")
+        # Classify only the control surface. Chat/document content is untrusted
+        # data, not evidence that the application itself is a terminal,
+        # payment, privacy, or authentication surface.
+        control_context = _surface_control_context(observation)
+        dialog_context = _dialog_surface_context(observation)
+        if _contains_term(control_context, _TERMINAL_TERMS):
             return _block("terminal and shell surfaces are outside the desktop agent boundary")
-        if _contains_term(local_context, _UAC_TERMS):
+        if _contains_term(control_context, _UAC_TERMS):
             return _block("UAC and operating-system security prompts cannot be automated")
-        if _looks_like_auth_surface(local_context):
+        if _looks_like_auth_surface(control_context):
             return _block("authentication surfaces cannot be sent to the desktop planner")
-        if _contains_term(local_context, _SECRET_TERMS):
-            return _block("password and credential surfaces cannot be sent to the desktop planner")
-        if _looks_like_payment_surface(local_context):
+        if _looks_like_payment_surface(control_context):
             return _block("payments and purchase surfaces are outside the desktop agent boundary")
-        if _looks_like_privacy_surface(local_context):
+        if _looks_like_privacy_surface(control_context):
             return _block("privacy, account, telemetry, and link-sharing surfaces are prohibited")
-        planner_view = (
-            self.planner_observation(observation, user_text=user_text) if user_text else observation
-        )
-        full_context = _full_observation_context(planner_view)
-        if contains_credential_like_value(full_context):
+        if _contains_term(dialog_context, _TERMINAL_TERMS):
+            return _block("terminal and shell dialogs cannot be automated")
+        if _contains_term(dialog_context, _UAC_TERMS):
+            return _block("operating-system security dialogs cannot be automated")
+        if _looks_like_auth_surface(dialog_context):
+            return _block("authentication dialogs cannot be automated")
+        if _looks_like_payment_surface(dialog_context):
+            return _block("payments and purchase dialogs cannot be automated")
+        if _looks_like_privacy_surface(dialog_context):
+            return _block("privacy and account dialogs cannot be automated")
+        if _contains_term(dialog_context, _SECRET_TERMS):
+            return _block("credential or secret-entry dialogs cannot be automated")
+        planner_view = self.planner_observation(observation, user_text=user_text)
+        # The planner view is constructed from a typed allow-list and excludes
+        # values, automation IDs, content-plane history, and credential-shaped
+        # labels. A final invariant protects against future regressions.
+        planner_context = _full_observation_context(planner_view)
+        if any(
+            finding.confidence == CredentialConfidence.HIGH
+            for finding in credential_findings(planner_context, include_low=False)
+        ):
             return _block("credential-like value cannot be sent to the desktop planner")
-        if _contains_term(full_context, _TERMINAL_TERMS):
-            return _block("terminal and shell surfaces are outside the desktop agent boundary")
-        if _contains_term(full_context, _UAC_TERMS):
-            return _block("UAC and operating-system security prompts cannot be automated")
-        if _looks_like_auth_surface(full_context):
-            return _block("authentication surfaces cannot be sent to the desktop planner")
-        if _contains_term(full_context, _SECRET_TERMS):
-            return _block("password and credential surfaces cannot be sent to the desktop planner")
-        if _looks_like_payment_surface(full_context):
-            return _block("payments and purchase surfaces are outside the desktop agent boundary")
-        if _looks_like_privacy_surface(full_context):
-            return _block("privacy, account, telemetry, and link-sharing surfaces are prohibited")
         return _allow("observation is within the locally allow-listed desktop boundary")
 
     def evaluate(
@@ -2399,6 +3036,22 @@ class DesktopSafetyPolicy:
         elif action.type == DesktopActionType.PRESS_KEY:
             target_context = _focused_context(observation)
 
+        target = next(
+            (element for element in observation.elements if element.index == action.element_index),
+            None,
+        )
+
+        if target is not None and not target.addressable:
+            return _block("the selected element is retained only for local safety or freshness")
+
+        if (
+            target is not None
+            and element_plane(target) == ElementPlane.CONTENT
+            and action.type
+            in {DesktopActionType.CLICK, DesktopActionType.PERFORM_SECONDARY_ACTION}
+        ):
+            return _block("chat and document content is not an addressable control target")
+
         if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.PRESS_KEY}:
             focused_targets = [
                 element
@@ -2426,8 +3079,47 @@ class DesktopSafetyPolicy:
             if not payload_is_exact:
                 return _block("text payload is not the complete user-authored payload")
 
+        # Risk classification uses the selected control identity, never chat
+        # history, the dictated payload, or unrelated document content.
+        generic_confirmation_labels = {
+            "ok",
+            "yes",
+            "confirm",
+            "continue",
+            "next",
+            "proceed",
+            "确定",
+            "确认",
+            "继续",
+            "下一步",
+        }
+        include_user_intent = action.type not in {
+            DesktopActionType.TYPE_TEXT,
+            DesktopActionType.SET_VALUE,
+        } and (
+            target is None or _normalized(target.name) in generic_confirmation_labels
+        )
+        named_dynamic_navigation = _is_named_dynamic_navigation_target(
+            action,
+            target,
+            user_text,
+        )
         risk_context = "\n".join(
-            (target_context, action.action_name or "", action_payload or "", user_text)
+            (
+                ""
+                if named_dynamic_navigation
+                else target.name
+                if target is not None
+                else target_context,
+                target.control_type if target is not None else "",
+                ""
+                if named_dynamic_navigation
+                else target.automation_id or ""
+                if target is not None
+                else "",
+                action.action_name or "",
+                user_text if include_user_intent else "",
+            )
         )
         if _contains_term(risk_context, _TERMINAL_TERMS):
             return _block("the selected target is a terminal or shell surface")
@@ -2435,7 +3127,7 @@ class DesktopSafetyPolicy:
             return _block("the selected target is an operating-system security prompt")
         if _looks_like_auth_surface(risk_context):
             return _block("authentication and account-verification targets cannot be automated")
-        if _contains_term(risk_context, _SECRET_TERMS):
+        if _contains_term(_mask_navigation_pin(risk_context), _SECRET_TERMS):
             return _block("passwords, credentials, and secret-entry surfaces cannot be automated")
         if _looks_like_payment_surface(risk_context):
             return _block("payments, purchases, and transfers cannot be automated")
@@ -2443,14 +3135,14 @@ class DesktopSafetyPolicy:
             return _block("privacy, account, telemetry, and link-sharing settings are prohibited")
 
         key = _normalized(action.key or "").replace(" ", "")
-        target = next(
-            (element for element in observation.elements if element.index == action.element_index),
-            None,
-        )
         competing_labels = tuple(
-            element.name for element in observation.elements if element.name.strip()
+            element.name
+            for element in observation.elements
+            if element.name.strip() and element_plane(element) != ElementPlane.CONTENT
         )
-        if target is not None and not any(
+        personal_text_target = self._personal_text_target(action, target)
+        personal_navigation_target = self._personal_navigation_target(action, target)
+        action_bound_to_user_step = target is not None and any(
             action_matches_next_user_step(
                 action,
                 target.name,
@@ -2458,6 +3150,12 @@ class DesktopSafetyPolicy:
                 completed_steps=step,
             )
             for step in range(user_action_step_count(user_text))
+        )
+        if (
+            target is not None
+            and not action_bound_to_user_step
+            and not personal_text_target
+            and not personal_navigation_target
         ):
             return _block("action parameters are not bound to an explicit user step")
         if target is not None:
@@ -2472,12 +3170,16 @@ class DesktopSafetyPolicy:
                 element
                 for element in observation.elements
                 if _normalized(element.name.strip()) == target_name
+                and element_plane(element) != ElementPlane.CONTENT
                 and (
                     action.type not in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
                     or _normalized(element.control_type) in _EDITABLE_CONTROL_TYPES
                 )
             ]
-            if not target_name or len(same_name_targets) != 1:
+            if (
+                (not target_name and not personal_text_target)
+                or len(same_name_targets) != 1
+            ):
                 return _block(
                     "semantic target label is absent or ambiguous in the current observation"
                 )
@@ -2489,22 +3191,25 @@ class DesktopSafetyPolicy:
             # explicitly negated (for example, "不要输入 X").
             if (
                 target is None
-                or not target.name.strip()
-                or not _affirmatively_authorized_action_target(
-                    target.name,
-                    user_text,
-                    action.type,
-                    competing_labels=competing_labels,
+                or (not target.name.strip() and not personal_text_target)
+                or (
+                    not personal_text_target
+                    and not _affirmatively_authorized_action_target(
+                        target.name,
+                        user_text,
+                        action.type,
+                        competing_labels=competing_labels,
+                    )
                 )
             ):
                 return _block("text target label is not affirmatively named in the user task")
-            text_confirmation_target = target.name
+            text_confirmation_target = target.name or "focused composer"
 
         if action.type in {
             DesktopActionType.CLICK,
             DesktopActionType.PERFORM_SECONDARY_ACTION,
             DesktopActionType.SCROLL,
-        } and (
+        } and not personal_navigation_target and (
             target is None
             or not target.name.strip()
             or not _affirmatively_authorized_action_target(
@@ -2591,7 +3296,14 @@ class DesktopSafetyPolicy:
                 DesktopExpectationKind.FOCUSED_CONTAINS,
             }:
                 expected_is_authorized = True
-            if target is None or not any(
+            if (
+                named_dynamic_navigation
+                and target is not None
+                and expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
+                and expected == _normalized(target.name)
+            ):
+                expected_is_authorized = True
+            expectation_bound_to_user_step = target is not None and any(
                 action_matches_next_user_step(
                     action,
                     target.name,
@@ -2606,8 +3318,40 @@ class DesktopSafetyPolicy:
                     completed_steps=step,
                 )
                 for step in range(user_action_step_count(user_text))
+            )
+            if (
+                expectation_bound_to_user_step
+                and target is not None
+                and expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
+                and expected == _normalized(target.name)
             ):
-                expected_is_authorized = False
+                expected_is_authorized = True
+            elif not expectation_bound_to_user_step:
+                expected_is_authorized = bool(
+                    personal_text_target
+                    and expected in payload_exact
+                    and expectation.kind
+                    in {
+                        DesktopExpectationKind.TEXT_PRESENT,
+                        DesktopExpectationKind.FOCUSED_CONTAINS,
+                    }
+                ) or bool(
+                    personal_navigation_target
+                    and expectation.text
+                    and expectation.kind
+                    in {
+                        DesktopExpectationKind.TEXT_PRESENT,
+                        DesktopExpectationKind.ELEMENT_SELECTED,
+                    }
+                    and not _contains_term(expectation.text, _SECRET_TERMS)
+                    and not _looks_like_payment_surface(expectation.text)
+                    and not _looks_like_privacy_surface(expectation.text)
+                ) or bool(
+                    named_dynamic_navigation
+                    and target is not None
+                    and expectation.kind == DesktopExpectationKind.ELEMENT_SELECTED
+                    and expected == _normalized(target.name)
+                )
             if not expected_is_authorized:
                 return _block("postcondition text is not bound to the user task or target")
             target_name = _normalized(target.name) if target is not None else ""
@@ -2662,6 +3406,8 @@ class DesktopSafetyPolicy:
         if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}:
             if expectation is None or not expectation.text:
                 return _block("text input needs an exact local text-presence postcondition")
+            if personal_text_target:
+                return _allow("personal trusted profile allows exact user-spoken draft text")
             return _confirm(
                 "enter exact user-spoken text",
                 action,
@@ -2732,31 +3478,64 @@ class DesktopSafetyPolicy:
                 trusted_target_label=target.name,
             )
 
-        side_effect_context = risk_context
-        whole_surface_activation = action.type in {
-            DesktopActionType.CLICK,
-            DesktopActionType.PERFORM_SECONDARY_ACTION,
-        } or (
-            action.type == DesktopActionType.PRESS_KEY
-            and key in {"enter", "return", "space", "escape"}
-        )
-        if whole_surface_activation:
-            # An innocuous-looking Next/Proceed control can commit a side effect described
-            # by a sibling label. Inspect the whole current surface for every activation,
-            # not only buttons named OK/Yes/Confirm.
-            side_effect_context = "\n".join(
-                (
-                    side_effect_context,
-                    _full_observation_context(observation),
-                    user_text,
-                )
-            )
+        # Generic confirmation controls (OK/Yes/Continue) carry almost no
+        # semantic identity of their own.  Retained dialog-plane text is local,
+        # authoritative context for whether activating one would send, delete,
+        # upload, or close.  Keep it out of the planner view and the stronger
+        # BLOCK classifiers above; here it can only raise an action to CONFIRM.
+        side_effect_context = "\n".join((risk_context, _dialog_surface_context(observation)))
 
         if action.type in {
             DesktopActionType.CLICK,
             DesktopActionType.PERFORM_SECONDARY_ACTION,
             DesktopActionType.PRESS_KEY,
         }:
+            if target is not None and _normalized(target.control_type) in {
+                "checkbox",
+                "radiobutton",
+                "switch",
+                "togglebutton",
+            }:
+                return _confirm(
+                    "change a persistent selectable control",
+                    action,
+                    observation,
+                    expectation,
+                    trusted_target_label=(
+                        target.name
+                        if _affirmatively_authorized_action_target(
+                            target.name,
+                            user_text,
+                            action.type,
+                            competing_labels=competing_labels,
+                        )
+                        else ""
+                    ),
+                )
+            if (
+                target is not None
+                and _normalized(target.name) in generic_confirmation_labels
+                and any(
+                    element_plane(element) == ElementPlane.DIALOG
+                    for element in observation.elements
+                )
+            ):
+                return _confirm(
+                    "activate a generic control in an active dialog",
+                    action,
+                    observation,
+                    expectation,
+                    trusted_target_label=(
+                        target.name
+                        if _affirmatively_authorized_action_target(
+                            target.name,
+                            user_text,
+                            action.type,
+                            competing_labels=competing_labels,
+                        )
+                        else ""
+                    ),
+                )
             for reason, terms in _CONFIRM_GROUPS:
                 if _contains_term(side_effect_context, terms):
                     trusted_target_label = (

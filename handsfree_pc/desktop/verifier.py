@@ -13,6 +13,8 @@ from .protocol import (
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
+    ElementPlane,
+    element_plane,
 )
 
 
@@ -53,6 +55,12 @@ def _fresh_observation_failure(
         return "post-action observation is not a fresh generation"
     if after.captured_at < before.captured_at:
         return "post-action observation predates the action observation"
+    if (before.local_window_id or after.local_window_id) and (
+        not before.local_window_id
+        or not after.local_window_id
+        or before.local_window_id != after.local_window_id
+    ):
+        return "post-action observation belongs to a different local application window"
     if "\ufffd" in after.accessibility_text:
         return "post-action accessibility text contains damaged Unicode"
     return None
@@ -74,7 +82,14 @@ def _element_by_index(observation: DesktopObservation, index: str | None):
 def _matching_element_after(target, after: DesktopObservation):
     if target is None:
         return None
-    if target.automation_id:
+    if target.local_identity:
+        matches = [
+            element
+            for element in after.elements
+            if element.local_identity == target.local_identity
+            and element.control_type == target.control_type
+        ]
+    elif target.automation_id:
         matches = [
             element
             for element in after.elements
@@ -152,6 +167,19 @@ class DesktopVerifier:
                 )
             if before_target.password or after_target.password:
                 return _result(False, "password targets cannot be verified or controlled", after)
+            if (
+                not before_target.addressable
+                or not after_target.addressable
+                or element_plane(before_target) != ElementPlane.INPUT
+                or element_plane(after_target) != ElementPlane.INPUT
+                or before_target.editable is False
+                or after_target.editable is False
+            ):
+                return _result(
+                    False,
+                    "the exact target is no longer a verified editable input",
+                    after,
+                )
             if action.type == DesktopActionType.TYPE_TEXT:
                 if before_target.focused is not True or after_target.focused is not True:
                     return _result(False, "text input target did not retain verified focus", after)

@@ -99,6 +99,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "backend": "local_agent",
         "driver": "windows_uia",
         "planner_backend": "claude",
+        "safety_profile": "strict",
         "allow_screen_context_to_cloud": False,
         "allow_codex_cli_host_read": False,
         "allow_legacy_codex_computer_use": False,
@@ -142,6 +143,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "native_voice_hotkey": None,
             "voice_button_names": [],
             "mode_names": {"chat": ["Chat"], "code": ["Code"]},
+            "include_control_types": [
+                "Button",
+                "TabItem",
+                "MenuItem",
+                "ListItem",
+                "TreeItem",
+                "Edit",
+                "ComboBox",
+                "CheckBox",
+                "RadioButton",
+                "Dialog",
+                "Window",
+            ],
+            "content_control_types": ["Text", "Document", "Pane", "Group"],
+            "drop_long_content": True,
+            "max_control_name_chars": 500,
+            "max_content_chars": 1000,
+            "max_content_nodes": 80,
+            "composer_names": [
+                "Prompt",
+                "Message",
+                "Ask anything",
+                "Type a message",
+                "输入消息",
+                "输入提示词",
+            ],
         },
         "claude": {
             "process_names": ["claude.exe"],
@@ -156,6 +183,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "code": ["Code"],
                 "design": ["Design"],
             },
+            "include_control_types": [
+                "Button",
+                "TabItem",
+                "MenuItem",
+                "ListItem",
+                "TreeItem",
+                "Edit",
+                "ComboBox",
+                "CheckBox",
+                "RadioButton",
+                "Dialog",
+                "Window",
+            ],
+            "content_control_types": ["Text", "Document", "Pane", "Group"],
+            "drop_long_content": True,
+            "max_control_name_chars": 500,
+            "max_content_chars": 1000,
+            "max_content_nodes": 80,
+            "composer_names": [
+                "Prompt",
+                "Message",
+                "Ask Claude",
+                "Type a message",
+                "输入消息",
+                "询问 Claude",
+            ],
         },
     },
 }
@@ -211,6 +264,48 @@ def _require_string_list_mapping(
     return result
 
 
+def _optional_string_list(
+    mapping: dict[str, Any],
+    key: str,
+    *,
+    section: str,
+) -> list[str]:
+    value = mapping.get(key, [])
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise ValueError(f"{section}.{key} must be a YAML list of non-empty strings")
+    return [item.strip() for item in value]
+
+
+def _optional_bool(
+    mapping: dict[str, Any],
+    key: str,
+    *,
+    section: str,
+    default: bool,
+) -> bool:
+    value = mapping.get(key, default)
+    if type(value) is not bool:
+        raise ValueError(f"{section}.{key} must be a YAML boolean, not a quoted string")
+    return value
+
+
+def _optional_int_in_range(
+    mapping: dict[str, Any],
+    key: str,
+    *,
+    section: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = mapping.get(key, default)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{section}.{key} must be between {minimum} and {maximum}")
+    return value
+
+
 @dataclass(slots=True)
 class AppSettings:
     language: str
@@ -263,6 +358,7 @@ class ComputerControlSettings:
     backend: str
     driver: str
     planner_backend: str
+    safety_profile: str
     allow_screen_context_to_cloud: bool
     allow_codex_cli_host_read: bool
     allow_legacy_codex_computer_use: bool
@@ -306,6 +402,16 @@ class AppProfile:
     native_voice_hotkey: str | None
     voice_button_names: list[str]
     mode_names: dict[str, list[str]] = field(default_factory=dict)
+    # Empty observation fields retain the pre-profile driver behavior. This is
+    # intentional so existing direct AppProfile(...) construction remains
+    # source- and behavior-compatible; packaged Claude/Codex profiles opt in.
+    include_control_types: list[str] = field(default_factory=list)
+    content_control_types: list[str] = field(default_factory=list)
+    drop_long_content: bool = False
+    max_control_name_chars: int = 500
+    max_content_chars: int = 4000
+    max_content_nodes: int = 500
+    composer_names: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -437,6 +543,51 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
                 "mode_names",
                 section=f"apps.{name}",
             ),
+            include_control_types=_optional_string_list(
+                value,
+                "include_control_types",
+                section=f"apps.{name}",
+            ),
+            content_control_types=_optional_string_list(
+                value,
+                "content_control_types",
+                section=f"apps.{name}",
+            ),
+            drop_long_content=_optional_bool(
+                value,
+                "drop_long_content",
+                section=f"apps.{name}",
+                default=False,
+            ),
+            max_control_name_chars=_optional_int_in_range(
+                value,
+                "max_control_name_chars",
+                section=f"apps.{name}",
+                default=500,
+                minimum=1,
+                maximum=1024,
+            ),
+            max_content_chars=_optional_int_in_range(
+                value,
+                "max_content_chars",
+                section=f"apps.{name}",
+                default=4000,
+                minimum=1,
+                maximum=16000,
+            ),
+            max_content_nodes=_optional_int_in_range(
+                value,
+                "max_content_nodes",
+                section=f"apps.{name}",
+                default=500,
+                minimum=0,
+                maximum=2000,
+            ),
+            composer_names=_optional_string_list(
+                value,
+                "composer_names",
+                section=f"apps.{name}",
+            ),
         )
 
     settings = Settings(
@@ -479,6 +630,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             backend=str(computer_control_raw["backend"]).lower(),
             driver=str(computer_control_raw["driver"]).lower(),
             planner_backend=str(computer_control_raw["planner_backend"]).lower(),
+            safety_profile=str(computer_control_raw["safety_profile"]).lower(),
             allow_screen_context_to_cloud=allow_screen_context,
             allow_codex_cli_host_read=allow_codex_cli_host_read,
             allow_legacy_codex_computer_use=allow_legacy_codex_computer_use,
@@ -567,6 +719,10 @@ def _validate(settings: Settings) -> None:
     }:
         raise ValueError(
             "computer_control.planner_backend must be codex_cli_best_effort, claude, or none"
+        )
+    if settings.computer_control.safety_profile not in {"strict", "personal_trusted"}:
+        raise ValueError(
+            "computer_control.safety_profile must be strict or personal_trusted"
         )
     if (
         settings.computer_control.driver == "open_computer_use"

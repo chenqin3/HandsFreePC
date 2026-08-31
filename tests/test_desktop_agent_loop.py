@@ -5,11 +5,18 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+import pytest
+
 from handsfree_pc.desktop.agent_loop import (
     DesktopAgentLoopController,
     _explicitly_named_apps,
+    _unsupported_explicit_app_scopes,
 )
-from handsfree_pc.desktop.native_skills import NativeRouteStatus, NativeSkillResult
+from handsfree_pc.desktop.native_skills import (
+    NativeRouteStatus,
+    NativeSkillResult,
+    NativeSkillRouter,
+)
 from handsfree_pc.desktop.protocol import (
     ActionReceipt,
     DesktopAction,
@@ -21,6 +28,7 @@ from handsfree_pc.desktop.protocol import (
     DesktopExpectationKind,
     DesktopObservation,
 )
+from handsfree_pc.desktop.safety import DesktopSafetyPolicy
 from handsfree_pc.models import Action, ActionType, ExecutionResult, Plan, RiskLevel
 
 
@@ -87,6 +95,16 @@ class FakeDriver:
         self.closed = True
 
 
+class ContextRecordingDriver(FakeDriver):
+    def __init__(self, observations):
+        super().__init__(observations)
+        self.task_contexts = []
+        self.profiles = {"claude": object(), "codex": object()}
+
+    def set_task_context(self, task):
+        self.task_contexts.append(task)
+
+
 class SequencePlanner:
     def __init__(self, decisions):
         self.decisions = list(decisions)
@@ -107,13 +125,21 @@ def _miss_router():
     return FakeNativeRouter(NativeSkillResult(NativeRouteStatus.MISS, "miss"))
 
 
-def _observation(generation, text, *, title="Claude", elements=()):
+def _observation(
+    generation,
+    text,
+    *,
+    title="Claude",
+    elements=(),
+    local_window_id=None,
+):
     return DesktopObservation(
         app="claude",
         generation=generation,
         accessibility_text=text,
         window_title=title,
         elements=tuple(elements),
+        local_window_id=local_window_id,
     )
 
 
@@ -132,6 +158,83 @@ def _done_decision(kind=DesktopExpectationKind.APP_VISIBLE, text=None):
         app="claude",
         expectation=DesktopExpectation(kind, text=text),
     )
+
+
+def _selection_observation(
+    generation,
+    *,
+    selected=(),
+    local_window_id="window-a",
+    marker=None,
+):
+    selected_names = frozenset(selected)
+    elements = [
+        DesktopElement(index, name, "Button", selected=name in selected_names)
+        for index, name in (("0", "Alpha"), ("1", "Beta"))
+    ]
+    if marker is not None:
+        elements.append(DesktopElement("2", marker, "Text"))
+    text = "\n".join(
+        f'{element.index} name="{element.name}" control_type="Button" '
+        f"selected={str(bool(element.selected)).lower()}"
+        if element.control_type == "Button"
+        else f'{element.index} name="{element.name}" control_type="Text"'
+        for element in elements
+    )
+    return _observation(
+        generation,
+        text,
+        elements=tuple(elements),
+        local_window_id=local_window_id,
+    )
+
+
+def _selection_action(name, generation):
+    index = "0" if name == "Alpha" else "1"
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.ELEMENT_SELECTED,
+        text=name,
+    )
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        f"select {name}",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=generation,
+            element_index=index,
+        ),
+        expectation=expectation,
+    )
+
+
+def _run_verified_alpha_session(*, profile, later_observations=(), later_decisions=()):
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+            *later_decisions,
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _selection_observation(1),
+            _selection_observation(2),
+            _selection_observation(3, selected={"Alpha"}),
+            *later_observations,
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy(profile=profile),
+    )
+    first = controller.run("In Claude, select Alpha")
+    assert first.success
+    return controller, driver, planner
 
 
 def test_app_scope_requires_one_affirmative_control_clause_and_rejects_denials():
@@ -179,6 +282,208 @@ def test_app_scope_reuses_data_and_negation_boundaries() -> None:
     ) == {"claude"}
 
 
+def test_unknown_explicit_app_scope_is_detected_without_matching_quotes_or_negation():
+    known = ("claude", "codex")
+
+    for task in (
+        "In Notepad, click Code",
+        "In Notepad click Code",
+        "click Code in Notepad",
+        "在记事本里点击 Code",
+        "点击 Code 于记事本",
+        "在记事本点击 Code",
+        "点击 Code，在记事本里",
+        "点击记事本里的 Code",
+        "Use Notepad to click Code",
+        "Click Code using Notepad",
+        "用记事本点击 Code",
+        "使用记事本点击 Code",
+        "到记事本点击 Code",
+        "Notepad: click Code",
+        "Go to Notepad and click Code",
+        "Switch to Notepad and click Code",
+        "Open Notepad and click Code",
+        "Launch Notepad then click Code",
+        "Select Notepad, then click Code",
+        "Navigate to Notepad and click Code",
+        "打开记事本然后点击 Code",
+        "切换到记事本然后点击 Code",
+        "进入记事本并点击 Code",
+        "启动记事本再点击 Code",
+        "选择记事本，然后点击 Code",
+        "导航到记事本然后点击 Code",
+    ):
+        assert _unsupported_explicit_app_scopes(task, known)
+
+    assert not _unsupported_explicit_app_scopes(
+        'type "In Notepad, click Code" into Prompt',
+        known,
+    )
+    assert not _unsupported_explicit_app_scopes(
+        "Do not click Code in Notepad, click Code in Claude",
+        known,
+    )
+    assert not _unsupported_explicit_app_scopes(
+        'type "Use Notepad to click Code" into Prompt',
+        known,
+    )
+    assert not _unsupported_explicit_app_scopes(
+        "Do not use Notepad to click Code; click Code in Claude",
+        known,
+    )
+    assert not _unsupported_explicit_app_scopes(
+        'type "Go to Notepad and click Code" into Prompt',
+        known,
+    )
+    assert not _unsupported_explicit_app_scopes(
+        "Do not go to Notepad and click Code; click Code in Claude",
+        known,
+    )
+    assert not _unsupported_explicit_app_scopes(
+        '输入“打开记事本然后点击 Code”到 Prompt',
+        known,
+    )
+    assert not _unsupported_explicit_app_scopes(
+        "不要打开记事本然后点击 Code；在 Claude 点击 Code",
+        known,
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "Go to Notepad and click Code",
+        "Launch Notepad then click Code",
+        "切换到记事本然后点击 Code",
+        "启动记事本再点击 Code",
+    ],
+)
+def test_action_before_unknown_app_clears_personal_context(task):
+    controller, driver, planner = _run_verified_alpha_session(
+        profile="personal_trusted",
+    )
+    calls_before = len(planner.calls)
+
+    unsupported = controller.run(task)
+    inherited = controller.run("select Beta")
+
+    assert unsupported.error_code == "APP_SCOPE_UNSUPPORTED"
+    assert inherited.error_code == "APP_SCOPE_REQUIRED"
+    assert len(planner.calls) == calls_before
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
+def test_personal_trusted_reuses_same_verified_app_window_for_next_over_command():
+    controller, driver, planner = _run_verified_alpha_session(
+        profile="personal_trusted",
+        later_observations=(
+            _selection_observation(4, selected={"Alpha"}),
+            _selection_observation(5, selected={"Alpha"}),
+            _selection_observation(6, selected={"Alpha", "Beta"}),
+        ),
+        later_decisions=(
+            _selection_action("Beta", 4),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Beta"),
+        ),
+    )
+
+    second = controller.run("select Beta")
+
+    assert second.success
+    assert planner.calls[3][0] == "select Beta"
+    assert planner.calls[3][1] == 4
+    assert "resumed the same locally verified app window" in planner.calls[3][2]
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2),
+        ("execute", "click", 5),
+    ]
+
+
+def test_unknown_explicit_app_clears_personal_context_instead_of_using_claude():
+    controller, driver, planner = _run_verified_alpha_session(
+        profile="personal_trusted",
+    )
+    calls_before = len(planner.calls)
+
+    unsupported = controller.run("In Notepad click Code")
+    inherited = controller.run("select Beta")
+
+    assert unsupported.error_code == "APP_SCOPE_UNSUPPORTED"
+    assert inherited.error_code == "APP_SCOPE_REQUIRED"
+    assert len(planner.calls) == calls_before
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
+def test_named_but_invisible_app_clears_personal_context():
+    controller, _driver, planner = _run_verified_alpha_session(
+        profile="personal_trusted",
+    )
+    calls_before = len(planner.calls)
+
+    invisible = controller.run("In Codex, click Projects")
+    inherited = controller.run("select Beta")
+
+    assert invisible.error_code == "APP_SCOPE_NOT_VISIBLE"
+    assert inherited.error_code == "APP_SCOPE_REQUIRED"
+    assert len(planner.calls) == calls_before
+
+
+def test_strict_profile_does_not_reuse_previous_verified_app_window():
+    controller, driver, planner = _run_verified_alpha_session(profile="strict")
+    calls_before = len(planner.calls)
+
+    second = controller.run("select Beta")
+
+    assert not second.success
+    assert second.error_code == "APP_SCOPE_REQUIRED"
+    assert len(planner.calls) == calls_before
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude"),
+        ("observe", "claude"),
+        ("observe", "claude"),
+    ]
+
+
+def test_new_personal_controller_has_no_inherited_app_window():
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=FakeDriver([]),
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy(profile="personal_trusted"),
+    )
+
+    result = controller.run("select Beta")
+
+    assert not result.success
+    assert result.error_code == "APP_SCOPE_REQUIRED"
+    assert not any(call[0] == "observe" for call in controller.driver.calls)
+
+
+def test_personal_context_fails_closed_when_local_window_changes():
+    controller, driver, planner = _run_verified_alpha_session(
+        profile="personal_trusted",
+        later_observations=(
+            _selection_observation(
+                4,
+                selected={"Alpha"},
+                local_window_id="window-b",
+            ),
+        ),
+    )
+    calls_before = len(planner.calls)
+
+    result = controller.run("select Beta")
+
+    assert not result.success
+    assert result.error_code == "SESSION_WINDOW_CHANGED"
+    assert len(planner.calls) == calls_before
+    assert not any(call == ("execute", "click", 4) for call in driver.calls)
+
+
 def test_native_route_runs_before_driver_or_planner():
     native = FakeNativeRouter(
         NativeSkillResult(NativeRouteStatus.SUCCEEDED, "done", plan=Plan("done", []))
@@ -197,6 +502,112 @@ def test_native_route_runs_before_driver_or_planner():
     assert native.calls == ["打开文档"]
     assert driver.calls == []
     assert planner.calls == []
+
+
+def test_native_router_exception_returns_structured_content_free_failure():
+    class ExplodingRouter(FakeNativeRouter):
+        def route(self, text):
+            self.calls.append(text)
+            raise RuntimeError("private-window-title-and-secret")
+
+    router = ExplodingRouter(NativeSkillResult(NativeRouteStatus.MISS, "miss"))
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=None,
+        planner=None,
+    )
+
+    result = controller.run("open a local folder")
+
+    assert result.success is False
+    assert result.stage == "native_route"
+    assert result.error_code == "NATIVE_ROUTE_INTERNAL_ERROR"
+    assert result.exception_type == "RuntimeError"
+    assert result.safe_message
+    assert "private-window-title-and-secret" not in result.message
+    assert "private-window-title-and-secret" not in result.safe_message
+
+
+def test_native_app_success_establishes_fresh_context_for_next_utterance():
+    plan = Plan(
+        "activate Claude",
+        [Action(ActionType.ACTIVATE_APP, app="claude")],
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(NativeRouteStatus.SUCCEEDED, "done", plan=plan)
+    )
+    driver = ContextRecordingDriver(
+        [
+            _selection_observation(1, selected={"Alpha"}),
+            _selection_observation(2, selected={"Alpha"}),
+            _selection_observation(3, selected={"Alpha"}),
+            _selection_observation(4, selected={"Alpha", "Beta"}),
+        ]
+    )
+    planner = SequencePlanner(
+        [
+            _selection_action("Beta", 2),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Beta"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("personal_trusted"),
+    )
+
+    first = controller.run("open Claude")
+    router.result = NativeSkillResult(NativeRouteStatus.MISS, "miss")
+    second = controller.run("select Beta")
+
+    assert first.success
+    assert second.success
+    assert planner.calls[0][1] == 2
+    assert "resumed the same locally verified app window" in planner.calls[0][2]
+    assert driver.task_contexts[-1] is None
+    assert driver.task_contexts.count("open Claude") >= 1
+    assert driver.task_contexts.count("select Beta") == 1
+
+
+def test_cancelled_native_app_switch_clears_previous_personal_context():
+    controller, _driver, _planner = _run_verified_alpha_session(
+        profile="personal_trusted",
+    )
+    controller.native_router.result = NativeSkillResult(
+        NativeRouteStatus.SUCCEEDED,
+        "done",
+        plan=Plan(
+            "activate Codex",
+            [Action(ActionType.ACTIVATE_APP, app="codex")],
+        ),
+    )
+    cancelled = threading.Event()
+    cancelled.set()
+
+    switched = controller.run("open Codex", cancel_event=cancelled)
+    controller.native_router.result = NativeSkillResult(NativeRouteStatus.MISS, "miss")
+    inherited = controller.run("select Beta")
+
+    assert switched.cancelled is True
+    assert switched.stage == "native_route"
+    assert switched.error_code == "CANCELLED"
+    assert inherited.error_code == "APP_SCOPE_REQUIRED"
+
+
+def test_driver_task_context_is_cleared_on_early_scope_failure():
+    driver = ContextRecordingDriver([])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("personal_trusted"),
+    )
+
+    result = controller.run("In Notepad click Code")
+
+    assert result.error_code == "APP_SCOPE_UNSUPPORTED"
+    assert driver.task_contexts == ["In Notepad click Code", None]
 
 
 def test_generic_loop_observes_one_action_reobserves_and_verifies_done():
@@ -260,6 +671,118 @@ def test_generic_loop_observes_one_action_reobserves_and_verifies_done():
         ("observe", "claude"),
     ]
     assert len(planner.calls) == 3
+
+
+def test_post_action_reobserve_retries_tree_rebuild_without_repeating_action():
+    class TransientReobserveDriver(FakeDriver):
+        def observe(self, app, *, cancel_event=None):
+            self.calls.append(("observe", app))
+            value = self.observations.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+        ]
+    )
+    driver = TransientReobserveDriver(
+        [
+            _selection_observation(1),
+            _selection_observation(2),
+            RuntimeError("transient Electron tree rebuild"),
+            _selection_observation(3, selected={"Alpha"}),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        sleeper=lambda _seconds: None,
+    )
+
+    result = controller.run("In Claude, select Alpha")
+
+    assert result.success
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude"),
+        ("observe", "claude"),
+        ("observe", "claude"),
+        ("observe", "claude"),
+    ]
+
+
+def test_changed_same_window_is_refreshed_and_replanned_without_executing_stale_action():
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _selection_action("Alpha", 2),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _selection_observation(1, marker="state-zero"),
+            _selection_observation(2, marker="state-one"),
+            _selection_observation(3, marker="state-one"),
+            _selection_observation(4, selected={"Alpha"}, marker="state-one"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+    )
+
+    result = controller.run("In Claude, select Alpha")
+
+    assert result.success
+    assert planner.calls[2][1] == 2
+    assert (
+        "refreshed changed UI in the same local window; previous action was not executed"
+        in planner.calls[2][2]
+    )
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 3)
+    ]
+
+
+def test_repeated_pre_action_changes_fail_as_unstable_without_executing():
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _selection_action("Alpha", 2),
+            _selection_action("Alpha", 3),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _selection_observation(1, marker="state-zero"),
+            _selection_observation(2, marker="state-one"),
+            _selection_observation(3, marker="state-two"),
+            _selection_observation(4, marker="state-three"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+    )
+
+    result = controller.run("In Claude, select Alpha")
+
+    assert not result.success
+    assert result.stage == "observe_driver"
+    assert result.error_code == "UI_STATE_UNSTABLE"
+    assert not any(call[0] == "execute" for call in driver.calls)
 
 
 def test_generic_loop_cannot_substitute_typed_payload_for_an_authored_outcome():
@@ -513,6 +1036,7 @@ def test_confirmation_fails_closed_when_interface_changes():
 
     assert not result.success
     assert "界面已经变化" in result.message
+    assert result.error_code == "STALE_WINDOW_CHANGED"
 
 
 def test_native_confirmation_executes_exact_saved_plan_once():
@@ -801,6 +1325,174 @@ def test_cancel_during_native_binding_cannot_publish_pending_confirmation():
     assert router.executor.plans == []
 
 
+def test_cancel_is_not_starved_by_blocking_native_confirmation_execution():
+    entered = threading.Event()
+    release = threading.Event()
+    plan = Plan(
+        "voice",
+        [Action(ActionType.START_NATIVE_VOICE, app="claude")],
+        risk=RiskLevel.CONFIRM,
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.CONFIRMATION_REQUIRED,
+            "confirm",
+            plan=plan,
+        )
+    )
+
+    def blocking_execute(execution_plan):
+        entered.set()
+        assert release.wait(timeout=2)
+        return [
+            ExecutionResult(True, "verified", action=action, evidence={"verified": True})
+            for action in execution_plan.actions
+        ]
+
+    router.executor.execute_plan = blocking_execute
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=None,
+        planner=None,
+    )
+    waiting = controller.run("打开 Claude 应用内语音")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        confirm_future = pool.submit(controller.confirm, waiting.confirmation_id)
+        assert entered.wait(timeout=2)
+        cancel_future = pool.submit(controller.cancel)
+        try:
+            assert cancel_future.result(timeout=0.5) is True
+        finally:
+            release.set()
+        result = confirm_future.result(timeout=2)
+
+    assert result.cancelled is True
+    assert result.error_code == "CANCELLED"
+
+
+def test_cancel_during_native_confirmation_verification_cannot_publish_success(
+    monkeypatch,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    plan = Plan(
+        "voice",
+        [Action(ActionType.START_NATIVE_VOICE, app="claude")],
+        risk=RiskLevel.CONFIRM,
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.CONFIRMATION_REQUIRED,
+            "confirm",
+            plan=plan,
+        )
+    )
+
+    def blocking_verifier(_plan, _results):
+        entered.set()
+        assert release.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr(
+        NativeSkillRouter,
+        "execution_is_locally_verified",
+        staticmethod(blocking_verifier),
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=None,
+        planner=None,
+    )
+    waiting = controller.run("打开 Claude 应用内语音")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        confirm_future = pool.submit(controller.confirm, waiting.confirmation_id)
+        assert entered.wait(timeout=2)
+        assert controller.cancel() is True
+        release.set()
+        result = confirm_future.result(timeout=2)
+
+    assert result.cancelled is True
+    assert result.error_code == "CANCELLED"
+    assert controller._trusted_context() is None
+
+
+def test_cancel_during_native_context_refresh_cannot_publish_success():
+    entered = threading.Event()
+    release = threading.Event()
+    plan = Plan(
+        "activate Claude",
+        [Action(ActionType.ACTIVATE_APP, app="claude")],
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(NativeRouteStatus.SUCCEEDED, "done", plan=plan)
+    )
+
+    class BlockingContextDriver(ContextRecordingDriver):
+        def observe(self, app, *, cancel_event=None):
+            entered.set()
+            assert release.wait(timeout=2)
+            return super().observe(app, cancel_event=cancel_event)
+
+    driver = BlockingContextDriver([_selection_observation(1)])
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("personal_trusted"),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        run_future = pool.submit(controller.run, "open Claude")
+        assert entered.wait(timeout=2)
+        assert controller.cancel() is True
+        release.set()
+        result = run_future.result(timeout=2)
+
+    assert result.cancelled is True
+    assert result.error_code == "CANCELLED"
+    assert controller._trusted_context() is None
+
+
+def test_cancel_is_not_starved_by_blocking_desktop_execution():
+    entered = threading.Event()
+    release = threading.Event()
+    before = _selection_observation(1)
+    refreshed = _selection_observation(2)
+    planner = SequencePlanner([_observe_decision(), _selection_action("Alpha", 1)])
+
+    class BlockingDriver(FakeDriver):
+        def execute(self, action, observation, *, cancel_event=None):
+            self.calls.append(("execute", action.type.value, observation.generation))
+            entered.set()
+            assert release.wait(timeout=2)
+            return ActionReceipt(action, True, observation.generation, "accepted")
+
+    driver = BlockingDriver([before, refreshed])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("personal_trusted"),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        run_future = pool.submit(controller.run, "In Claude, select Alpha")
+        assert entered.wait(timeout=2)
+        cancel_future = pool.submit(controller.cancel)
+        try:
+            assert cancel_future.result(timeout=0.5) is True
+        finally:
+            release.set()
+        result = run_future.result(timeout=2)
+
+    assert result.cancelled is True
+    assert result.stage == "execute"
+    assert result.error_code == "CANCELLED"
+    assert controller._trusted_context() is None
+
+
 def test_generic_loop_cannot_finish_after_only_the_first_of_two_user_steps():
     before = _observation(
         1,
@@ -906,7 +1598,7 @@ def test_generic_loop_rejects_skipping_directly_to_a_later_user_step():
     result = controller.run("In Claude, click Alpha to show X, then click Beta to show Y")
 
     assert not result.success
-    assert "下一个明确步骤" in result.message
+    assert "未对应用户要求" in result.message
     assert not any(call[0] == "execute" for call in driver.calls)
 
 

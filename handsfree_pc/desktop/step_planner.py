@@ -78,18 +78,42 @@ Mandatory rules:
 - An action postcondition may be text_present, text_absent, focused_contains, or element_selected.
   Never use app_visible or last_action_verified as an action postcondition, and never reuse a
   condition that is already true before the action. A click/secondary action may not use
-  text_absent or focused_contains: use element_selected for the exact target, or text_present for
-  a distinct destination state explicitly named in user_authored_task. Focus alone proves only
-  that a click reached a control; it never proves that the requested navigation completed.
-  Use element_selected only when the observed target exposes a non-null selected state.
-  A scroll needs newly visible text named in the task. Text entry may prove the exact payload only
-  when the user did not state a separate outcome; when the task says the entry should make another
-  result appear, prove that authored result instead. Tab navigation must prove the requested focused
+  text_absent or focused_contains. Focus alone proves only that a click reached a control; it never
+  proves that the requested navigation completed. Use element_selected only when the observed
+  target exposes a non-null selected state. Text entry may prove the exact payload only when the
+  user did not state a separate outcome; when the task says the entry should make another result
+  appear, prove that authored result instead. Tab navigation must prove the requested focused
   target.
 - Do not mark done merely because an action API returned. Require a visible task-specific condition.
 - Preserve user-provided names and text exactly. Do not invent projects, files, conversations, tabs,
   or input payloads.
 """
+
+_STRICT_NAVIGATION_POLICY = """
+Strict navigation mode is enabled. A click/secondary action must use element_selected for the
+exact target, or text_present for a distinct destination state explicitly named in
+user_authored_task. A scroll must reveal newly visible text explicitly named in
+user_authored_task. Never invent or infer an intermediate navigation target.
+"""
+
+_PERSONAL_TRUSTED_NAVIGATION_POLICY = """
+Personal-trusted local navigation mode is enabled. This paragraph replaces the strict navigation
+rule. A requested click/secondary action must use element_selected for the exact target, or
+text_present for a distinct requested destination state. As the only exception, you may use an
+ordinary enabled navigation control that the user did not name when it is a necessary intermediate
+step inside the already authorized application (for example Search, expand, Back, a safe tab, or a
+mode switch). Such a bridge, including a bridge scroll, must still be one semantic action with a
+fresh, locally checkable postcondition derived from visible UI state. Never use this exception for
+Send, Submit, Delete, Upload, Install, permission/security/privacy controls, authentication,
+payments, terminals, or any other side effect. Text payloads must still be exact user-authored
+spans; this mode does not authorize invented content or a final outcome the user did not request.
+"""
+
+
+def _planner_policy(safety_profile: str) -> str:
+    if safety_profile == "personal_trusted":
+        return _PLANNER_POLICY + _PERSONAL_TRUSTED_NAVIGATION_POLICY
+    return _PLANNER_POLICY + _STRICT_NAVIGATION_POLICY
 
 
 def desktop_step_schema_path() -> Path:
@@ -145,6 +169,7 @@ def _planner_prompt(
     observation: DesktopObservation | None,
     history: Sequence[str],
     max_observation_chars: int,
+    safety_profile: str = "strict",
 ) -> str:
     data = _planner_data_prompt(
         task,
@@ -153,7 +178,7 @@ def _planner_prompt(
         history=history,
         max_observation_chars=max_observation_chars,
     )
-    return f"{_PLANNER_POLICY}\nUntrusted JSON data follows:\n{data}"
+    return f"{_planner_policy(safety_profile)}\nUntrusted JSON data follows:\n{data}"
 
 
 def _parse_decision_payload(
@@ -242,6 +267,7 @@ class _CliDesktopStepPlanner:
         model: str | None,
         timeout_seconds: float,
         max_observation_chars: int = 24000,
+        safety_profile: str = "strict",
         environment: Mapping[str, str] | None = None,
         popen_factory: Any | None = None,
     ) -> None:
@@ -249,10 +275,13 @@ class _CliDesktopStepPlanner:
             raise ValueError("timeout_seconds must be positive")
         if max_observation_chars < 1000:
             raise ValueError("max_observation_chars must be at least 1000")
+        if safety_profile not in {"strict", "personal_trusted"}:
+            raise ValueError("safety_profile must be strict or personal_trusted")
         self.executable = executable
         self.model = model.strip() if isinstance(model, str) and model.strip() else None
         self.timeout_seconds = float(timeout_seconds)
         self.max_observation_chars = int(max_observation_chars)
+        self.safety_profile = safety_profile
         self._environment = environment
         self._popen_factory = popen_factory or subprocess.Popen
 
@@ -323,6 +352,7 @@ class _CliDesktopStepPlanner:
             observation=observation,
             history=history,
             max_observation_chars=self.max_observation_chars,
+            safety_profile=self.safety_profile,
         )
 
 
@@ -437,7 +467,7 @@ class ClaudeDesktopStepPlanner(_CliDesktopStepPlanner):
             "--no-chrome",
             "--exclude-dynamic-system-prompt-sections",
             "--system-prompt",
-            _PLANNER_POLICY,
+            _planner_policy(self.safety_profile),
             "-p",
             "--permission-mode",
             "dontAsk",
@@ -445,8 +475,6 @@ class ClaudeDesktopStepPlanner(_CliDesktopStepPlanner):
             "",
             "--disallowedTools",
             "mcp__*",
-            "--max-turns",
-            "1",
             "--output-format",
             "json",
             "--json-schema",

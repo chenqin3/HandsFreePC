@@ -182,6 +182,47 @@ def test_multiline_text_matches_driver_rendered_escape_sequences() -> None:
     assert verifier.verify_action(action, _receipt(action), before, after).verified
 
 
+def test_text_action_uses_local_identity_when_electron_changes_composer_name() -> None:
+    verifier = DesktopVerifier()
+    identity = "a" * 64
+    before = _observation(
+        "empty composer",
+        elements=(
+            DesktopElement(
+                "318",
+                "",
+                "Edit",
+                value=None,
+                focused=True,
+                local_identity=identity,
+            ),
+        ),
+    )
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="Notepad",
+        generation=1,
+        element_index="318",
+        text="HandsFreePC-DRAFT-123",
+    )
+    after = _observation(
+        "filled composer",
+        generation=2,
+        elements=(
+            DesktopElement(
+                "318",
+                "HandsFreePC-DRAFT-123",
+                "Edit",
+                value="HandsFreePC-DRAFT-123",
+                focused=True,
+                local_identity=identity,
+            ),
+        ),
+    )
+
+    assert verifier.verify_action(action, _receipt(action), before, after).verified
+
+
 def test_planner_done_prose_is_never_completion_evidence() -> None:
     verifier = DesktopVerifier()
     observation = _observation("VERIFIED_COMPLETION\n2 button Open")

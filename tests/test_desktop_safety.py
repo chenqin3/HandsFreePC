@@ -3,16 +3,22 @@ from __future__ import annotations
 import pytest
 
 from handsfree_pc.desktop.protocol import (
+    CredentialConfidence,
     DesktopAction,
     DesktopActionType,
     DesktopElement,
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
+    ElementPlane,
+    credential_findings,
 )
 from handsfree_pc.desktop.safety import (
     DesktopSafetyDisposition,
     DesktopSafetyPolicy,
+    action_matches_next_user_step,
+    expectation_matches_user_step,
+    observation_credential_summary,
 )
 
 
@@ -47,6 +53,51 @@ def _action(
     return DesktopAction(type=action_type, app=app, generation=generation, **values)
 
 
+def test_raw_high_credential_flag_blocks_focused_input_after_display_bounding() -> None:
+    element = DesktopElement(
+        "1",
+        "Prompt",
+        "Edit",
+        value="prefix…suffix",
+        focused=True,
+        plane=ElementPlane.INPUT,
+        editable=True,
+        composer=True,
+        high_credential=True,
+    )
+    observation = _observation(elements=(element,))
+    policy = DesktopSafetyPolicy("personal_trusted")
+
+    assert policy.inspect_observation(observation).disposition == DesktopSafetyDisposition.BLOCK
+    assert policy.planner_observation(
+        observation,
+        user_text="In Claude, type hello into Prompt",
+    ).elements == ()
+    assert observation_credential_summary(observation) == {
+        "high": 1,
+        "low": 0,
+        "affected_elements": 1,
+    }
+
+
+def test_typed_credential_counts_cover_elements_dropped_before_retention() -> None:
+    observation = DesktopObservation(
+        app="Claude",
+        generation=1,
+        accessibility_text="bounded surface",
+        elements=(DesktopElement("1", "Chat", "Button"),),
+        high_credential_count=2,
+        low_credential_count=3,
+        credential_affected_element_count=4,
+    )
+
+    assert observation_credential_summary(observation) == {
+        "high": 2,
+        "low": 3,
+        "affected_elements": 4,
+    }
+
+
 def test_semantic_low_risk_action_is_allowed() -> None:
     observation = _observation(
         elements=(DesktopElement("2", "Open", "Button"),),
@@ -59,6 +110,29 @@ def test_semantic_low_risk_action_is_allowed() -> None:
 
     assert result.allowed
     assert result.confirmation is None
+
+
+def test_literal_click_is_bound_when_fresh_uia_can_verify_target_selected() -> None:
+    task = "In Claude, click Chat and Cowork."
+    action = _action(DesktopActionType.CLICK, index="25")
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.ELEMENT_SELECTED,
+        text="Chat and Cowork",
+    )
+
+    assert action_matches_next_user_step(
+        action,
+        "Chat and Cowork",
+        task,
+        completed_steps=0,
+    )
+    assert expectation_matches_user_step(
+        action,
+        "Chat and Cowork",
+        expectation,
+        task,
+        completed_steps=0,
+    )
 
 
 def test_duplicate_semantic_labels_are_neither_exposed_nor_actionable() -> None:
@@ -84,6 +158,67 @@ def test_duplicate_semantic_labels_are_neither_exposed_nor_actionable() -> None:
 
     assert planner_view.elements == ()
     assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_content_with_same_name_does_not_hide_the_addressable_control() -> None:
+    observation = _observation(
+        elements=(
+            DesktopElement("2", "Code", "Button"),
+            DesktopElement("3", "Code", "Text"),
+        ),
+    )
+    policy = DesktopSafetyPolicy()
+    task = "In Claude, click Code to show Home"
+
+    planner_view = policy.planner_observation(observation, user_text=task)
+    result = policy.evaluate(
+        _action(DesktopActionType.CLICK, index="2"),
+        observation,
+        user_text=task,
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_PRESENT,
+            text="Home",
+        ),
+    )
+
+    assert [element.index for element in planner_view.elements] == ["2"]
+    assert result.allowed
+
+
+def test_named_content_never_enters_the_planner_observation() -> None:
+    observation = _observation(
+        elements=(DesktopElement("9", "Quarterly plan", "Document"),),
+    )
+
+    planner_view = DesktopSafetyPolicy().planner_observation(
+        observation,
+        user_text="In Claude, click Quarterly plan",
+    )
+
+    assert planner_view.elements == ()
+    assert "Quarterly plan" not in planner_view.accessibility_text
+
+
+def test_focused_document_input_remains_eligible_for_the_planner() -> None:
+    observation = _observation(
+        elements=(
+            DesktopElement(
+                "4",
+                "Prompt",
+                "Document",
+                focused=True,
+                plane=ElementPlane.INPUT,
+                editable=True,
+            ),
+        ),
+    )
+
+    planner_view = DesktopSafetyPolicy().planner_observation(
+        observation,
+        user_text="In Claude, type hello into Prompt",
+    )
+
+    assert [element.index for element in planner_view.elements] == ["4"]
 
 
 @pytest.mark.parametrize(
@@ -395,6 +530,43 @@ def test_generic_confirmation_control_uses_whole_dialog_risk_context(action, tas
 
 
 @pytest.mark.parametrize(
+    ("dialog_label", "button_label"),
+    [
+        ("Delete all conversations?", "Continue"),
+        ("Send this message externally?", "OK"),
+        ("Upload this file?", "Yes"),
+        ("Close without saving?", "Continue"),
+    ],
+)
+@pytest.mark.parametrize("profile", ["strict", "personal_trusted"])
+def test_generic_dialog_confirmation_uses_retained_dialog_semantics(
+    dialog_label: str,
+    button_label: str,
+    profile: str,
+) -> None:
+    observation = _observation(
+        elements=(
+            DesktopElement("0", dialog_label, "Dialog", addressable=False),
+            DesktopElement("2", button_label, "Button"),
+        ),
+    )
+
+    inspection = DesktopSafetyPolicy(profile).inspect_observation(observation)
+    result = DesktopSafetyPolicy(profile).evaluate(
+        _action(DesktopActionType.CLICK, index="2"),
+        observation,
+        user_text=f"In Claude, click {button_label} and show Home",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_PRESENT,
+            text="Home",
+        ),
+    )
+
+    assert inspection.disposition == DesktopSafetyDisposition.ALLOW
+    assert result.disposition == DesktopSafetyDisposition.CONFIRM
+
+
+@pytest.mark.parametrize(
     "key",
     ["Ctrl+Enter", "Alt+S", "Shift+Delete", "Alt+F4", "Win+R", "F5", "Delete"],
 )
@@ -475,10 +647,10 @@ def test_damaged_unicode_state_is_blocked() -> None:
         "power_shell",
     ],
 )
-def test_identifier_styles_cannot_bypass_sensitive_surface_filter(identifier: str) -> None:
+def test_content_identifier_styles_do_not_define_the_surface(identifier: str) -> None:
     result = DesktopSafetyPolicy().inspect_observation(_observation(f"2 edit {identifier}"))
 
-    assert result.disposition == DesktopSafetyDisposition.BLOCK
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
 
 
 @pytest.mark.parametrize(
@@ -487,21 +659,26 @@ def test_identifier_styles_cannot_bypass_sensitive_surface_filter(identifier: st
         "sk-proj-" + "DUMMYTOKEN1234567890abcdef",
         "ghp_" + "DUMMYTOKEN1234567890abcdef123456",
         "AKIA" + "DUMMYTOKEN123456",
-        "eyJDUMMYHEADER123.DUMMYPAYLOAD123.DUMMYSIGNATURE123",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.DUMMYSIGNATURE123",
         "Bearer DUMMYmixedToken1234567890_abcdef-XYZ",
         "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_TOKEN",
         "-----BEGIN PRIVATE KEY-----",
     ],
 )
-def test_unlabelled_credential_like_values_are_blocked_before_planning(
+def test_credentials_in_content_are_detected_but_do_not_block_navigation(
     dummy_secret: str,
 ) -> None:
-    result = DesktopSafetyPolicy().inspect_observation(_observation(f"2 text {dummy_secret}"))
+    observation = _observation(
+        elements=(DesktopElement("2", dummy_secret, "Document"),),
+    )
+    result = DesktopSafetyPolicy().inspect_observation(observation)
+    findings = credential_findings(dummy_secret)
 
-    assert result.disposition == DesktopSafetyDisposition.BLOCK
+    assert findings
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
 
 
-def test_task_authorized_planner_view_omits_but_local_policy_blocks_sensitive_content() -> None:
+def test_task_authorized_planner_view_omits_sensitive_content_without_blocking_navigation() -> None:
     dummy_secret = "sk-proj-" + "DUMMYTOKEN1234567890abcdef"
     observation = _observation(
         f'2 name="Code" control_type="Button"\n9 value="{dummy_secret}"',
@@ -522,8 +699,8 @@ def test_task_authorized_planner_view_omits_but_local_policy_blocks_sensitive_co
         user_text="In Claude, click Code",
     )
 
-    assert raw.disposition == DesktopSafetyDisposition.BLOCK
-    assert scoped.disposition == DesktopSafetyDisposition.BLOCK
+    assert raw.disposition == DesktopSafetyDisposition.ALLOW
+    assert scoped.disposition == DesktopSafetyDisposition.ALLOW
     assert [element.name for element in planner_view.elements] == ["Code"]
     assert dummy_secret not in planner_view.accessibility_text
     assert planner_view.screenshot_png is None
@@ -695,7 +872,8 @@ def test_spatial_reference_label_is_not_authorized_as_an_action_target(task: str
 
     assert result.disposition == DesktopSafetyDisposition.BLOCK
     assert target_name not in {element.name for element in planner_view.elements}
-    assert {safe_name, done_name}.issubset({element.name for element in planner_view.elements})
+    assert {element.name for element in planner_view.elements} == {safe_name}
+    assert done_name not in planner_view.accessibility_text
 
 
 @pytest.mark.parametrize(
@@ -926,7 +1104,7 @@ def test_full_local_payment_surface_blocks_harmless_looking_next_action() -> Non
         ("Incognito mode", "Ordinary setting"),
     ],
 )
-def test_full_local_privacy_surface_blocks_harmless_looking_continue_action(labels) -> None:
+def test_privacy_words_in_content_do_not_block_continue_action(labels) -> None:
     first, second = labels
     observation = _observation(
         f'2 name="Continue" control_type="Button"\n'
@@ -943,7 +1121,7 @@ def test_full_local_privacy_surface_blocks_harmless_looking_continue_action(labe
     policy = DesktopSafetyPolicy()
 
     assert policy.inspect_observation(observation, user_text=task).disposition == (
-        DesktopSafetyDisposition.BLOCK
+        DesktopSafetyDisposition.ALLOW
     )
     assert (
         policy.evaluate(
@@ -955,7 +1133,7 @@ def test_full_local_privacy_surface_blocks_harmless_looking_continue_action(labe
                 text="Home",
             ),
         ).disposition
-        == DesktopSafetyDisposition.BLOCK
+        == DesktopSafetyDisposition.ALLOW
     )
 
 
@@ -976,7 +1154,7 @@ def test_full_local_privacy_surface_blocks_harmless_looking_continue_action(labe
         "任何知道链接的人",
     ],
 )
-def test_common_public_link_visibility_labels_block_the_whole_surface(
+def test_public_link_words_in_content_do_not_define_the_surface(
     public_visibility_label,
 ) -> None:
     observation = _observation(
@@ -991,7 +1169,7 @@ def test_common_public_link_visibility_labels_block_the_whole_surface(
     task = "In Claude, click Continue to open Home"
 
     assert policy.inspect_observation(observation, user_text=task).disposition == (
-        DesktopSafetyDisposition.BLOCK
+        DesktopSafetyDisposition.ALLOW
     )
     assert (
         policy.evaluate(
@@ -1003,7 +1181,7 @@ def test_common_public_link_visibility_labels_block_the_whole_surface(
                 text="Home",
             ),
         ).disposition
-        == DesktopSafetyDisposition.BLOCK
+        == DesktopSafetyDisposition.ALLOW
     )
 
 
@@ -1019,7 +1197,7 @@ def test_common_public_link_visibility_labels_block_the_whole_surface(
         "训练数据",
     ],
 )
-def test_model_training_and_usage_data_privacy_labels_block_the_whole_surface(
+def test_model_training_words_in_content_do_not_define_the_surface(
     privacy_label,
 ) -> None:
     observation = _observation(
@@ -1036,7 +1214,7 @@ def test_model_training_and_usage_data_privacy_labels_block_the_whole_surface(
             observation,
             user_text="In Claude, click Continue to show Home",
         ).disposition
-        == DesktopSafetyDisposition.BLOCK
+        == DesktopSafetyDisposition.ALLOW
     )
 
 
@@ -1145,6 +1323,18 @@ def test_attachment_activation_always_requires_confirmation(label, action_type) 
         "Terminate",
         "Unpublish",
         "Repost",
+        "Save",
+        "Save changes",
+        "Apply",
+        "Archive conversation",
+        "Create project",
+        "Enable sync",
+        "Accept invitation",
+        "Join workspace",
+        "Approve",
+        "Like",
+        "Follow",
+        "Pin conversation",
     ],
 )
 @pytest.mark.parametrize(
@@ -1185,6 +1375,52 @@ def test_common_side_effect_labels_require_confirmation(label, action_type) -> N
 
 
 @pytest.mark.parametrize(
+    ("label", "control_type"),
+    [
+        ("Enable experimental feature", "CheckBox"),
+        ("Use beta mode", "RadioButton"),
+        ("Turn on notifications", "CheckBox"),
+        ("Disable autosave", "CheckBox"),
+        ("Mute notifications", "CheckBox"),
+        ("Rename project", "Button"),
+        ("Move conversation", "Button"),
+        ("Mark as read", "Button"),
+        ("Star conversation", "Button"),
+        ("Upvote", "Button"),
+    ],
+)
+def test_unmentioned_mutations_cannot_be_invented_as_personal_navigation_bridges(
+    label,
+    control_type,
+) -> None:
+    target = DesktopElement("2", label, control_type, selected=False)
+    observation = _observation(elements=(target,))
+    action = _action(DesktopActionType.CLICK, index="2")
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.ELEMENT_SELECTED,
+        text=label,
+    )
+    policy = DesktopSafetyPolicy("personal_trusted")
+
+    binding = policy.classify_personal_action_binding(
+        action,
+        target,
+        expectation,
+        user_text="In Claude, open Settings",
+        completed_steps=0,
+    )
+    result = policy.evaluate(
+        action,
+        observation,
+        user_text="In Claude, open Settings",
+        expectation=expectation,
+    )
+
+    assert binding is None
+    assert result.disposition != DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
     "sibling_label",
     [
         "Permanently delete all data",
@@ -1194,7 +1430,7 @@ def test_common_side_effect_labels_require_confirmation(label, action_type) -> N
         "Send message externally",
     ],
 )
-def test_full_surface_side_effect_requires_confirmation_for_innocuous_next_button(
+def test_side_effect_words_in_content_do_not_reclassify_an_innocuous_next_button(
     sibling_label,
 ) -> None:
     observation = _observation(
@@ -1214,14 +1450,12 @@ def test_full_surface_side_effect_requires_confirmation_for_innocuous_next_butto
         ),
     )
 
-    assert result.disposition == DesktopSafetyDisposition.CONFIRM
-    assert result.confirmation is not None
-    assert 'user-spoken-target="Next"' in result.confirmation.summary
-    assert sibling_label not in result.confirmation.summary
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+    assert result.confirmation is None
 
 
 @pytest.mark.parametrize("automation_id", ["PasswordField", "APIKey", "Terminal"])
-def test_local_automation_id_is_classified_but_never_sent_to_planner(
+def test_local_automation_id_stays_local_and_does_not_define_the_surface(
     automation_id: str,
 ) -> None:
     observation = _observation(
@@ -1247,7 +1481,7 @@ def test_local_automation_id_is_classified_but_never_sent_to_planner(
             observation,
             user_text="click Code in Claude",
         ).disposition
-        == DesktopSafetyDisposition.BLOCK
+        == DesktopSafetyDisposition.ALLOW
     )
     assert automation_id not in planner_view.accessibility_text
     assert all(element.automation_id is None for element in planner_view.elements)
@@ -1263,7 +1497,7 @@ def test_embedded_authentication_controls_are_blocked(label: str) -> None:
     task = f"click {label} in Claude"
 
     assert policy.inspect_observation(observation, user_text=task).disposition == (
-        DesktopSafetyDisposition.BLOCK
+        DesktopSafetyDisposition.ALLOW
     )
     assert (
         policy.evaluate(
@@ -1273,6 +1507,132 @@ def test_embedded_authentication_controls_are_blocked(label: str) -> None:
         ).disposition
         == DesktopSafetyDisposition.BLOCK
     )
+
+
+def test_top_level_authentication_window_still_blocks_before_planning() -> None:
+    observation = _observation(
+        '2 name="Continue" control_type="Button"',
+        title="Sign in to Claude",
+        elements=(DesktopElement("2", "Continue", "Button"),),
+    )
+
+    assert DesktopSafetyPolicy().inspect_observation(observation).disposition == (
+        DesktopSafetyDisposition.BLOCK
+    )
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_sensitive_words_in_named_conversation_title_are_navigation_data(selected) -> None:
+    title = "Payment API auth debugging"
+    observation = _observation(
+        f'2 name="{title}" control_type="ListItem" selected={str(selected).lower()}',
+        elements=(DesktopElement("2", title, "ListItem", selected=selected),),
+    )
+    task = f"In Claude, open conversation {title}"
+    result = DesktopSafetyPolicy("personal_trusted").evaluate(
+        _action(DesktopActionType.CLICK, index="2"),
+        observation,
+        user_text=task,
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            text=title,
+        ),
+    )
+
+    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
+        observation,
+        user_text=task,
+    ).disposition == DesktopSafetyDisposition.ALLOW
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "How to save money",
+        "How to create an app",
+        "Things I like",
+        "Who to follow",
+        "Archive formats",
+        "Pin APIs explained",
+        "Delete key behavior",
+        "Close reading methods",
+    ],
+)
+def test_content_shaped_conversation_titles_do_not_become_side_effect_controls(title) -> None:
+    observation = _observation(
+        elements=(DesktopElement("2", title, "ListItem", selected=False),),
+    )
+    result = DesktopSafetyPolicy("personal_trusted").evaluate(
+        _action(DesktopActionType.CLICK, index="2"),
+        observation,
+        user_text=f"In Claude, open conversation {title}",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            text=title,
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Sign out",
+        "Delete account",
+        "Remove conversation",
+        "Delete this conversation",
+        "Permanently delete account",
+        "Delete workspace",
+        "Sign out now",
+        "Remove this conversation",
+        "Close this project",
+    ],
+)
+def test_side_effect_controls_cannot_masquerade_as_named_conversation_titles(label) -> None:
+    observation = _observation(
+        f'2 name="{label}" control_type="ListItem" selected=false',
+        elements=(DesktopElement("2", label, "ListItem", selected=False),),
+    )
+    result = DesktopSafetyPolicy("personal_trusted").evaluate(
+        _action(DesktopActionType.CLICK, index="2"),
+        observation,
+        user_text=f"In Claude, open conversation {label}",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            text=label,
+        ),
+    )
+
+    assert result.disposition != DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Payment method",
+        "Account settings",
+        "Windows Security",
+        "Sign in to Claude",
+        "API Key",
+    ],
+)
+def test_sensitive_list_controls_cannot_masquerade_as_conversation_rows(label) -> None:
+    observation = _observation(
+        elements=(DesktopElement("2", label, "ListItem", selected=False),),
+    )
+    result = DesktopSafetyPolicy("personal_trusted").evaluate(
+        _action(DesktopActionType.CLICK, index="2"),
+        observation,
+        user_text=f"In Claude, open conversation {label}",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            text=label,
+        ),
+    )
+
+    assert result.disposition != DesktopSafetyDisposition.ALLOW
 
 
 @pytest.mark.parametrize(
@@ -1295,7 +1655,7 @@ def test_oauth_registration_and_account_selection_controls_are_blocked(label: st
     task = f"click {label} in Claude and show Home"
 
     assert policy.inspect_observation(observation, user_text=task).disposition == (
-        DesktopSafetyDisposition.BLOCK
+        DesktopSafetyDisposition.ALLOW
     )
     assert (
         policy.evaluate(
@@ -1381,7 +1741,7 @@ def test_explicit_privacy_or_public_link_intent_is_blocked_even_on_plain_surface
         "Certificate warning",
     ],
 )
-def test_strong_sensitive_surface_labels_block_an_innocuous_continue_action(
+def test_sensitive_words_in_content_do_not_block_an_innocuous_continue_action(
     sensitive_sibling: str,
 ) -> None:
     observation = _observation(
@@ -1394,7 +1754,7 @@ def test_strong_sensitive_surface_labels_block_an_innocuous_continue_action(
     task = "In Claude, click Continue to show Home"
 
     assert policy.inspect_observation(observation, user_text=task).disposition == (
-        DesktopSafetyDisposition.BLOCK
+        DesktopSafetyDisposition.ALLOW
     )
     assert (
         policy.evaluate(
@@ -1406,7 +1766,7 @@ def test_strong_sensitive_surface_labels_block_an_innocuous_continue_action(
                 text="Home",
             ),
         ).disposition
-        == DesktopSafetyDisposition.BLOCK
+        == DesktopSafetyDisposition.ALLOW
     )
 
 
@@ -1448,8 +1808,8 @@ def test_close_click_requires_confirmation_before_side_effect() -> None:
 
 def test_escape_requires_named_target_and_confirmation() -> None:
     observation = _observation(
-        '2 name="Unsaved draft" control_type="Document" focused=true',
-        elements=(DesktopElement("2", "Unsaved draft", "Document", focused=True),),
+        '2 name="Unsaved draft" control_type="Edit" focused=true',
+        elements=(DesktopElement("2", "Unsaved draft", "Edit", focused=True),),
     )
     action = _action(DesktopActionType.PRESS_KEY, index="2", key="escape")
     expectation = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, text="Dashboard")
@@ -2254,3 +2614,255 @@ def test_pure_negative_or_polite_text_tail_keeps_payload_verification(task, payl
     )
 
     assert result.disposition == DesktopSafetyDisposition.CONFIRM
+
+
+def test_opaque_identifier_is_low_confidence_and_never_blocks_the_window() -> None:
+    opaque = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_TOKEN"
+    findings = credential_findings(opaque)
+    observation = _observation(
+        elements=(
+            DesktopElement("2", "Chat", "Button"),
+            DesktopElement("3", opaque, "Document"),
+        ),
+    )
+    policy = DesktopSafetyPolicy()
+    planner_view = policy.planner_observation(
+        observation,
+        user_text="In Claude, click Chat",
+    )
+
+    assert {finding.confidence for finding in findings} == {CredentialConfidence.LOW}
+    assert policy.inspect_observation(observation).disposition == DesktopSafetyDisposition.ALLOW
+    assert opaque not in planner_view.accessibility_text
+    assert [element.name for element in planner_view.elements] == ["Chat"]
+
+
+def test_focused_api_key_input_remains_blocked() -> None:
+    observation = _observation(
+        elements=(DesktopElement("2", "API Key", "Edit", focused=True),),
+    )
+
+    result = DesktopSafetyPolicy("personal_trusted").inspect_observation(observation)
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+    assert "credential" in result.reason
+
+
+def test_personal_trusted_allows_exact_spoken_text_without_challenge() -> None:
+    observation = _observation(
+        '2 name="Prompt" control_type="Edit" focused=true',
+        elements=(DesktopElement("2", "Prompt", "Edit", focused=True),),
+    )
+    action = _action(DesktopActionType.TYPE_TEXT, index="2", text="hello")
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.FOCUSED_CONTAINS,
+        text="hello",
+    )
+
+    strict = DesktopSafetyPolicy("strict").evaluate(
+        action,
+        observation,
+        user_text="type hello into Prompt",
+        expectation=expectation,
+    )
+    trusted = DesktopSafetyPolicy("personal_trusted").evaluate(
+        action,
+        observation,
+        user_text="type hello into Prompt",
+        expectation=expectation,
+    )
+
+    assert strict.disposition == DesktopSafetyDisposition.CONFIRM
+    assert trusted.disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_personal_trusted_can_use_the_unique_focused_composer_without_naming_its_label() -> None:
+    observation = _observation(
+        '2 name="Message" control_type="Edit" focused=true',
+        elements=(DesktopElement("2", "Message", "Edit", focused=True),),
+    )
+    action = _action(DesktopActionType.TYPE_TEXT, index="2", text="hello")
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.FOCUSED_CONTAINS,
+        text="hello",
+    )
+
+    result = DesktopSafetyPolicy("personal_trusted").evaluate(
+        action,
+        observation,
+        user_text="In Claude, type hello",
+        expectation=expectation,
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_focused_document_without_positive_editability_remains_content() -> None:
+    observation = _observation(
+        elements=(DesktopElement("4", "Chat transcript", "Document", focused=True),),
+    )
+
+    planner_view = DesktopSafetyPolicy("personal_trusted").planner_observation(
+        observation,
+        user_text="In Claude, type hello",
+    )
+
+    assert planner_view.elements == ()
+
+
+def test_unique_unnamed_verified_composer_is_visible_only_in_personal_trusted() -> None:
+    composer = DesktopElement(
+        "4",
+        "",
+        "Document",
+        focused=True,
+        plane=ElementPlane.INPUT,
+        editable=True,
+        composer=True,
+    )
+    observation = _observation(elements=(composer,))
+
+    trusted = DesktopSafetyPolicy("personal_trusted").planner_observation(
+        observation,
+        user_text="In Claude, type hello",
+    )
+    strict = DesktopSafetyPolicy("strict").planner_observation(
+        observation,
+        user_text="In Claude, type hello",
+    )
+
+    assert [element.index for element in trusted.elements] == ["4"]
+    assert trusted.elements[0].composer is True
+    assert strict.elements == ()
+
+
+def test_github_fine_grained_pat_is_high_confidence() -> None:
+    synthetic = "github_pat_" + "AbCdEf0123456789_" * 2
+
+    findings = credential_findings(synthetic)
+
+    assert {finding.confidence for finding in findings} == {CredentialConfidence.HIGH}
+
+
+def test_high_confidence_name_blocks_only_when_it_is_the_focused_input() -> None:
+    synthetic = "sk-proj-" + "AbCdEf0123456789" * 2
+    focused = _observation(
+        elements=(DesktopElement("2", synthetic, "Edit", focused=True),),
+    )
+    content = _observation(
+        elements=(
+            DesktopElement("1", synthetic, "Document"),
+            DesktopElement("2", "Chat", "Button"),
+        ),
+    )
+
+    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
+        focused
+    ).disposition == DesktopSafetyDisposition.BLOCK
+    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
+        content,
+        user_text="In Claude, click Chat",
+    ).disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_only_explicit_uia_labeled_by_relation_can_classify_an_empty_secret_input() -> None:
+    unrelated_flat_text = _observation(
+        elements=(
+            DesktopElement("1", "API Key", "Text"),
+            DesktopElement("2", "Prompt", "Edit", focused=True),
+        ),
+    )
+    labeled_input = _observation(
+        elements=(
+            DesktopElement(
+                "2",
+                "",
+                "Edit",
+                focused=True,
+                secret_labeled=True,
+            ),
+        ),
+    )
+
+    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
+        unrelated_flat_text
+    ).disposition == DesktopSafetyDisposition.ALLOW
+    assert DesktopSafetyPolicy("personal_trusted").inspect_observation(
+        labeled_input
+    ).disposition == DesktopSafetyDisposition.BLOCK
+
+
+@pytest.mark.parametrize("label", ["Payment", "Windows Terminal", "API Key"])
+def test_retained_dialog_semantics_fail_closed(label: str) -> None:
+    observation = _observation(
+        elements=(
+            DesktopElement("0", label, "Dialog", addressable=False),
+            DesktopElement("1", "Continue", "Button"),
+        ),
+    )
+
+    result = DesktopSafetyPolicy("personal_trusted").inspect_observation(observation)
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+@pytest.mark.parametrize(
+    "content_label",
+    [
+        "Payment details",
+        "Sign in to continue",
+        "Delete all conversations?",
+        "Windows Security",
+    ],
+)
+def test_generic_dialog_identity_blocks_when_semantics_exist_only_in_content(
+    content_label: str,
+) -> None:
+    observation = _observation(
+        elements=(
+            DesktopElement("0", "Wizard", "Dialog", addressable=False),
+            DesktopElement(
+                "1",
+                content_label,
+                "Text",
+                plane=ElementPlane.CONTENT,
+                addressable=False,
+            ),
+            DesktopElement("2", "Continue", "Button"),
+        ),
+    )
+
+    result = DesktopSafetyPolicy("personal_trusted").inspect_observation(observation)
+
+    if content_label == "Delete all conversations?":
+        assert result.disposition == DesktopSafetyDisposition.ALLOW
+        action_result = DesktopSafetyPolicy("personal_trusted").evaluate(
+            _action(DesktopActionType.CLICK, index="2"),
+            observation,
+            user_text="In Claude, click Continue and show Home",
+            expectation=DesktopExpectation(
+                DesktopExpectationKind.TEXT_PRESENT,
+                text="Home",
+            ),
+        )
+        assert action_result.disposition == DesktopSafetyDisposition.CONFIRM
+    else:
+        assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+@pytest.mark.parametrize(
+    "dialog_name",
+    ["Dialog", "Modal", "Popup", "Confirmation", "Confirmation dialog", "Untitled"],
+)
+def test_semantically_empty_dialog_container_names_fail_closed(dialog_name: str) -> None:
+    observation = _observation(
+        elements=(
+            DesktopElement("0", dialog_name, "Dialog", addressable=False),
+            DesktopElement("2", "Continue", "Button"),
+        ),
+    )
+
+    assert (
+        DesktopSafetyPolicy("personal_trusted").inspect_observation(observation).disposition
+        == DesktopSafetyDisposition.BLOCK
+    )

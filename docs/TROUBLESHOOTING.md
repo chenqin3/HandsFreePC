@@ -9,7 +9,11 @@
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml list-audio-devices
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml simulate --independent --file ./examples/demo_commands.txt
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml overlay-demo --text "我在听"
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml logs --tail 50
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml diagnose-last
 ```
+
+最后两条读取的是隐私受限的本地 JSONL 事件：`logs --tail 50` 展示最近 50 条，`diagnose-last` 只找最近一次失败。默认路径是 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl`；日志会轮转，且不含原始 prompt、UIA 正文/值、截图、provider stderr、绝对路径或凭据。优先看 `stage` 与 `error_code`，再定位下文对应层，不要只根据遮罩里的短句猜测原因。
 
 需要验证自有 UIA driver 时，再按 [TESTING.md](TESTING.md) 配置 `local_agent/windows_uia`、`planner_backend: none`，显式运行：
 
@@ -110,6 +114,44 @@ execution:
 - fixture/driver 异常：UIA 依赖、前台桌面、唯一文本框或 Unicode 验收失败。
 
 该命令不会替 Qwen driver、Codex/Claude planner 或真实应用做验收。失败时不要把 `planner_backend` 改成云端来绕过 fixture。
+
+## fixture 通过后，怎样检查 Claude / Codex
+
+`computer-doctor --live` 只证明项目自有 fixture。要确认真实应用能否被当前 UIA profile 观察，先打开并置前 Claude 或 Codex，再运行：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --observe-only
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --observe-only
+```
+
+`--observe-only` 不执行鼠标键盘动作，只报告脱敏控件统计、截断/省略情况和摘要；它不会打印聊天正文、字段值或截图。若这里失败，先修正 `apps.*.process_names/title_patterns`、重复窗口、目标窗口前台状态或应用辅助功能，不要直接尝试真实语音任务。
+
+只读观察通过后，才能显式做未发送草稿 smoke：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --draft-smoke
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --draft-smoke
+```
+
+该命令只向唯一、安全绑定的非密码编辑框写入随机 token，并 fresh observe 后本地读回；不会点击发送。成功后界面会留下未发送草稿，需人工清除。出现 `ComposerNotUnique`、没有可靠焦点、敏感输入框或读回失败时，应调整窗口/焦点或应用 profile 后重试，不要打开坐标 fallback。
+
+## `strict` 与 `personal_trusted` 表现不同
+
+公开示例默认：
+
+```yaml
+computer_control:
+  safety_profile: strict
+```
+
+`strict` 会让通用文本输入走绑定当前界面的随机码确认。本人的受监督电脑若希望先验证连续“听—导航—写草稿”，可以只在 Git 忽略的 `config.local.yaml` 中显式改为：
+
+```yaml
+computer_control:
+  safety_profile: personal_trusted
+```
+
+`personal_trusted` 可免确认完成安全导航，并把用户本句完整口述的文字写入唯一聚焦、非密码编辑框；它不自动发送。发送/提交、删除、上传/分享、安装/卸载、关闭等副作用仍需本轮随机码，密码/令牌/认证/付款/UAC/Windows Security 仍阻断，纯坐标、shell 和未可靠绑定的控件仍不可用。若草稿输入仍要求确认，检查当前配置实际加载的是哪个文件、`safety_profile` 拼写，以及目标输入框是否唯一、聚焦并由 UIA 标为非密码字段。
 
 ## 静态 doctor 通过，但 `computer-doctor --live` 失败
 
@@ -222,7 +264,7 @@ computer_control:
 
 ## 等待确认但“确认执行”无效
 
-0.3 confirmation 绑定一个 runtime 保存的 ID，并为每次 pending action 生成随机四位挑战码。提示会类似“确认执行 4 8 2 7”；只说静态“确认执行”永远无效，也不靠模型理解“确认”。无效原因包括：
+在 `strict` 下，通用文本输入会进入 confirmation；在 `personal_trusted` 下，只有满足唯一聚焦非密码输入框、文本等于本句完整口述且不构成发送等副作用的草稿输入才可免确认。其余需要确认的动作会绑定一个 runtime 保存的 ID，并为每次 pending action 生成随机四位挑战码。提示会类似“确认执行 4 8 2 7”；只说静态“确认执行”永远无效，也不靠模型理解“确认”。无效原因包括：
 
 - 确认提示尚未实际显示/完整播报；
 - 已超过 `execution.confirmation_timeout_seconds`；
@@ -317,6 +359,6 @@ $testTemp = Join-Path $PWD ('.pytest-tmp\run-' + [guid]::NewGuid().ToString('N')
 
 ## 报告问题
 
-请提供：版本/commit、Windows/Python、backend/driver/planner、脱敏 `error_type`、是否为 static/fixture/target-app 哪一层，以及最小复现。不要上传音频、完整转写、绝对路径、窗口截图、UIA 私人内容、token、登录缓存或 provider stderr。
+请提供：版本/commit、Windows/Python、backend/driver/planner/safety profile、`diagnose-last` 的脱敏 `stage` 与 `error_code`、是否为 static/fixture/target-app 哪一层，以及最小复现。不要上传音频、完整转写、绝对路径、窗口截图、UIA 私人内容、token、登录缓存或 provider stderr。
 
 涉及安全绕过时按根目录 [SECURITY.md](../SECURITY.md) 私密报告。

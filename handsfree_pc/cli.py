@@ -18,6 +18,14 @@ import yaml
 
 from .audio import build_transcriber, list_audio_devices
 from .config import DEFAULT_CONFIG, discover_config_path, load_settings
+from .diagnostics import (
+    DEFAULT_TAIL_COUNT,
+    MAX_TAIL_COUNT,
+    configure_diagnostics,
+    default_log_path,
+    diagnose_last_event,
+    tail_events,
+)
 from .downloads import download_models
 from .feedback import FeedbackController
 from .intents import DeterministicIntentParser
@@ -485,6 +493,69 @@ def command_computer_doctor(args: argparse.Namespace) -> int:
     return 0 if report["live_control_verified"] else 2
 
 
+def command_app_doctor(args: argparse.Namespace) -> int:
+    """Observe or draft-test a configured AI app without exposing chat content."""
+
+    from .app_doctor import AppDoctorFailure, run_app_doctor
+
+    report: dict[str, Any] = {
+        "app": args.app,
+        "mode": "draft-smoke" if args.draft_smoke else "observe-only",
+        "observe_succeeded": False,
+    }
+    if platform.system() != "Windows":
+        report.update(
+            error_code="UNSUPPORTED_PLATFORM",
+            safe_message="app-doctor requires an interactive Windows desktop",
+        )
+        _json(report)
+        return 2
+    try:
+        settings = load_settings(args.config, allow_missing=False)
+        control = settings.computer_control
+        if not control.enabled:
+            raise AppDoctorFailure(
+                "COMPUTER_CONTROL_DISABLED",
+                "Computer control is disabled in the selected configuration",
+            )
+        if control.backend != "local_agent" or control.driver != "windows_uia":
+            raise AppDoctorFailure(
+                "APP_DOCTOR_BACKEND_UNSUPPORTED",
+                "app-doctor requires the local_agent/windows_uia backend",
+            )
+        if settings.execution.dry_run:
+            raise AppDoctorFailure(
+                "DRY_RUN_ENABLED",
+                "app-doctor requires execution.dry_run=false",
+            )
+        report = run_app_doctor(
+            settings,
+            app=args.app,
+            draft_smoke=bool(args.draft_smoke),
+        )
+    except AppDoctorFailure as exc:
+        report.update(
+            error_code=exc.error_code,
+            safe_message=exc.safe_message,
+        )
+        _json(report)
+        return 2
+    except Exception as exc:
+        # Exception text may contain a title, path, UI label, or driver detail.
+        # Keep terminal output diagnosable without copying that private text.
+        report.update(
+            error_code="APP_DOCTOR_FAILED",
+            exception_type=type(exc).__name__,
+            safe_message="The local application diagnostic failed",
+        )
+        _json(report)
+        return 2
+    _json(report)
+    if args.draft_smoke:
+        return 0 if report.get("draft_smoke", {}).get("verified") is True else 2
+    return 0 if report.get("observe_succeeded") is True else 2
+
+
 def command_download_models(args: argparse.Namespace) -> int:
     models_dir = Path(args.directory).resolve()
     download_models(models_dir, force=args.force)
@@ -526,17 +597,79 @@ def command_overlay(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_logs(args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser().resolve() if args.path else default_log_path().resolve()
+    events = tail_events(path, limit=args.tail)
+    _json(
+        {
+            "log_file": path.name,
+            "event_count": len(events),
+            "events": events,
+        }
+    )
+    return 0
+
+
+def command_diagnose_last(args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser().resolve() if args.path else default_log_path().resolve()
+    event = diagnose_last_event(path)
+    _json(
+        {
+            "found": event is not None,
+            "log_file": path.name,
+            "event": event,
+        }
+    )
+    return 0
+
+
 def command_run(args: argparse.Namespace) -> int:
     from .runtime import VoiceRuntime
 
-    settings = load_settings(args.config)
-    runtime = VoiceRuntime(settings, _build_executor(settings))
+    diagnostics = configure_diagnostics()
+    runtime: VoiceRuntime | None = None
     try:
+        settings = load_settings(args.config)
+        runtime = VoiceRuntime(settings, _build_executor(settings), diagnostics=diagnostics)
+        diagnostics.event(
+            stage="runtime",
+            error_code="RUNTIME_STARTED",
+            safe_message="HandsFreePC voice runtime started",
+            level="info",
+        )
         runtime.run_microphone()
+        diagnostics.event(
+            stage="runtime",
+            error_code="RUNTIME_STOPPED",
+            safe_message="HandsFreePC voice runtime stopped normally",
+            level="info",
+        )
     except KeyboardInterrupt:
-        pass
+        diagnostics.event(
+            stage="runtime",
+            error_code="RUNTIME_STOPPED_BY_USER",
+            safe_message="HandsFreePC voice runtime was stopped by the user",
+            level="info",
+        )
+    except Exception as exc:
+        diagnostics.event(
+            stage="runtime",
+            error_code=(
+                "RUNTIME_INITIALIZATION_FAILED"
+                if runtime is None
+                else "RUNTIME_UNEXPECTED_FAILURE"
+            ),
+            safe_message=(
+                "HandsFreePC voice runtime could not initialize"
+                if runtime is None
+                else "HandsFreePC voice runtime stopped after an unexpected failure"
+            ),
+            exception_type=exc,
+        )
+        raise
     finally:
-        runtime.stop()
+        if runtime is not None:
+            runtime.stop()
     return 0
 
 
@@ -590,6 +723,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     computer_doctor.set_defaults(func=command_computer_doctor)
 
+    app_doctor = subparsers.add_parser(
+        "app-doctor",
+        help="Observe Claude/Codex or write one locally verified unsent draft",
+    )
+    app_doctor.add_argument("--app", required=True, choices=["claude", "codex"])
+    app_doctor_mode = app_doctor.add_mutually_exclusive_group()
+    app_doctor_mode.add_argument(
+        "--observe-only",
+        action="store_true",
+        help="Inspect safe UIA statistics without performing an action (default)",
+    )
+    app_doctor_mode.add_argument(
+        "--draft-smoke",
+        action="store_true",
+        help="Type one random draft into the verified composer without sending it",
+    )
+    app_doctor.set_defaults(func=command_app_doctor)
+
     downloader = subparsers.add_parser(
         "download-models", help="Download official local speech models"
     )
@@ -614,6 +765,27 @@ def build_parser() -> argparse.ArgumentParser:
     overlay.add_argument("--duration", type=float, default=3.0)
     overlay.add_argument("--mode", default="overlay", choices=[item.value for item in FeedbackMode])
     overlay.set_defaults(func=command_overlay)
+
+    logs = subparsers.add_parser("logs", help="Read privacy-bounded local diagnostic events")
+    logs.add_argument(
+        "--tail",
+        type=int,
+        nargs="?",
+        const=DEFAULT_TAIL_COUNT,
+        default=DEFAULT_TAIL_COUNT,
+        choices=range(1, MAX_TAIL_COUNT + 1),
+        metavar="N",
+        help=f"Show the newest N events (default {DEFAULT_TAIL_COUNT})",
+    )
+    logs.add_argument("--path", help=argparse.SUPPRESS)
+    logs.set_defaults(func=command_logs)
+
+    diagnose_last = subparsers.add_parser(
+        "diagnose-last",
+        help="Show the newest privacy-bounded failure event",
+    )
+    diagnose_last.add_argument("--path", help=argparse.SUPPRESS)
+    diagnose_last.set_defaults(func=command_diagnose_last)
 
     run_parser = subparsers.add_parser("run", help="Start the always-on local voice controller")
     run_parser.set_defaults(func=command_run)

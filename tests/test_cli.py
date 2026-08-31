@@ -5,6 +5,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 import handsfree_pc.cli as cli
@@ -239,3 +240,139 @@ execution:
     assert report["live_control_verified"] is False
     assert report["error_type"] == "ForegroundIntegrityBoundary"
     assert "private diagnostic details" not in json.dumps(report)
+
+
+def test_logs_tail_outputs_only_bounded_diagnostic_events(tmp_path, capsys) -> None:
+    path = tmp_path / "handsfreepc.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-31T00:00:00.000Z",
+                "level": "error",
+                "stage": "observe_driver",
+                "error_code": "UIA_READ_FAILED",
+                "safe_message": "UI Automation could not read the target app",
+                "prompt": "private prompt",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = cli.command_logs(SimpleNamespace(path=str(path), tail=10))
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["log_file"] == "handsfreepc.jsonl"
+    assert report["event_count"] == 1
+    assert "prompt" not in report["events"][0]
+
+
+def test_diagnose_last_reports_newest_failure_without_raw_fields(tmp_path, capsys) -> None:
+    path = tmp_path / "handsfreepc.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-31T00:00:00.000Z",
+                        "level": "error",
+                        "stage": "plan",
+                        "error_code": "PLANNER_FAILED",
+                        "safe_message": "Planner returned no safe next step",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-31T00:00:01.000Z",
+                        "level": "info",
+                        "stage": "runtime",
+                        "error_code": "QUEUE_PAUSED",
+                        "safe_message": "Queue paused",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = cli.command_diagnose_last(SimpleNamespace(path=str(path)))
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["found"] is True
+    assert report["event"]["stage"] == "plan"
+    assert report["event"]["error_code"] == "PLANNER_FAILED"
+
+
+def test_diagnostic_subcommands_accept_tail_and_empty_log(tmp_path, capsys) -> None:
+    parser = cli.build_parser()
+    logs_args = parser.parse_args(["logs", "--tail", "7", "--path", str(tmp_path / "none")])
+    diagnose_args = parser.parse_args(["diagnose-last", "--path", str(tmp_path / "none")])
+
+    assert logs_args.func(logs_args) == 0
+    logs_report = json.loads(capsys.readouterr().out)
+    assert logs_report["events"] == []
+    assert diagnose_args.func(diagnose_args) == 0
+    diagnose_report = json.loads(capsys.readouterr().out)
+    assert diagnose_report == {
+        "found": False,
+        "log_file": "none",
+        "event": None,
+    }
+
+
+def test_run_records_runtime_lifecycle_without_transcript_content(monkeypatch) -> None:
+    events: list[dict[str, object]] = []
+
+    class FakeDiagnostics:
+        def event(self, **kwargs):
+            events.append(kwargs)
+
+    class FakeRuntime:
+        stopped = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def run_microphone() -> None:
+            pass
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+    monkeypatch.setattr(cli, "load_settings", lambda _config: object())
+    monkeypatch.setattr(cli, "_build_executor", lambda _settings: object())
+    monkeypatch.setattr("handsfree_pc.runtime.VoiceRuntime", FakeRuntime)
+
+    assert cli.command_run(SimpleNamespace(config=None)) == 0
+    assert [event["error_code"] for event in events] == ["RUNTIME_STARTED", "RUNTIME_STOPPED"]
+    assert all("prompt" not in event and "uia_text" not in event for event in events)
+
+
+def test_run_records_initialization_failure_by_exception_type_only(monkeypatch) -> None:
+    events: list[dict[str, object]] = []
+
+    class FakeDiagnostics:
+        def event(self, **kwargs):
+            events.append(kwargs)
+
+    monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda _config: (_ for _ in ()).throw(RuntimeError("private configuration detail")),
+    )
+
+    with pytest.raises(RuntimeError, match="private configuration detail"):
+        cli.command_run(SimpleNamespace(config=None))
+
+    assert len(events) == 1
+    assert events[0]["stage"] == "runtime"
+    assert events[0]["error_code"] == "RUNTIME_INITIALIZATION_FAILED"
+    assert events[0]["safe_message"] == "HandsFreePC voice runtime could not initialize"
+    assert isinstance(events[0]["exception_type"], RuntimeError)
+    assert "private configuration detail" not in str(events[0]["safe_message"])

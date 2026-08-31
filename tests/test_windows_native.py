@@ -157,3 +157,16 @@ def test_activation_never_succeeds_without_exact_foreground_hwnd() -> None:
 
     assert user32.foreground == 202
     assert user32.attached == []
+
+
+def test_null_foreground_handle_is_treated_as_no_foreground_window() -> None:
+    user32 = ActivationUser32(promote_after_attach=False)
+    user32.foreground = None
+    native = build_native(user32)
+
+    assert native.get_foreground_window_info() is None
+    assert native.is_foreground(user32.target) is False
+    with pytest.raises(WindowActivationError, match="foreground window is 0"):
+        native.assert_foreground(user32.target)
+    with pytest.raises(WindowActivationError):
+        native.activate_window(user32.target, timeout=0.1)

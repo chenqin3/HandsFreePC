@@ -6,6 +6,7 @@ from ..windows.executor import WindowsExecutor
 from .agent_loop import DesktopAgentLoopController
 from .native_skills import NativeSkillRouter
 from .open_computer_use import PersistentOpenComputerUseDriver
+from .safety import DesktopSafetyPolicy
 from .step_planner import ClaudeDesktopStepPlanner, CodexDesktopStepPlanner, DesktopStepPlanner
 from .windows_uia import WindowsUiaDriver
 
@@ -39,6 +40,7 @@ def build_computer_controller(settings: Settings, executor: WindowsExecutor) -> 
         "model": control.model,
         "timeout_seconds": min(control.timeout_seconds, settings.planner.timeout_seconds),
         "max_observation_chars": control.max_observation_chars,
+        "safety_profile": control.safety_profile,
     }
     if control.planner_backend == "codex_cli_best_effort":
         planner = CodexDesktopStepPlanner(
@@ -55,6 +57,7 @@ def build_computer_controller(settings: Settings, executor: WindowsExecutor) -> 
         native_router=NativeSkillRouter(settings, executor=executor),
         driver=driver,
         planner=planner,
+        safety=DesktopSafetyPolicy(profile=control.safety_profile),
         timeout_seconds=control.timeout_seconds,
         confirmation_timeout_seconds=settings.execution.confirmation_timeout_seconds,
         max_steps=control.max_steps,

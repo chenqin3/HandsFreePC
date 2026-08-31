@@ -30,7 +30,7 @@ HandsFreePC 让 Windows 11 在双手被占用时继续接受语音操作：说�
 - 默认 `windows_uia` 驱动把元素索引绑定到应用、窗口和本次 observation generation；动作后旧索引立即失效；
 - 本地有限语法把动作类型、目标完整短语、完整口述输入 payload、按键、左右键/点击次数、secondary action、滚动方向/页数逐项绑定到当前用户步骤；`type/input` 只授权键入，`fill/write` 才授权直接设置字段值；不能把“Open settings”缩成当前唯一可见的“Open”，不能只输入口述文本的子串，也不能借用同句后续输入动作的 payload；若文本动作后还有独立、非空且肯定的 clause，payload 出现不能自证完成，必须验证用户给出的真实结果；条件句在没有本地条件求值器时整体拒绝，尚不支持的尾随桌面动作也会计入步骤数，不能被提前 `DONE` 掩盖；
 - 只有本地 verifier 通过才返回 `LOCAL_VERIFIED_COMPLETION`。驱动“已接受动作”或 planner “done”都不是证据；
-- 通用 agent 的 `type_text`/`set_value` 文本输入一律使用绑定到**确切动作与确切界面快照**的确认；点击/按键上下文被本地已知词形识别为发送/提交、删除、安装/卸载、上传/共享、关闭等副作用时也要求确认。每次提示会生成新的随机四位口令；只说静态“确认执行”、口令不匹配、已使用、超时或界面变化都会拒绝；
+- 公开配置默认使用 `strict`：通用 agent 的 `type_text`/`set_value` 文本输入使用绑定到**确切动作与确切界面快照**的确认。仅在本机忽略提交的配置里显式使用 `personal_trusted` 时，才可免确认执行安全导航，以及把用户本句完整口述的草稿写入唯一、已聚焦、非密码输入框；它不会自动点击发送。两种模式下，被本地已知词形识别为发送/提交、删除、安装/卸载、上传/共享、关闭等副作用仍要求确认；认证、密码、付款、UAC 和 Windows Security 界面仍直接阻断。每次确认提示会生成新的随机四位口令；只说静态“确认执行”、口令不匹配、已使用、超时或界面变化都会拒绝；
 - 风险词表和上下文规则不是完整语义证明：未知语言、同义词、自绘控件或伪装文案仍可能漏分。重要外发、删除、安装、分享或不可逆任务必须有人看屏幕监督；
 - 完整本地快照一旦被已知词形/元素属性识别为密码、凭据、付款/转账、认证、隐私/公开链接设置、终端/shell、UAC 或 Windows Security surface 就 fail closed；纯坐标点击默认阻断。未识别 surface 仍是残余风险；
 - 通用 UI 确认摘要若原文显示目标标签，只显示已由用户原句精确授权并再次验证的 exact target label；未授权 sibling/window 标签的原文和语义只在本地参与分类，不进入摘要，摘要中的不可逆短 digest 仅是绑定元数据；
@@ -96,6 +96,26 @@ execution:
 
 只有输出中 `live_control_verified: true` 才表示这次 fixture 验收通过。该结果仍不覆盖麦克风、云 planner、应用选择器、第三方窗口或业务任务；详见 [测试指南](docs/TESTING.md)。
 
+### 观察 Claude / Codex 的真实界面
+
+在 fixture 通过后，可用 `app-doctor` 对已经打开的目标应用做受控检查。先把目标 Claude 或 Codex 窗口置于当前桌面，再运行只读观察：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --observe-only
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --observe-only
+```
+
+`--observe-only` 不点击、不输入，只输出元素数量、控件类型、截断/省略统计和不可逆摘要等脱敏信息；不会输出聊天正文、输入值、窗口完整文本或截图。它用于确认应用 profile、窗口选择和 UIA tree 是否可用，不代表业务流程已经完成。
+
+确认观察结果正常后，可显式运行草稿 smoke：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --draft-smoke
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --draft-smoke
+```
+
+`--draft-smoke` 只会在可唯一、安全绑定的非密码编辑框中写入一个随机测试 token，再通过 fresh observe 和 LocalVerifier 读回；**不会点击发送，也不会替你提交 prompt**。它会在界面里留下未发送草稿，测试后可人工清除。若编辑框不唯一、没有可靠焦点、目标是敏感字段或界面无法读回，命令会失败关闭。
+
 ## 启用连续桌面 agent
 
 任意 UI 任务通常需要单步 planner。Codex 和 Claude 都可以规划；真正执行动作的仍是本地 `DesktopDriver`。只在被 Git 忽略的 `config.local.yaml` 中显式授权：
@@ -109,6 +129,7 @@ computer_control:
   backend: local_agent
   driver: windows_uia
   planner_backend: claude
+  safety_profile: personal_trusted
   allow_screen_context_to_cloud: true
   allow_codex_cli_host_read: false
   allow_legacy_codex_computer_use: false
@@ -119,7 +140,16 @@ execution:
   dry_run: false
 ```
 
-这会把完成的语音 prompt、唯一明确授权的可见应用摘要、observation generation、**仅限本句肯定且精确点名的 UIA 控件子集**和最近的本地验收摘要发送给选定的 planner。原始窗口标题、进程 ID、聊天正文、未点名控件、automation ID、元素 value、原始音频、截图字节和真实截图可用性不进入项目构造的单步 prompt；本地仍保留完整快照用于 freshness 与动作后验收。`allow_screen_context_to_cloud` 仍是必需的，因为被点名的控件标签和状态也属于屏幕上下文。先登录相应 CLI，再运行：
+公开仓库的 `config.example.yaml` 始终使用 `safety_profile: strict`。上面的 `personal_trusted` 只适合写入不会提交的 `config.local.yaml`，用于本人看着屏幕、目标应用和 Windows 会话都受信任的电脑：它允许 planner 逐步完成安全导航，并把**本句完整口述、未发送的草稿**写入唯一聚焦编辑框，减少抱娃场景下反复念确认码。它不是“关闭全部安全”；发送/提交、删除、上传/分享、安装/卸载、关闭等副作用仍要求本轮随机码，密码/令牌/认证/付款/UAC/Windows Security 仍阻断，纯坐标和 shell 仍不可用。
+
+若要复现公开项目的最保守行为，改回：
+
+```yaml
+computer_control:
+  safety_profile: strict
+```
+
+这会把完成的语音 prompt、唯一明确授权的可见应用摘要、observation generation 和最近的本地验收摘要发送给选定的 planner。`strict` 只暴露本句肯定且精确点名的可寻址控件；`personal_trusted` 还可暴露已授权应用内的安全导航控件和当前输入框，但内容层节点始终不进入 planner。原始窗口标题、进程 ID、聊天正文、automation ID、元素 value、原始音频、截图字节和真实截图可用性不进入项目构造的单步 prompt；本地仍保留完整快照用于 freshness 与动作后验收。`allow_screen_context_to_cloud` 仍是必需的，因为可见控件标签和状态也属于屏幕上下文。先登录相应 CLI，再运行：
 
 ```powershell
 ./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor --check-planner-auth --strict
@@ -169,6 +199,17 @@ Electron 应用的可访问标签会随版本变化。`apps.*.mode_names` 同时
 - `silent`：隐藏普通反馈，但安全确认/错误仍可能强制显示。
 
 可以说“切换到屏幕反馈”“切换到语音反馈”“大字和语音两种都开”或“切换到静默模式”。SAPI 播放期间采用半双工处理，播报结束前说的话可能被丢弃，且语音急停不能打断正在播放的 SAPI；需要连续快速输入时优先用 `overlay`。
+
+## 本地诊断日志
+
+运行时会写入有界轮转的 JSONL 诊断事件。任务失败后先看最近事件，再看最近一次失败：
+
+```powershell
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml logs --tail 50
+./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml diagnose-last
+```
+
+默认文件位于 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl`，单文件最大 2 MiB，保留 5 个备份。事件只保留 `stage`、`error_code`、异常类型、应用代号、observation generation 和短安全说明等白名单字段；不记录原始语音 prompt、完整转写、UIA 正文/值、截图、provider stderr、绝对路径或凭据。它是定位 `plan`、`observe_driver`、`action_safety`、`execute`、`reobserve`、`verify_action`、`verify_completion` 等阶段的诊断线索，不是完整操作审计。
 
 ## 可选 Qwen Open Computer Use 驱动
 
@@ -223,4 +264,4 @@ computer_control:
 
 ---
 
-**English summary:** HandsFreePC 0.3.0 keeps continuous local speech input, `over` segmentation, and FIFO execution, but replaces model-owned mouse/keyboard control with an owned Windows UIA driver. Claude CLI is the default strict step planner. Codex CLI is an explicit best-effort alternative that requires host-read consent and is not a guaranteed no-tools mode. Every generic planner action requires a false-before/true-after local postcondition; deterministic native skills use action-specific local evidence and may succeed idempotently when the exact target state already holds. Generic text entry requires a fresh random four-digit confirmation. Cloud planning and live control remain disabled by default. The legacy Codex Computer Use controller and Qwen open-computer-use 0.2.3 adapter are explicit, non-default compatibility/experimental options.
+**English summary:** HandsFreePC 0.3.0 keeps continuous local speech input, `over` segmentation, and FIFO execution, but replaces model-owned mouse/keyboard control with an owned Windows UIA driver. Claude CLI is the default strict step planner. Codex CLI is an explicit best-effort alternative that requires host-read consent and is not a guaranteed no-tools mode. Every generic planner action requires a false-before/true-after local postcondition; deterministic native skills use action-specific local evidence and may succeed idempotently when the exact target state already holds. The public `strict` profile requires a fresh random four-digit confirmation for generic text entry; an explicitly local `personal_trusted` profile may enter the user's exact spoken draft into one focused non-password field, but never auto-sends it and retains confirmation/blocking for side effects and sensitive surfaces. Cloud planning and live control remain disabled by default. The legacy Codex Computer Use controller and Qwen open-computer-use 0.2.3 adapter are explicit, non-default compatibility/experimental options.

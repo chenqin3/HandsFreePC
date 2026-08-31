@@ -79,6 +79,12 @@ class JobOutcome:
     message: str = ""
     cancelled: bool = False
     error_type: str | None = None
+    stage: str | None = None
+    error_code: str | None = None
+    safe_message: str | None = None
+    exception_type: str | None = None
+    app: str | None = None
+    generation: int | None = None
     started_at: float | None = None
     completed_at: float = field(default_factory=time.monotonic)
 

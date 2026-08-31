@@ -57,6 +57,7 @@ computer_control:
   enabled: true
   backend: local_agent
   planner_backend: claude
+  safety_profile: strict
   allow_screen_context_to_cloud: true
   allow_codex_cli_host_read: false
   allow_legacy_codex_computer_use: false
@@ -70,7 +71,7 @@ NativeSkillRouter miss 后，每个 planner step 当前可能收到：
 - 用户完成的一条语音 prompt；
 - 用户原句中唯一明确授权、且当前可见的 app 摘要；
 - 当前 task-authorized observation generation；
-- 只包含用户原句中肯定、精确点名控件的任务授权 UIA 子集；
+- `strict` 下只包含用户原句中肯定、精确点名控件的任务授权 UIA 子集；`personal_trusted` 下还可包含已授权应用内的安全导航控件与当前输入框；
 - 这些控件的 index、名称、control type、selected/focused/enabled 状态；
 - 最近最多 8 条本地验收历史；
 - 合成的应用级窗口标识。
@@ -84,7 +85,7 @@ NativeSkillRouter miss 后，每个 planner step 当前可能收到：
 - screenshot PNG bytes；
 - 真实 screenshot 是否存在/可用；
 - 原始窗口标题和进程 ID；
-- 未由当前任务明确点名的 UIA 元素、聊天正文和侧栏标题；
+- 聊天正文和其他 `CONTENT` plane 节点；`strict` 下也不发送未由当前任务明确点名的控件；
 - automation ID 和元素 value；
 - 剪贴板内容；
 - 全桌面截图；
@@ -92,9 +93,9 @@ NativeSkillRouter miss 后，每个 planner step 当前可能收到：
 - HandsFreePC 主动收集的密码字段值；
 - 名称含常见 API key/token/secret/password/credential 标记的环境变量。
 
-完整 UIA 快照可能包含病历、学生信息、客户数据、聊天内容、文件名或页面里的无关私人信息，因此只留在本地做 fingerprint、目标重绑定和 after-state 验收。云 planner 只接收任务授权子集；凭据样式长串还会被本地替换为 redaction marker。该最小化不是完整 DLP：用户亲口点名的控件标签仍会离机，也可能包含敏感词，所以仍要求独立屏幕上下文许可，并应先在非敏感测试账户验收。
+完整 UIA 快照可能包含病历、学生信息、客户数据、聊天内容、文件名或页面里的无关私人信息，因此只留在本地做 fingerprint、目标重绑定和 after-state 验收。云 planner 只接收按 profile 重建的最小控制子集，`CONTENT` plane 永不进入该子集；高置信度凭据节点会被删除/脱敏，普通不透明长标识也会从 planner view 排除。该最小化不是完整 DLP：可见控件标签仍可能离机并包含敏感内容，所以仍要求独立屏幕上下文许可，并应先在非敏感测试账户验收。
 
-密码元素值不会进入 observation；完整本地快照若被已知词形/元素属性识别为认证、password、UAC/Windows Security、凭据、付款、terminal/shell、隐私设置或公开链接/链接共享 surface，就在发送前 fail closed。未授权的敏感旁支原文不会发送，但仍参与本地分类。规则无法识别所有语言、同义词、自绘控件或伪装界面，因此这不是完整 DLP。
+密码元素值不会进入 observation。敏感 surface 分类依据顶层窗口/对话框身份、密码属性、当前聚焦输入框、相邻标签和具体目标元素；聊天正文中出现 password、terminal、payment 或凭据示例不会单独阻断整窗。真正的认证、密码、UAC/Windows Security、付款和聚焦 secret/API-key 输入 surface 仍在发送前 fail closed。规则无法识别所有语言、同义词、自绘控件或伪装界面，因此这不是完整 DLP。
 
 通用 UI confirmation 摘要若需要原文显示一个目标标签，只回显用户原句中已经验证的 exact target label。未授权 sibling/window label 的原文和语义只在本地分类，不进入摘要；摘要中的短 digest 只是不可逆绑定元数据。文本 payload 只取用户亲口给出的 exact span；确定性 native path 摘要可能另行显示已解析路径，因此 overlay/SAPI 的路径旁观风险仍适用。
 
@@ -122,7 +123,7 @@ Codex 的认证、传输、服务端留存、训练/数据控制、错误报告�
 
 driver 不使用剪贴板，不读取 password value，不保存 screenshot/audio/transcript 文件。操作会占用前台窗口，并可能让旁人看到输入或使目标应用自己产生历史、草稿、审计日志和云同步；这些外部持久化不受 `save_transcripts` 控制。
 
-通用 agent 的 `type_text`/`set_value` 即使只写草稿，也必须先显示/播报本轮随机四位一次性确认口令；单独说静态“确认执行”无效。同一 `VoiceRuntime` 进程内已签发码在确认、取消或超时后都不回收，有界重抽耗尽时拒绝；去重集合不持久化，重启后不保证绝对不复用。挑战码不是持久化防重放凭证或说话人认证，也不能阻止同一房间的人、扬声器或实时转述/重放获取本轮口令后代说。
+公开默认 `strict` 中，通用 agent 的 `type_text`/`set_value` 即使只写草稿，也必须先显示/播报本轮随机四位一次性确认口令。仅在本机忽略提交配置中显式启用的 `personal_trusted`，可把本句完整口述草稿免确认写入唯一聚焦、非密码输入框，但不会自动发送；发送、提交及其他副作用仍需确认。单独说静态“确认执行”无效。同一 `VoiceRuntime` 进程内已签发码在确认、取消或超时后都不回收，有界重抽耗尽时拒绝；去重集合不持久化，重启后不保证绝对不复用。挑战码不是持久化防重放凭证或说话人认证，也不能阻止同一房间的人、扬声器或实时转述/重放获取本轮口令后代说。
 
 ## Qwen open-computer-use 实验 driver
 
@@ -210,4 +211,4 @@ HandsFreePC 0.3 自身不建立音频/转写历史库。prompt assembler、FIFO�
 
 ---
 
-**English summary:** Audio recognition is local by default; HandsFreePC does not save audio or transcripts and disables cloud planning and live control. With the 0.3 local agent enabled, the default Claude planner—or an explicitly consented Codex CLI best-effort planner—may receive a completed transcript, visible-app summary, only the UI controls affirmatively and exactly named in that task, and recent local verification history. Raw window titles, process IDs, unrelated UI/chat content, automation IDs, element values, PCM, screenshot bytes, and actual screenshot availability are excluded from the project-built step prompt; the full snapshot stays local for verification. CLI/provider account, host, connection, runtime, and diagnostic metadata remain separate boundaries.
+**English summary:** Audio recognition is local by default; HandsFreePC does not save audio or transcripts and disables cloud planning and live control. With the 0.3 local agent enabled, the default Claude planner—or an explicitly consented Codex CLI best-effort planner—may receive a completed transcript, visible-app summary, task-named controls (`strict`) or locally classified safe navigation controls (`personal_trusted`), and recent local verification history. Content-plane nodes, raw window titles, process IDs, automation IDs, element values, PCM, screenshot bytes, and actual screenshot availability are excluded from the project-built step prompt; the full snapshot stays local for verification. CLI/provider account, host, connection, runtime, and diagnostic metadata remain separate boundaries.

@@ -10,6 +10,9 @@ import pytest
 
 import handsfree_pc.runtime as runtime_module
 from handsfree_pc.computer_control import ComputerControlResult
+from handsfree_pc.desktop.agent_loop import DesktopAgentLoopController
+from handsfree_pc.desktop.native_skills import NativeRouteStatus, NativeSkillResult
+from handsfree_pc.diagnostics import Diagnostics, tail_events
 from handsfree_pc.models import (
     Action,
     ActionType,
@@ -20,7 +23,7 @@ from handsfree_pc.models import (
     RuntimeState,
 )
 from handsfree_pc.runtime import VoiceRuntime, _merge_control_phrase_transcript
-from handsfree_pc.session import SessionState, WorkerState
+from handsfree_pc.session import JobOutcome, QueuedCommand, SessionState, WorkerState
 
 
 class FakeExecutor:
@@ -151,6 +154,192 @@ def test_continuous_session_queues_only_at_over_and_stays_active(settings) -> No
         assert runtime.session_state == SessionState.ACTIVE
     finally:
         runtime.stop()
+
+
+def test_control_failure_overlay_and_log_show_bounded_stage_without_raw_content(settings) -> None:
+    class FakeDiagnostics:
+        def __init__(self) -> None:
+            self.events = []
+
+        def event(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    feedback = FakeFeedback()
+    feedback.mode = FeedbackMode.BOTH
+    diagnostics = FakeDiagnostics()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=feedback,
+        diagnostics=diagnostics,
+    )
+    runtime._voice_session_id = "session-1"
+    command = QueuedCommand(
+        "private spoken prompt",
+        sequence=2,
+        session_id="session-1",
+        command_id="command-2",
+    )
+    private_value = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+    try:
+        runtime._on_control_outcome(
+            JobOutcome(
+                command,
+                success=False,
+                message=f"FAILURE: 本地安全策略阻止读取该界面：{private_value}",
+            )
+        )
+
+        overlay = feedback.events[-1][0]
+        assert "[observe_safety / OBSERVATION_SAFETY_BLOCKED]" in overlay
+        assert "本地界面安全检查未通过" in overlay
+        assert "handsfreepc.jsonl" in overlay
+        assert private_value not in overlay
+        assert diagnostics.events == [
+            {
+                "stage": "observe_safety",
+                "error_code": "OBSERVATION_SAFETY_BLOCKED",
+                "safe_message": "本地界面安全检查未通过",
+                "level": "error",
+                "session_id": "session-1",
+                "command_id": "command-2",
+                "sequence": 2,
+            }
+        ]
+        with runtime._voice_feedback_lock:
+            queued_voice = [text for _kind, text in runtime._voice_feedback]
+        assert queued_voice == ["第 2 条在界面安全检查阶段失败，队列已暂停"]
+        assert private_value not in queued_voice[0]
+    finally:
+        runtime.stop()
+
+
+def test_structured_controller_diagnostic_survives_queue_boundary(settings) -> None:
+    class FakeDiagnostics:
+        def __init__(self) -> None:
+            self.events = []
+
+        def event(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    enable_computer_control(settings)
+    diagnostics = FakeDiagnostics()
+    feedback = FakeFeedback()
+    controller = FakeController(
+        responses=[
+            ComputerControlResult(
+                False,
+                "FAILURE: private UIA body that must not be surfaced",
+                stage="reobserve",
+                error_code="FRESH_OBSERVATION_FAILED",
+                safe_message="动作后无法刷新目标应用的界面状态",
+                exception_type="WindowsUiaDriverError",
+                app="claude",
+                generation=7,
+            )
+        ]
+    )
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=feedback,
+        controller=controller,
+        diagnostics=diagnostics,
+    )
+    runtime._voice_session_id = "session-structured"
+    command = QueuedCommand(
+        "private spoken prompt",
+        sequence=3,
+        session_id="session-structured",
+        command_id="command-structured",
+    )
+    try:
+        outcome = runtime._run_queued_control(command, threading.Event())
+
+        assert outcome.stage == "reobserve"
+        assert outcome.error_code == "FRESH_OBSERVATION_FAILED"
+        assert outcome.safe_message == "动作后无法刷新目标应用的界面状态"
+        assert outcome.exception_type == "WindowsUiaDriverError"
+        assert outcome.app == "claude"
+        assert outcome.generation == 7
+
+        runtime._on_control_outcome(outcome)
+
+        assert diagnostics.events == [
+            {
+                "stage": "reobserve",
+                "error_code": "FRESH_OBSERVATION_FAILED",
+                "safe_message": "动作后无法刷新目标应用的界面状态",
+                "level": "error",
+                "session_id": "session-structured",
+                "command_id": "command-structured",
+                "sequence": 3,
+                "exception_type": "WindowsUiaDriverError",
+                "app": "claude",
+                "generation": 7,
+            }
+        ]
+        assert "private UIA body" not in feedback.events[-1][0]
+    finally:
+        runtime.stop()
+
+
+def test_real_controller_failure_reaches_runtime_jsonl_with_stage_and_code(
+    settings,
+    tmp_path,
+) -> None:
+    class MissRouter:
+        @staticmethod
+        def route(_instruction):
+            return NativeSkillResult(NativeRouteStatus.MISS, "miss")
+
+    class UnusedDriver:
+        @staticmethod
+        def cancel():
+            return False
+
+        @staticmethod
+        def close():
+            return None
+
+    enable_computer_control(settings)
+    path = tmp_path / "handsfreepc.jsonl"
+    diagnostics = Diagnostics(path)
+    controller = DesktopAgentLoopController(
+        native_router=MissRouter(),
+        driver=UnusedDriver(),
+        planner=None,
+    )
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+        diagnostics=diagnostics,
+    )
+    runtime._voice_session_id = "session-real-controller"
+    command = QueuedCommand(
+        "在 Claude 打开设计",
+        sequence=1,
+        session_id="session-real-controller",
+        command_id="command-real-controller",
+    )
+    try:
+        outcome = runtime._run_queued_control(command, threading.Event())
+        runtime._on_control_outcome(outcome)
+
+        assert outcome.stage == "plan"
+        assert outcome.error_code == "PLANNER_NOT_CONFIGURED"
+        diagnostics.close()
+        events = tail_events(path)
+        assert len(events) == 1
+        assert events[0]["stage"] == "plan"
+        assert events[0]["error_code"] == "PLANNER_NOT_CONFIGURED"
+        assert events[0]["session_id"] == "session-real-controller"
+        assert events[0]["command_id"] == "command-real-controller"
+    finally:
+        runtime.stop()
+        diagnostics.close()
 
 
 def test_control_phrase_transcript_overlap_preserves_real_command_text() -> None:

@@ -218,17 +218,42 @@ class UIABackend:
     def _is_password(element: Any) -> bool:
         """Read UIA_IsPasswordPropertyId (30019) through common wrapper surfaces."""
 
-        info = getattr(element, "element_info", None)
+        missing = object()
+        read_errors: list[Exception] = []
+
+        def read_member(owner: Any, attribute_name: str, *, invoke: bool = True) -> Any:
+            try:
+                member = getattr(owner, attribute_name)
+            except AttributeError:
+                return missing
+            except Exception as exc:
+                read_errors.append(exc)
+                return missing
+            if not callable(member) or not invoke:
+                return member
+            try:
+                return member()
+            except Exception as exc:
+                read_errors.append(exc)
+                return missing
+
+        try:
+            info = getattr(element, "element_info", None)
+        except Exception as exc:
+            read_errors.append(exc)
+            info = None
         for owner in (element, info):
             if owner is None:
                 continue
             for attribute_name in ("is_password", "password", "IsPassword"):
-                value = _safe_call(owner, attribute_name, None)
+                value = read_member(owner, attribute_name)
+                if value is missing:
+                    continue
                 coerced = _coerce_bool(value)
                 if coerced is not None:
                     return coerced
 
-        properties = _safe_call(element, "get_properties", None)
+        properties = read_member(element, "get_properties")
         if isinstance(properties, dict):
             for key in ("is_password", "password", "IsPassword"):
                 coerced = _coerce_bool(properties.get(key))
@@ -240,18 +265,29 @@ class UIABackend:
                 continue
             raw_element = None
             for attribute_name in ("element", "_element", "uia_element"):
-                candidate = getattr(owner, attribute_name, None)
+                candidate = read_member(owner, attribute_name)
+                if candidate is missing:
+                    continue
                 if candidate is not None:
                     raw_element = candidate
                     break
-            get_property = getattr(raw_element, "GetCurrentPropertyValue", None)
+            if raw_element is None:
+                continue
+            get_property = read_member(
+                raw_element,
+                "GetCurrentPropertyValue",
+                invoke=False,
+            )
             if callable(get_property):
                 try:
                     coerced = _coerce_bool(get_property(30019))
                 except Exception as exc:
-                    raise UIAError("Could not read the UIA password property") from exc
+                    read_errors.append(exc)
+                    continue
                 if coerced is not None:
                     return coerced
+        if read_errors:
+            raise UIAError("Could not read the UIA password property") from read_errors[0]
         return False
 
     def _assert_not_password(self, element: Any) -> None:
@@ -305,6 +341,25 @@ class UIABackend:
         toggle_state = _safe_call(element, "get_toggle_state", None)
         if isinstance(toggle_state, int):
             return toggle_state == 1
+        info = _safe_attr(element, "element_info", None)
+        raw_aria = _safe_attr(
+            _safe_attr(info, "element", None),
+            "CurrentAriaProperties",
+            "",
+        )
+        if isinstance(raw_aria, str):
+            aria: dict[str, str] = {}
+            for item in raw_aria.split(";"):
+                key, separator, value = item.partition("=")
+                if separator:
+                    aria[key.strip().casefold()] = value.strip().casefold()
+            for key in ("selected", "pressed", "checked"):
+                if aria.get(key) in {"true", "1"}:
+                    return True
+                if aria.get(key) in {"false", "0"}:
+                    return False
+            if "current" in aria:
+                return aria["current"] not in {"", "false", "0", "none"}
         return None
 
     def _tree_signature(self, hwnd: int) -> tuple[tuple[str, str, str, str], ...]:

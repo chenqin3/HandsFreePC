@@ -24,6 +24,7 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .pytest-tmp*/
+.pytest_tmp*/
 .pytest-root/
 .pytest-audit*/
 .ruff_cache/

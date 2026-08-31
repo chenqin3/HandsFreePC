@@ -1,0 +1,52 @@
+{
+  "app": "claude",
+  "window_title": "Claude",
+  "elements": [
+    {
+      "index": "10",
+      "name": "Chat and Cowork",
+      "control_type": "Button",
+      "enabled": true
+    },
+    {
+      "index": "11",
+      "name": "Code",
+      "control_type": "Button",
+      "enabled": true
+    },
+    {
+      "index": "12",
+      "name": "",
+      "control_type": "Edit",
+      "value": "",
+      "focused": true,
+      "enabled": true
+    },
+    {
+      "index": "13",
+      "name": "conversation-content-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "control_type": "Document",
+      "value": "Discussing password, terminal, payment and fake sk-proj-abcdefghijklmnopqrstuvwxyz012345 in ordinary chat content. Opaque id: AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_TOKEN",
+      "enabled": true
+    }
+  ],
+  "uia_elements": [
+    {"name": "Chat and Cowork", "control_type": "Button"},
+    {"name": "Code", "control_type": "Button"},
+    {"name": "New chat", "control_type": "Button"},
+    {
+      "name": "Prompt",
+      "control_type": "Edit",
+      "value": "",
+      "focused": true,
+      "runtime_id": [42, 1],
+      "aria_properties": "readonly=false;multiline=true",
+      "aria_role": "textbox"
+    },
+    {
+      "name": "conversation-content-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "control_type": "Document",
+      "value": "Untrusted content examples only: sk-proj-abcdefghijklmnopqrstuvwxyz012345 github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 AKIAABCDEFGHIJKLMNOP -----BEGIN PRIVATE KEY----- plus password terminal payment API Key words. None is an actionable control."
+    }
+  ]
+}
