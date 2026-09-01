@@ -958,7 +958,14 @@ class NativeWindows:
         before: dict[str, object],
         timeout: float = 8.0,
     ) -> dict[str, object]:
-        """Wait until a false-before exact path condition becomes true locally."""
+        """Wait until a false-before exact path condition becomes true locally.
+
+        Explorer can navigate the current tab without changing its top-level
+        HWND, and its COM folder identity proves the exact directory. File
+        verification currently has only a foreground title match, so it still
+        requires a new foreground HWND rather than accepting a same-window
+        document with the same basename.
+        """
 
         if before.get("verified") is True:
             raise NativeWindowsError("The requested path was already open in the foreground")
@@ -966,11 +973,14 @@ class NativeWindows:
         while True:
             current = self.path_open_state(path)
             foreground_changed = current.get("foreground_hwnd") != before.get("foreground_hwnd")
-            if current.get("verified") is True and foreground_changed:
+            exact_directory = current.get("kind") == "explorer_directory"
+            if current.get("verified") is True and (
+                exact_directory or foreground_changed
+            ):
                 return {
                     "postcondition_verified": True,
                     "verification_kind": current.get("kind"),
-                    "foreground_changed": True,
+                    "foreground_changed": foreground_changed,
                 }
             if self._monotonic() >= deadline:
                 raise NativeWindowsError(

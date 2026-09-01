@@ -133,6 +133,32 @@ def test_ocr_regions_require_the_screenshot_visual_layer(tmp_path: Path) -> None
         load_settings(config)
 
 
+def test_visual_ocr_wildcard_requires_enabled_local_unrestricted_mode(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        'visual_ocr:\n  apps: ["*"]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="wildcard.*local_unrestricted"):
+        load_settings(config)
+
+    config.write_text(
+        "computer_control:\n"
+        "  safety_profile: local_unrestricted\n"
+        "visual_ocr:\n"
+        "  enabled: true\n"
+        '  apps: ["*"]\n',
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.visual_ocr.apps == ["*"]
+
+
 def test_personal_runtime_can_continue_fifo_after_an_ordinary_failure(tmp_path: Path) -> None:
     config = tmp_path / "config.yaml"
     config.write_text(

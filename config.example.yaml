@@ -148,15 +148,18 @@ computer_control:
   allow_experimental_driver: false
   allow_coordinate_actions: false
 
-# Optional exact-window visual fallback for apps whose accessibility tree exposes
-# no usable controls. The complete screenshot is the primary planner input.
-# PaddleOCR text regions are a separate, optional enhancement and never need to
-# be enabled for screenshot planning or frame-bound point clicks.
+# Optional exact-window visual context for selected apps. Every matched window
+# retains its complete screenshot viewport even when rich UIA controls exist;
+# semantic UIA controls remain preferred, while the screenshot is also available
+# to a configured visual planner and may leave the machine. PaddleOCR text regions
+# are a separate optional enhancement and are not required for screenshot planning.
 visual_ocr:
   enabled: false
   ocr_regions_enabled: false
   endpoint: http://127.0.0.1:8766/layout-parsing
   allow_remote_screen_ocr: false
+  # In an ignored local_unrestricted config, use ["*"] to retain an exact-window
+  # screenshot viewport for every freshly enumerated visible top-level window.
   apps: [codex, wechat]
   timeout_seconds: 60
   max_image_bytes: 8388608

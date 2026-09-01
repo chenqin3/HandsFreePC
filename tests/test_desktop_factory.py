@@ -85,6 +85,19 @@ def test_factory_wires_screenshot_visual_planning_without_requiring_ocr(tmp_path
     assert controller.driver._visual_ocr_apps == {"codex", "wechat"}
 
 
+def test_factory_wires_explicit_visual_wildcard_for_local_unrestricted(tmp_path):
+    settings = _settings(tmp_path)
+    settings.computer_control.safety_profile = "local_unrestricted"
+    settings.visual_ocr.enabled = True
+    settings.visual_ocr.apps = ["*"]
+
+    controller = build_computer_controller(settings, FakeExecutor())
+
+    assert controller.driver._discover_all_windows is True
+    assert controller.driver._visual_screenshot_enabled is True
+    assert controller.driver._visual_ocr_apps == {"*"}
+
+
 def test_factory_wires_optional_ocr_regions_only_after_separate_opt_in(tmp_path):
     settings = _settings(tmp_path)
     settings.computer_control.safety_profile = "local_unrestricted"

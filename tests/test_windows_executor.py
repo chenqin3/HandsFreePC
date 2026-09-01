@@ -270,7 +270,7 @@ def test_open_path_refuses_a_postcondition_that_was_already_true(settings, tmp_p
     assert "open_path" not in {call[0] for call in native.calls}
 
 
-def test_file_title_match_without_new_foreground_window_is_not_verified(monkeypatch):
+def test_file_title_match_in_same_foreground_window_is_not_exact_path_proof(monkeypatch):
     clock = [0.0]
 
     def sleeper(duration):
@@ -298,6 +298,28 @@ def test_file_title_match_without_new_foreground_window_is_not_verified(monkeypa
             before={"verified": False, "foreground_hwnd": 101},
             timeout=0.2,
         )
+
+
+def test_exact_explorer_directory_transition_in_same_hwnd_is_verified(monkeypatch):
+    native = NativeWindows(user32=object(), shell32=object())
+    monkeypatch.setattr(
+        native,
+        "path_open_state",
+        lambda _path: {
+            "kind": "explorer_directory",
+            "verified": True,
+            "foreground_hwnd": 101,
+        },
+    )
+
+    result = native.wait_for_path_open(
+        r"G:\deep\folder",
+        before={"verified": False, "foreground_hwnd": 101},
+        timeout=0.2,
+    )
+
+    assert result["postcondition_verified"] is True
+    assert result["foreground_changed"] is False
 
 
 def test_secure_desktop_blocks_path_dispatch(settings, tmp_path):

@@ -953,9 +953,18 @@ def _validate(settings: Settings) -> None:
         raise ValueError("visual_ocr.max_text_chars must be between 8 and 512")
     if not 0 <= settings.visual_ocr.bbox_tolerance_pixels <= 32:
         raise ValueError("visual_ocr.bbox_tolerance_pixels must be between 0 and 32")
-    unknown_visual_apps = {
+    normalized_visual_apps = {
         item.strip().casefold() for item in settings.visual_ocr.apps
-    } - set(settings.apps)
+    }
+    if "*" in normalized_visual_apps and (
+        not settings.visual_ocr.enabled
+        or settings.computer_control.safety_profile != "local_unrestricted"
+    ):
+        raise ValueError(
+            "visual_ocr.apps wildcard '*' requires visual_ocr.enabled=true and "
+            "computer_control.safety_profile=local_unrestricted"
+        )
+    unknown_visual_apps = normalized_visual_apps - set(settings.apps) - {"*"}
     if unknown_visual_apps:
         raise ValueError("visual_ocr.apps must name configured apps")
     if settings.visual_ocr.enabled:

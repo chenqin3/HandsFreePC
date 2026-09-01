@@ -291,11 +291,11 @@ def test_parser_rebinds_armed_visual_search_text_to_the_viewport() -> None:
     assert decision.expectation.text is None
 
 
-def test_parser_rebinds_one_armed_visual_search_enter_to_the_viewport() -> None:
+def test_parser_rejects_press_key_targeting_visual_viewport() -> None:
     payload = _decision_payload()
     payload["action"] = {
         "type": "press_key",
-        "element_index": "0",
+        "element_index": "7",
         "key": "enter",
     }
     payload["expectation"] = {"kind": "search_submitted", "text": "文件传输助手"}
@@ -319,17 +319,48 @@ def test_parser_rebinds_one_armed_visual_search_enter_to_the_viewport() -> None:
         ),
     )
 
+    with pytest.raises(DesktopPlannerError, match="VisualViewport never supports press_key"):
+        _parse_decision_payload(payload, observation=observation)
+
+
+def test_parser_preserves_enter_on_focused_semantic_search_input() -> None:
+    payload = _decision_payload()
+    payload["action"] = {
+        "type": "press_key",
+        "element_index": "2",
+        "key": "enter",
+    }
+    payload["expectation"] = {"kind": "search_submitted", "text": "文件传输助手"}
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="semantic search",
+        elements=(
+            DesktopElement(
+                "2",
+                "Search",
+                "SearchBox",
+                value="文件传输助手",
+                focused=True,
+                editable=True,
+                plane=ElementPlane.INPUT,
+                supported_actions=(DesktopElementAction.PRESS_KEY,),
+            ),
+        ),
+    )
+
     decision = _parse_decision_payload(payload, observation=observation)
 
     assert decision.action is not None
-    assert decision.action.element_index == "7"
+    assert decision.action.type == DesktopActionType.PRESS_KEY
+    assert decision.action.element_index == "2"
     assert decision.action.key == "enter"
     assert decision.expectation is not None
-    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
-    assert decision.expectation.text is None
+    assert decision.expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED
+    assert decision.expectation.text == "文件传输助手"
 
 
-def test_parser_advances_armed_visual_search_instead_of_clicking_field_again() -> None:
+def test_parser_never_turns_a_repeat_visual_click_into_an_unrequested_enter() -> None:
     payload = _decision_payload()
     payload["action"] = {
         "type": "click",
@@ -346,7 +377,7 @@ def test_parser_advances_armed_visual_search_instead_of_clicking_field_again() -
     observation = DesktopObservation(
         app="claude",
         generation=8,
-        accessibility_text="visual search submission armed",
+        accessibility_text="visual filter results",
         screenshot_png=_png(1200, 800),
         elements=(
             DesktopElement(
@@ -355,10 +386,7 @@ def test_parser_advances_armed_visual_search_instead_of_clicking_field_again() -
                 "VisualViewport",
                 plane=ElementPlane.CONTROL,
                 visual_ocr=True,
-                supported_actions=(
-                    DesktopElementAction.CLICK,
-                    DesktopElementAction.PRESS_KEY,
-                ),
+                supported_actions=(DesktopElementAction.CLICK,),
             ),
         ),
     )
@@ -366,16 +394,16 @@ def test_parser_advances_armed_visual_search_instead_of_clicking_field_again() -
     decision = _parse_decision_payload(payload, observation=observation)
 
     assert decision.action is not None
-    assert decision.action.type == DesktopActionType.PRESS_KEY
+    assert decision.action.type == DesktopActionType.CLICK
     assert decision.action.element_index == "7"
-    assert decision.action.key == "enter"
-    assert decision.action.x is None
-    assert decision.action.y is None
+    assert decision.action.key is None
+    assert decision.action.x == 280
+    assert decision.action.y == 90
     assert decision.expectation is not None
     assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
 
 
-def test_parser_preserves_unique_result_button_click_while_visual_search_is_armed() -> None:
+def test_parser_preserves_unique_result_button_click_with_visual_results() -> None:
     label = "文件传输助手 在手机和电脑之间传输各类文件 前往"
     payload = _decision_payload()
     payload["action"] = {
@@ -407,10 +435,7 @@ def test_parser_preserves_unique_result_button_click_while_visual_search_is_arme
                 "VisualViewport",
                 plane=ElementPlane.CONTROL,
                 visual_ocr=True,
-                supported_actions=(
-                    DesktopElementAction.CLICK,
-                    DesktopElementAction.PRESS_KEY,
-                ),
+                supported_actions=(DesktopElementAction.CLICK,),
             ),
         ),
     )
@@ -426,7 +451,7 @@ def test_parser_preserves_unique_result_button_click_while_visual_search_is_arme
     assert decision.expectation.text == label
 
 
-def test_parser_preserves_armed_viewport_click_outside_the_search_zone() -> None:
+def test_parser_preserves_viewport_click_outside_the_top_zone() -> None:
     payload = _decision_payload()
     payload["action"] = {
         "type": "click",
@@ -443,7 +468,7 @@ def test_parser_preserves_armed_viewport_click_outside_the_search_zone() -> None
     observation = DesktopObservation(
         app="claude",
         generation=8,
-        accessibility_text="visual search submission armed",
+        accessibility_text="visual filter results",
         screenshot_png=_png(1200, 800),
         elements=(
             DesktopElement(
@@ -452,10 +477,7 @@ def test_parser_preserves_armed_viewport_click_outside_the_search_zone() -> None
                 "VisualViewport",
                 plane=ElementPlane.CONTROL,
                 visual_ocr=True,
-                supported_actions=(
-                    DesktopElementAction.CLICK,
-                    DesktopElementAction.PRESS_KEY,
-                ),
+                supported_actions=(DesktopElementAction.CLICK,),
             ),
         ),
     )
@@ -683,6 +705,7 @@ def test_local_unrestricted_policy_supports_unscoped_cross_app_search():
     assert "across listed applications" in policy
     assert "search for X" in policy
     assert "return done with app_visible" in policy
+    assert "unsent draft/message/prompt" in policy
     assert "last_action_verified" in policy
     assert "scrollintoview" in policy
     assert "does not complete a user step" in policy

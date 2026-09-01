@@ -664,14 +664,37 @@ def _mask_navigation_pin(context: str) -> str:
     )
 
 
+_SEQUENTIAL_ACTION_START_PATTERN = (
+    r"(?:点击|点开|打开|开启|选择|切换到|切换至|切到|转到|进入|查看|"
+    r"按(?:下|一下)?|滚动|输入(?!框)|键入|填写|写入|搜索|查找|检索|"
+    r"搜一下|搜一搜|激活|执行|操作|使用|删除|关闭|展开|折叠|"
+    r"\b(?:click|open|choose|select|switch(?:\s+to)?|go\s+to|navigate\s+to|"
+    r"enter|view|press|scroll|type|input|fill|write|search|find|look\s+up|"
+    r"activate|execute|operate|use|delete|close|expand|collapse|focus|launch)\b)"
+)
+_SEQUENTIAL_CONNECTOR_RE = re.compile(
+    rf"(?:\bafter\s+that\b|之后|随后|接着|并|再)"
+    rf"(?=\s*(?:[,，;；]\s*)?(?:(?:then|next|please|kindly)\s+|"
+    rf"(?:然后|再|接着|随后|请|麻烦|帮我)\s*)*"
+    rf"{_SEQUENTIAL_ACTION_START_PATTERN})",
+    re.IGNORECASE,
+)
 _CLAUSE_BOUNDARY_RE = re.compile(
-    r"[，。；,;.!！？?\n]|但是|不过|然后|并且|而且|以及|但|\b(?:but|then|and)\b",
+    rf"[，。；,;.!！？?\n]|但是|不过|然后|并且|而且|以及|但|"
+    rf"\b(?:but|then|and)\b|{_SEQUENTIAL_CONNECTOR_RE.pattern}|"
+    rf"(?<=[A-Za-z0-9])(?={_SEQUENTIAL_ACTION_START_PATTERN})",
     re.IGNORECASE,
 )
 _NEGATED_ACTION_RE = re.compile(
-    r"(?:不要|不能|请勿|避免|切勿|不得|莫|别|不用|无需|禁止|不许|不想|忽略|不可|勿|"
+    r"(?:不要|不能|请勿|避免|切勿|不得|莫|别|不用|无需|不必|禁止|不许|不想|忽略|不可|勿|"
     r"不应|不应该|不该|不会|没有|尚未|未|拒绝|"
-    r"\bdo\s+not\b|\bdon't\b|\bcannot\b|\bcan't\b|\bshould\s+not\b|"
+    r"跳过\s*(?=点击|点开|打开|开启|选择|按|滚动|输入|搜索|查找|检索)|"
+    r"\bdo\s+not\b|\bdon't\b|\brefrain(?:ed|ing)?\s+from\b|"
+    r"\b(?:there\s+is\s+)?no\s+need\s+to\b|"
+    r"\b(?:do(?:es)?\s+not|don't|doesn't)\s+need\s+to\b|\bneed\s+not\b|"
+    r"\bskip\s+(?=clicking|pressing|opening|choosing|selecting|switching|"
+    r"entering|scrolling|typing|inputting|filling|writing|searching|finding)|"
+    r"\bcannot\b|\bcan't\b|\bshould\s+not\b|"
     r"\bshouldn't\b|\bmust\s+not\b|\bmustn't\b|\bnot\b|\bnever\b|"
     r"\b[a-z]+n't\b|\bwithout\b|\bignore\b|\bavoid\b|\brefuse\s+to\b)",
     re.IGNORECASE,
@@ -898,7 +921,7 @@ _DISALLOWED_EXPECTATION_BRIDGE_RE = re.compile(
     re.IGNORECASE,
 )
 _UNSUPPORTED_CONTROL_CONDITION_RE = re.compile(
-    r"(?:\b(?:only\s+if|if|when|whenever|unless|before|after|while|because|should|where|"
+    r"(?:\b(?:only\s+if|if|when|whenever|unless|before|after|while|because|where|"
     r"once|since|as\s+long\s+as|so\s+long\s+as|insofar\s+as|lest|in\s+case|"
     r"as\s+soon\s+as|at\s+such\s+time\s+as|by\s+the\s+time|"
     r"in\s+the\s+event\s+that|(?:on|under)\s+(?:the\s+)?condition\s+that|"
@@ -907,14 +930,34 @@ _UNSUPPORTED_CONTROL_CONDITION_RE = re.compile(
     r"suppose(?:d)?|assume(?:d)?|presuming(?:\s+that)?|contingent\s+on|"
     r"subject\s+to|whether|provided(?:\s+that)?|providing(?:\s+that)?|"
     r"assuming(?:\s+that)?)\b|"
-    r"如果|若|假如|倘若|要是|假设|当|一旦|除非|只要|因为|由于|之前|之后|"
-    r"待|的话|假使|如若|倘使|若是|万一|假定|条件是|前提是|取决于|"
+    r"如果|若|假如|倘若|要是|假设|一旦|除非|只要|因为|由于|之前|之后|"
+    r"的话|假使|如若|倘使|若是|万一|假定|条件是|前提是|取决于|"
     r"情况下|前提下|为条件|为前提|视[^，。；,;.!！？?\n]{1,120}是否|"
+    r"(?:当|待)[^，。；,;.!！？?\n]{1,120}(?:时|后|[,，])|"
     r"在[^，。；,;.!！？?\n]{1,120}时(?:[,，])?)",
+    re.IGNORECASE,
+)
+_REPORTED_ACTION_CONTEXT_RE = re.compile(
+    r"(?:\b(?:the\s+)?(?:page|screen|message|instruction|text|document|website|app)\s+"
+    r"(?:says?|reads?|shows?|states?|tells?\s+me)\b|"
+    r"\b(?:he|she|they|it|[a-z][a-z0-9_-]{1,30})"
+    r"(?:\s+[a-z][a-z0-9_-]{1,30}){0,2}\s+"
+    r"(?:said|says|told|tells|wrote|writes|read|reads)\b|"
+    r"\bi\s+(?:heard|saw|read)\b[^，。；,;.!！？?\n]{0,80}"
+    r"(?:\bsay(?:ing|s)?\b|\bwrite(?:s|ten|ing)?\b|\bread(?:s|ing)?\b)|"
+    r"(?:页面|屏幕|消息|指令|文本|文档|网站|应用)[^，。；,;.!！？?\n]{0,40}"
+    r"(?:写着|写道|显示|说|要求)|"
+    r"(?:他|她|他们|她们|[a-z0-9_-]{2,32})\s*(?:说|说道|写着|写道|要求)|"
+    r"(?:我)?(?:听见|听到|看到|读到)[^，。；,;.!！？?\n]{0,60}"
+    r"(?:说|写着|写道|要求))",
     re.IGNORECASE,
 )
 _ACTION_OUTCOME_START_RE = re.compile(
     r"(?:\b(?:so(?:\s+that)?|until|"
+    r"which\s+(?:(?:it\s+)?(?:should|would|will|can|could|must)\s+)?"
+    r"(?:show|display|reveal|make|cause)|"
+    r"(?:(?:it\s+)?(?:should|would|will|can|could|must)\s+)"
+    r"(?:show|display|reveal|make|cause)|"
     r"to\s+(?:show|display|reveal|see|verify|check|make|ensure|cause|get|have)|"
     r"to\s+(?:[a-z]+ly\s+)*(?:send|submit|delete|remove|open|select|choose|switch|"
     r"upload|share|install|uninstall|close|dismiss|save|publish|unpublish)|"
@@ -923,6 +966,11 @@ _ACTION_OUTCOME_START_RE = re.compile(
     r"[，,;；。.!]\s*(?:expect(?:ed|ing)?(?:\s+(?:to|that))?|"
     r"(?:the\s+)?(?:outcome|result)(?:\s+(?:is|will|should|must)\b)?)|"
     r"以便|以(?:显示|看到|展示|验证|检查)|直到|直至|"
+    r"(?:这样|如此)(?:(?:就|便|可以|能够|能|会|将|从而))*"
+    r"(?:显示|出现|展示|看到|可见)|"
+    r"从而(?:(?:可以|能够|能|会|将))*?(?:显示|出现|展示|看到|可见)|"
+    r"(?:后)?(?:(?:应该|应当)(?:会|将|可以|能够|能)?|"
+    r"会|将|就能|可以|可|能够|能)(?:显示|出现|展示|看到|可见)|"
     r"并(?:显示|看到|展示|验证|检查)|让|使|"
     r"发送|提交|删除|移除|打开|选择|切换|上传|分享|安装|卸载|关闭|保存|发布)",
     re.IGNORECASE,
@@ -954,10 +1002,33 @@ _TARGET_TRAILING_DECORATION_RE = re.compile(
     r"(?:\s+(?:app|application|window)|\s*(?:应用|程序|窗口))?)?\s*",
     re.IGNORECASE,
 )
+_BRIDGE_LABEL_TRAILING_DECORATION_RE = re.compile(
+    r"(?:\s+(?:button|tab(?:\s+item)?|menu(?:\s+item)?|list\s+item|tree\s+item|"
+    r"item|option|field|box|link|dialog|window|app|application)|"
+    r"\s*(?:按钮|选项卡|标签页|菜单项|列表项|树项目|项目|选项|输入框|字段|"
+    r"链接|窗口|应用|程序|前往)|\s+go\s+to)\s*$",
+    re.IGNORECASE,
+)
 _NEXT_ACTION_SEPARATOR_RE = re.compile(
     r"\s*(?:(?:[，。；,;.!！？?])|\b(?:and|then)\b|然后|并且|而且|以及|但|但是|不过)*\s*",
     re.IGNORECASE,
 )
+_KEY_ACTION_ALIASES = {
+    "enter": ("enter", "return", "回车"),
+    "return": ("enter", "return", "回车"),
+    "escape": ("escape", "退出"),
+    "space": ("space", "空格"),
+    "tab": ("tab", "制表"),
+    "shift+tab": ("shift+tab", "shift tab"),
+    "pageup": ("pageup", "page up"),
+    "pagedown": ("pagedown", "page down"),
+    "home": ("home",),
+    "end": ("end",),
+    "left": ("left", "左"),
+    "right": ("right", "右"),
+    "up": ("up", "上"),
+    "down": ("down", "下"),
+}
 _PAIRED_QUOTES = (('"', '"'), ("`", "`"), ("“", "”"), ("‘", "’"), ("「", "」"), ("『", "』"))
 
 
@@ -1134,6 +1205,84 @@ def _mask_text_payloads(source: str, start: int, end: int) -> str:
         for index in range(overlap_start, overlap_end):
             clause[index - start] = " "
     return "".join(clause)
+
+
+def unsupported_control_condition_present(user_text: str) -> bool:
+    """Detect control-flow conditions that are not locally evaluated."""
+
+    source = _normalized(user_text)
+    masked = _mask_text_payloads(source, 0, len(source))
+    # ``after``/``之后`` can introduce either a real condition or an ordinary
+    # sequential imperative. Only erase the connector when an already parsed
+    # positive action precedes it and another action follows immediately. This
+    # keeps ``after Alpha appears, click Beta`` blocked while allowing spoken
+    # sequences such as ``Open Claude, after that click Chat``.
+    sequentially_masked = list(masked)
+    for connector in _SEQUENTIAL_CONNECTOR_RE.finditer(masked):
+        if user_action_step_count(source[: connector.start()]) <= 0:
+            continue
+        for index in range(connector.start(), connector.end()):
+            sequentially_masked[index] = " "
+    masked = "".join(sequentially_masked)
+    return bool(
+        _UNSUPPORTED_CONTROL_CONDITION_RE.search(masked)
+        or re.match(r"\s*should\b", masked, re.IGNORECASE)
+    )
+
+
+def reported_action_reference_present(user_text: str) -> bool:
+    """Reject page text or reported speech that merely contains an action phrase."""
+
+    source = _normalized(user_text)
+    masked = _mask_text_payloads(source, 0, len(source))
+    report = _REPORTED_ACTION_CONTEXT_RE.search(masked)
+    return bool(
+        report is not None
+        and _USER_ACTION_VERB_RE.search(masked, report.end()) is not None
+    )
+
+
+def dangling_negation_before_action_present(user_text: str) -> bool:
+    """Preserve a spoken negation across an ASR-inserted comma or short pause."""
+
+    source = _normalized(user_text)
+    masked = _mask_text_payloads(source, 0, len(source))
+    return bool(
+        re.search(
+            rf"(?:\b(?:please\s+)?(?:do\s+not|don't|never)\b|"
+            rf"(?:请|千万)?\s*(?:不要|别|请勿|切勿|勿))\s*"
+            rf"(?:[,，;；…]+|\.{{2,}})\s*"
+            rf"(?:{_USER_ACTION_VERB_RE.pattern})",
+            masked,
+            re.IGNORECASE,
+        )
+    )
+
+
+def unparsed_affirmative_action_present(user_text: str) -> bool:
+    """Detect only explicit deferred-action clauses the step parser cannot bind.
+
+    This is intentionally narrower than scanning every action-shaped token. UI
+    labels such as ``Open`` and nouns such as ``语音输入`` can look like verbs,
+    while unsupported trailing actions are handled by normal completion checks.
+    Explicit deferred-time clauses are different: the current parser does not
+    count them as steps, so an unmentioned bridge could be dispatched too early.
+    """
+
+    source = _normalized(user_text)
+    masked = _mask_text_payloads(source, 0, len(source))
+    return bool(
+        re.search(
+            rf"(?:^|[，。；,;.!！？?\n])\s*"
+            rf"(?:afterwards|later(?:\s+on)?|at\s+(?:a\s+later\s+time|some\s+point\s+later)|"
+            rf"eventually|subsequently|finally|ultimately|"
+            rf"稍后|晚些时候|晚一点|过一会儿?|等会儿?|待会儿?|"
+            rf"回头|以后|最后|往后)\s*(?:再\s*)?"
+            rf"(?:please\s+|请\s*)?(?:{_USER_ACTION_VERB_RE.pattern})",
+            masked,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _imperative_prefix(prefix: str) -> bool:
@@ -1319,6 +1468,179 @@ def _has_negated_candidate_occurrence(candidate: str, user_text: str) -> bool:
         if _NEGATED_ACTION_RE.search(_mask_quoted_text(source, clause_start, clause_end)):
             return True
     return False
+
+
+def _has_excluded_candidate_occurrence(candidate: str, user_text: str) -> bool:
+    """Detect a candidate introduced only as an excluded alternative."""
+
+    source = _normalized(user_text)
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    payload_ranges = _text_payload_ranges(source)
+    quote_ranges = _quoted_ranges(source)
+    for start, end in _matching_spans(candidate, user_text):
+        clause_start = max(
+            (match.end() for match in boundaries if match.end() <= start),
+            default=0,
+        )
+        if any(
+            payload_start <= start and end <= payload_end
+            for payload_start, payload_end in payload_ranges
+        ) or any(
+            quote_start <= start and end <= quote_end
+            for quote_start, quote_end in quote_ranges
+        ):
+            continue
+        prefix = _mask_quoted_text(source, clause_start, start)
+        if _EXCLUDED_REFERENCE_BRIDGE_RE.search(prefix):
+            return True
+    return False
+
+
+def _has_negated_text_action_for_payload(payload: str, user_text: str) -> bool:
+    """Detect an exact payload inside an explicitly negated text mutation."""
+
+    source = _normalized(user_text)
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    for start, _end in _matching_spans(payload, user_text):
+        clause_start = max(
+            (match.end() for match in boundaries if match.end() <= start),
+            default=0,
+        )
+        clause_end = min(
+            (match.start() for match in boundaries if match.start() >= start),
+            default=len(source),
+        )
+        clause = _mask_quoted_text(source, clause_start, clause_end)
+        local_start = start - clause_start
+        if not _NEGATED_ACTION_RE.search(clause):
+            continue
+        if any(
+            verb.end() <= local_start
+            and (
+                _verb_matches_action_type(verb, DesktopActionType.TYPE_TEXT)
+                or _verb_matches_action_type(verb, DesktopActionType.SET_VALUE)
+            )
+            for verb in _USER_ACTION_VERB_RE.finditer(clause)
+        ):
+            return True
+    return False
+
+
+def _has_negated_action_for_target(
+    action: DesktopAction,
+    target_label: str,
+    user_text: str,
+) -> bool:
+    """Detect the same action class and target inside a negated clause."""
+
+    source = _normalized(user_text)
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    for start, _end in _matching_spans(target_label, user_text):
+        clause_start = max(
+            (match.end() for match in boundaries if match.end() <= start),
+            default=0,
+        )
+        clause_end = min(
+            (match.start() for match in boundaries if match.start() >= start),
+            default=len(source),
+        )
+        clause = _mask_quoted_text(source, clause_start, clause_end)
+        local_start = start - clause_start
+        if not _NEGATED_ACTION_RE.search(clause):
+            continue
+        if any(
+            verb.end() <= local_start
+            and _verb_matches_action_type(verb, action.type)
+            for verb in _USER_ACTION_VERB_RE.finditer(clause)
+        ):
+            return True
+    return False
+
+
+def _has_negated_key_action(key: str | None, user_text: str) -> bool:
+    """Detect an exact allowed key inside an explicitly negated key action."""
+
+    normalized_key = _normalized(key or "").replace(" ", "")
+    aliases = _KEY_ACTION_ALIASES.get(normalized_key)
+    if not aliases:
+        return False
+    source = _normalized(user_text)
+    masked_source = _mask_text_payloads(source, 0, len(source))
+    if re.search(
+        r"(?:\b(?:(?:do\s+not|don't|never)\s+(?:press|hit|use)\s+"
+        r"(?:anything|any\s+keys?|the\s+keyboard)|"
+        r"(?:avoid|without|refrain(?:ed|ing)?\s+from)\s+"
+        r"(?:pressing|using)\s+(?:anything|any\s+keys?|the\s+keyboard)|"
+        r"no\s+keystrokes?)\b|"
+        r"(?:不要|别|请勿|切勿)按(?:下)?任何键|"
+        r"(?:不要(?:用|使用)?|别用?|不使用|禁止使用)键盘|"
+        r"禁止按键)",
+        masked_source,
+        re.IGNORECASE,
+    ):
+        return True
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    clause_starts = (0, *(match.end() for match in boundaries))
+    clause_ends = (*(match.start() for match in boundaries), len(source))
+    for clause_start, clause_end in zip(clause_starts, clause_ends, strict=True):
+        clause = _mask_text_payloads(source, clause_start, clause_end)
+        if not _NEGATED_ACTION_RE.search(clause):
+            continue
+        # Key references in negative prose commonly use gerunds ("skip pressing
+        # Enter") or synonyms ("do not hit Enter"), neither of which is an
+        # imperative step and therefore belongs outside _USER_ACTION_VERB_RE.
+        if any(_authorized_span(alias, clause) for alias in aliases):
+            return True
+        if normalized_key in {"enter", "return"} and re.search(
+            r"\b(?:submit(?:ting|ted)?|submission)\b|提交|执行搜索|开始搜索",
+            clause,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
+def _negated_search_or_text_mutation_present(user_text: str) -> bool:
+    """Veto an inferred search-field mutation that the utterance forbids."""
+
+    source = _normalized(user_text)
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    clause_starts = (0, *(match.end() for match in boundaries))
+    clause_ends = (*(match.start() for match in boundaries), len(source))
+    mutation = re.compile(
+        r"(?:\b(?:search(?:ing|ed)?|find(?:ing)?|look(?:ing)?\s+up|"
+        r"type(?:d|s|ing)?|input(?:ted|s|ting)?|fill(?:ed|s|ing)?|"
+        r"writ(?:e|es|ing|ten)|chang(?:e|es|ed|ing)|"
+        r"edit(?:s|ed|ing)?|use(?:d|s|ing)?\s+(?:the\s+)?(?:search|find)\s*(?:box|field)?)\b|"
+        r"\benter(?:ed|s|ing)?\s+(?:anything|it|this|that|"
+        r"(?:the\s+)?(?:text|query|field|input|search\s*(?:box|field)))\b|"
+        r"搜索|查找|检索|搜一下|搜一搜|输入|填写|写入|键入|"
+        r"更改|修改|编辑|使用\s*(?:搜索|查找|输入)(?:框|栏))",
+        re.IGNORECASE,
+    )
+    for clause_start, clause_end in zip(clause_starts, clause_ends, strict=True):
+        raw_clause = _mask_quoted_text(source, clause_start, clause_end)
+        # "do not type or send any content" is a common no-message side
+        # constraint on an open-conversation task. It must not prohibit typing
+        # the exact conversation name into a transient navigation filter.
+        if re.search(r"\b(?:send|sending)\b|发送", raw_clause, re.IGNORECASE) and not re.search(
+            r"\b(?:search|find)\s*(?:box|field)?\b|搜索(?:框|栏)?|查找(?:框|栏)?",
+            raw_clause,
+            re.IGNORECASE,
+        ):
+            continue
+        clause = _mask_text_payloads(source, clause_start, clause_end)
+        if _NEGATED_ACTION_RE.search(clause) and mutation.search(clause):
+            return True
+    masked = _mask_text_payloads(source, 0, len(source))
+    return bool(
+        re.search(
+            r"\b(?:leave|keep)\s+(?:the\s+)?(?:search\s+)?(?:box|field|input)\s+empty\b|"
+            r"(?:保持|让)\s*(?:搜索|查找|输入)?(?:框|栏)?\s*(?:为空|空着)",
+            masked,
+            re.IGNORECASE,
+        )
+    )
 
 
 def affirmatively_authorized_reference(
@@ -1728,7 +2050,23 @@ def _positive_natural_search_payloads(user_text: str) -> tuple[str, ...]:
 
 def _natural_search_payload_authorized(payload: str, user_text: str) -> bool:
     normalized = _normalized(payload)
-    return bool(normalized) and normalized in _positive_natural_search_payloads(user_text)
+    return bool(
+        normalized
+        and normalized in _positive_natural_search_payloads(user_text)
+        and not _has_negated_text_action_for_payload(payload, user_text)
+        and not _negated_search_or_text_mutation_present(user_text)
+    )
+
+
+def _payload_belongs_to_any_text_step(payload: str, user_text: str) -> bool:
+    return any(
+        (
+            _verb_matches_action_type(verb, DesktopActionType.TYPE_TEXT)
+            or _verb_matches_action_type(verb, DesktopActionType.SET_VALUE)
+        )
+        and _payload_belongs_to_verb(payload, user_text, verb)
+        for verb in _positive_user_action_verbs(user_text)
+    )
 
 
 def _visual_navigation_payload_authorized(payload: str, user_text: str) -> bool:
@@ -1744,6 +2082,8 @@ def _visual_navigation_payload_authorized(payload: str, user_text: str) -> bool:
         or _looks_like_payment_surface(payload)
         or _looks_like_privacy_surface(payload)
         or _has_negated_candidate_occurrence(payload, user_text)
+        or _has_negated_text_action_for_payload(payload, user_text)
+        or _negated_search_or_text_mutation_present(user_text)
     ):
         return False
     return any(
@@ -1760,6 +2100,224 @@ def _visual_navigation_payload_authorized(payload: str, user_text: str) -> bool:
     )
 
 
+def visual_search_submission_payload_authorized(payload: str, user_text: str) -> bool:
+    """Authorize only an exact rendered search/navigation query, never a draft."""
+
+    return bool(
+        not _payload_belongs_to_any_text_step(payload, user_text)
+        and (
+            _natural_search_payload_authorized(payload, user_text)
+            or _visual_navigation_payload_authorized(payload, user_text)
+        )
+    )
+
+
+def visual_search_task_allows_submission(user_text: str) -> bool:
+    """Never authorize Enter from task text plus a coordinate-only caret.
+
+    A top-of-window caret is not semantic proof that the focused rendered field
+    is a search box rather than a message composer.  Semantic SearchBox or
+    AddressBar controls can still execute Enter through their own UIA element;
+    the screenshot viewport may type an exact filter and click a surfaced
+    result, but it never receives a submission capability.
+    """
+
+    del user_text
+    return False
+
+
+def visual_search_payload_matches_next_user_step(
+    payload: str,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Bind one exact rendered-search payload to the current spoken step."""
+
+    verbs = _positive_user_action_verbs(user_text)
+    if (
+        completed_steps < 0
+        or completed_steps >= len(verbs)
+        or _has_negated_text_action_for_payload(payload, user_text)
+        or _negated_search_or_text_mutation_present(user_text)
+        or any(
+            (
+                _verb_matches_action_type(verb, DesktopActionType.TYPE_TEXT)
+                or _verb_matches_action_type(verb, DesktopActionType.SET_VALUE)
+            )
+            and _payload_belongs_to_verb(payload, user_text, verb)
+            for verb in verbs[completed_steps + 1 :]
+        )
+    ):
+        return False
+    verb = verbs[completed_steps]
+    natural_payload = _natural_search_payload_for_verb(user_text, verb)
+    return bool(
+        (
+            _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is not None
+            and natural_payload is not None
+            and _normalized(payload) == _normalized(natural_payload)
+        )
+        or (
+            _verb_matches_action_type(verb, DesktopActionType.CLICK)
+            and bool(
+                _target_spans_for_verb(
+                    payload,
+                    user_text,
+                    verb,
+                    DesktopActionType.CLICK,
+                )
+            )
+        )
+    )
+
+
+def visual_text_action_matches_next_user_step(
+    action: DesktopAction,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Bind armed viewport text to one exact current spoken text-entry step."""
+
+    verbs = _positive_user_action_verbs(user_text)
+    if completed_steps < 0 or completed_steps >= len(verbs):
+        return False
+    verb = verbs[completed_steps]
+    source = _normalized(user_text)
+    step_end = (
+        verbs[completed_steps + 1].start()
+        if completed_steps + 1 < len(verbs)
+        else len(source)
+    )
+    return bool(
+        action.type == DesktopActionType.TYPE_TEXT
+        and not _has_negated_text_action_for_payload(action.text or "", user_text)
+        and _verb_matches_action_type(verb, DesktopActionType.TYPE_TEXT)
+        and _payload_belongs_to_verb(action.text or "", user_text, verb)
+        and not _step_has_explicit_outcome(user_text, verb, step_end)
+    )
+
+
+def visual_point_click_matches_next_user_step(
+    action: DesktopAction,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Limit visual terminal credit to one still-current click/open step."""
+
+    verbs = _positive_user_action_verbs(user_text)
+    if completed_steps < 0 or completed_steps >= len(verbs):
+        return False
+    verb = verbs[completed_steps]
+    source = _normalized(user_text)
+    step_end = (
+        verbs[completed_steps + 1].start()
+        if completed_steps + 1 < len(verbs)
+        else len(source)
+    )
+    return bool(
+        action.type == DesktopActionType.CLICK
+        and action.x is not None
+        and action.y is not None
+        and _verb_matches_action_type(verb, DesktopActionType.CLICK)
+        and _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is None
+        and not _step_has_explicit_outcome(user_text, verb, step_end)
+    )
+
+
+def visual_point_click_is_unambiguous_for_task(
+    action: DesktopAction,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Reject coordinates that could execute a negated or later click step."""
+
+    if (
+        action.type != DesktopActionType.CLICK
+        or action.x is None
+        or action.y is None
+    ):
+        return False
+    source = _normalized(user_text)
+    verbs = _positive_user_action_verbs(user_text)
+    if completed_steps < 0 or completed_steps >= len(verbs):
+        return False
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    payload_ranges = _text_payload_ranges(source)
+    quote_ranges = _quoted_ranges(source)
+    for verb in _USER_ACTION_VERB_RE.finditer(source):
+        if not _verb_matches_action_type(verb, DesktopActionType.CLICK):
+            continue
+        if any(start <= verb.start() and verb.end() <= end for start, end in payload_ranges):
+            continue
+        if any(start <= verb.start() and verb.end() <= end for start, end in quote_ranges):
+            continue
+        clause_start = max(
+            (match.end() for match in boundaries if match.end() <= verb.start()),
+            default=0,
+        )
+        clause_end = min(
+            (match.start() for match in boundaries if match.start() >= verb.end()),
+            default=len(source),
+        )
+        if _NEGATED_ACTION_RE.search(
+            _mask_quoted_text(source, clause_start, clause_end)
+        ):
+            return False
+    remaining_activation_steps = [
+        verb
+        for verb in verbs[completed_steps:]
+        if _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is None
+        and _verb_matches_action_type(verb, DesktopActionType.CLICK)
+    ]
+    current_is_activation = bool(
+        _NATURAL_SEARCH_ACTION_RE.fullmatch(verbs[completed_steps].group()) is None
+        and _verb_matches_action_type(
+            verbs[completed_steps],
+            DesktopActionType.CLICK,
+        )
+    )
+    return bool(
+        not remaining_activation_steps
+        or (current_is_activation and len(remaining_activation_steps) == 1)
+    )
+
+
+def visual_search_submission_matches_next_user_step(
+    action: DesktopAction,
+    payload: str,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Bind one armed Enter to the current exact natural-search utterance."""
+
+    verbs = _positive_user_action_verbs(user_text)
+    if completed_steps < 0 or completed_steps >= len(verbs):
+        return False
+    verb = verbs[completed_steps]
+    source = _normalized(user_text)
+    step_end = (
+        verbs[completed_steps + 1].start()
+        if completed_steps + 1 < len(verbs)
+        else len(source)
+    )
+    natural_payload = _natural_search_payload_for_verb(user_text, verb)
+    return bool(
+        action.type == DesktopActionType.PRESS_KEY
+        and (action.key or "").strip().casefold() in {"enter", "return"}
+        and _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is not None
+        and natural_payload is not None
+        and _normalized(payload) == _normalized(natural_payload)
+        and _natural_search_payload_authorized(payload, user_text)
+        and visual_search_task_allows_submission(user_text)
+        and not _step_has_explicit_outcome(user_text, verb, step_end)
+    )
+
+
 def natural_search_step_count(user_text: str) -> int:
     return sum(
         1
@@ -1773,6 +2331,47 @@ def _is_search_input(target: DesktopElement | None) -> bool:
         return False
     identity = "\n".join((target.name, target.automation_id or ""))
     return _SEARCH_INPUT_IDENTITY_RE.search(identity) is not None
+
+
+def semantic_search_text_action_matches_next_user_step(
+    action: DesktopAction,
+    target: DesktopElement | None,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Allow only an exact current-step query in one focused semantic search box."""
+
+    if (
+        action.type not in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
+        or target is None
+        or not _is_search_input(target)
+        or not target.addressable
+        or not target.enabled
+        or target.focused is not True
+        or target.editable is False
+        or target.password
+        or target.secret_labeled
+        or target.high_credential
+        or target.low_credential
+    ):
+        return False
+    payload = action.text if action.type == DesktopActionType.TYPE_TEXT else action.value
+    if (
+        not payload
+        or _has_negated_candidate_occurrence(payload, user_text)
+        or _has_negated_text_action_for_payload(payload, user_text)
+        or not visual_search_payload_matches_next_user_step(
+            payload,
+            user_text,
+            completed_steps=completed_steps,
+        )
+    ):
+        return False
+    return bool(
+        action.type == DesktopActionType.SET_VALUE
+        or target.value in {None, ""}
+    )
 
 
 def _step_has_explicit_outcome(
@@ -1797,6 +2396,10 @@ def _step_has_explicit_outcome(
         if _PURE_NEGATED_TEXT_SIDE_CLAUSE_RE.fullmatch(source[clause_start:clause_end]):
             continue
         return True
+    if _USER_ACTION_VERB_RE.match(source, step_end) is not None:
+        # Punctuation and an app locator before the next parsed action are an
+        # ordering bridge, not a distinct outcome of the current step.
+        return False
     independent_boundaries = [
         boundary
         for boundary in boundaries
@@ -1882,6 +2485,22 @@ def action_matches_next_user_step(
 ) -> bool:
     """Bind each proposed mutation to the next direct positive action in the task."""
 
+    action_payload = (
+        action.text
+        if action.type == DesktopActionType.TYPE_TEXT
+        else action.value
+        if action.type == DesktopActionType.SET_VALUE
+        else None
+    )
+    if action_payload and _has_negated_text_action_for_payload(action_payload, user_text):
+        return False
+    if action.type == DesktopActionType.PRESS_KEY and _has_negated_key_action(
+        action.key,
+        user_text,
+    ):
+        return False
+    if target_label and _has_negated_action_for_target(action, target_label, user_text):
+        return False
     verbs = _positive_user_action_verbs(user_text)
     if completed_steps < 0 or completed_steps >= len(verbs):
         return False
@@ -2003,12 +2622,16 @@ def expectation_matches_user_step(
     if completed_steps < 0 or completed_steps >= len(verbs):
         return False
     verb = verbs[completed_steps]
+    source = _normalized(user_text)
+    step_end = (
+        verbs[completed_steps + 1].start()
+        if completed_steps + 1 < len(verbs)
+        else len(source)
+    )
     if _NATURAL_SEARCH_ACTION_RE.fullmatch(verb.group()) is not None:
         payload = _natural_search_payload_for_verb(user_text, verb)
-        return bool(
+        action_matches = bool(
             payload
-            and expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED
-            and _normalized(expectation.text or "") == _normalized(payload)
             and action_matches_next_user_step(
                 action,
                 target_label,
@@ -2016,14 +2639,56 @@ def expectation_matches_user_step(
                 completed_steps=completed_steps,
             )
         )
+        if not action_matches:
+            return False
+        if not _step_has_explicit_outcome(user_text, verb, step_end):
+            return bool(
+                expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED
+                and _normalized(expectation.text or "") == _normalized(payload or "")
+            )
+        if not expectation.text:
+            return False
+        outcome = _ACTION_OUTCOME_START_RE.search(source, verb.end(), step_end)
+        boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+        fallback_boundary = next(
+            (
+                boundary
+                for boundary in boundaries
+                if verb.end() <= boundary.start() < step_end
+            ),
+            None,
+        )
+        if outcome is None and fallback_boundary is None:
+            return False
+        outcome_floor = (
+            outcome.start() if outcome is not None else fallback_boundary.end()
+        )
+        payload_ranges = _text_payload_ranges(source)
+        for start, end in _matching_spans(expectation.text, user_text):
+            clause_start = max(
+                (match.end() for match in boundaries if match.end() <= start),
+                default=0,
+            )
+            if start < outcome_floor or end > step_end:
+                continue
+            if any(
+                payload_start <= start and end <= payload_end
+                for payload_start, payload_end in payload_ranges
+            ) or _span_is_quoted_text_payload(source, start, end, clause_start):
+                continue
+            if _expectation_suffix_is_complete(
+                expectation.kind,
+                source,
+                end,
+                step_end,
+                has_next_action=completed_steps + 1 < len(verbs),
+            ):
+                return True
+        return False
     target_spans = _target_spans_for_verb(target_label, user_text, verb, action.type)
     if not target_spans:
         return False
     expected = _normalized(expectation.text or "")
-    source = _normalized(user_text)
-    step_end = (
-        verbs[completed_steps + 1].start() if completed_steps + 1 < len(verbs) else len(source)
-    )
     if (
         action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
         and expectation.kind
@@ -2090,6 +2755,193 @@ def expectation_matches_user_step(
 
 def user_action_step_count(user_text: str) -> int:
     return len(_positive_user_action_verbs(user_text))
+
+
+def action_type_matches_a_future_user_step(
+    action: DesktopAction,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Detect future same-class mutations even when their target is a pronoun."""
+
+    verbs = _positive_user_action_verbs(user_text)
+    return any(
+        _verb_matches_action_type(verb, action.type)
+        for verb in verbs[completed_steps + 1 :]
+    )
+
+
+def _bridge_label_variants(label: str) -> tuple[str, ...]:
+    variant = _normalized(label.strip())
+    variants: list[str] = []
+    while variant and variant not in variants:
+        variants.append(variant)
+        stripped = _BRIDGE_LABEL_TRAILING_DECORATION_RE.sub("", variant).strip()
+        if stripped == variant:
+            break
+        variant = stripped
+    return tuple(variants)
+
+
+def action_matches_user_step_with_label_aliases(
+    action: DesktopAction,
+    target_label: str,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Match a user step after stripping only benign UI control suffixes."""
+
+    return any(
+        action_matches_next_user_step(
+            action,
+            variant,
+            user_text,
+            completed_steps=completed_steps,
+        )
+        for variant in _bridge_label_variants(target_label)
+    )
+
+
+def expectation_matches_user_step_with_label_aliases(
+    action: DesktopAction,
+    target_label: str,
+    expectation: DesktopExpectation,
+    user_text: str,
+    *,
+    completed_steps: int,
+) -> bool:
+    """Bind a postcondition through the same benign UI label aliases."""
+
+    return any(
+        expectation_matches_user_step(
+            action,
+            variant,
+            expectation,
+            user_text,
+            completed_steps=completed_steps,
+        )
+        for variant in _bridge_label_variants(target_label)
+    )
+
+
+def generic_navigation_bridge_avoids_negated_targets(
+    target_label: str,
+    expectation: DesktopExpectation | None,
+    user_text: str,
+) -> bool:
+    """Reject inferred bridge labels that occur in a negated user clause."""
+
+    candidates: list[tuple[str, bool]] = [(target_label, True)]
+    if expectation is not None and expectation.text:
+        candidates.append((expectation.text, False))
+    for candidate, is_action_target in candidates:
+        for variant in _bridge_label_variants(candidate):
+            if is_action_target and _matching_spans(
+                variant,
+                user_text,
+            ) and not affirmatively_authorized_action_reference(variant, user_text):
+                # A label occurring only as dictated data, reported/page text,
+                # an outcome, spatial reference, excluded alternative, or an
+                # unparsed future clause is never an inferred navigation bridge.
+                return False
+            if _has_negated_candidate_occurrence(
+                variant,
+                user_text,
+            ) or _has_excluded_candidate_occurrence(variant, user_text):
+                return False
+    return True
+
+
+def generic_navigation_bridge_action_is_unnegated(
+    action: DesktopAction,
+    user_text: str,
+) -> bool:
+    """Do not infer a bridge through any explicitly negated action class."""
+
+    source = _normalized(user_text)
+    masked_source = _mask_text_payloads(source, 0, len(source))
+    if re.search(
+        r"(?:\bonly\s+(?:click|open|select|choose|press|scroll|expand|collapse)\b|"
+        r"\b(?:click|open|select|choose|press|scroll|expand|collapse)\b"
+        r"[^.;。；!?！？\n]{0,160}\bonly\s*[.;!?。；！？]*$|"
+        r"\b(?:and\s+)?nothing\s+else\b|"
+        r"\b(?:do\s+not|don't|never)\s+(?:perform|take|do)\s+any\s+other\s+action\b|"
+        r"(?:不要|别|请勿|切勿|不必|无需)(?:再)?做任何其他操作)",
+        masked_source,
+        re.IGNORECASE,
+    ):
+        return False
+    if action.type == DesktopActionType.SCROLL and re.search(
+        r"\b(?:with\s+)?no\s+scrolling\b|\bscrolling\s+(?:is\s+)?disabled\b|"
+        r"\bwithout\s+scrolling\b|(?:不|别|无需|不必)滚动",
+        masked_source,
+        re.IGNORECASE,
+    ):
+        return False
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    payload_ranges = _text_payload_ranges(source)
+    quote_ranges = _quoted_ranges(source)
+    for verb in _USER_ACTION_VERB_RE.finditer(source):
+        if not _verb_matches_action_type(verb, action.type):
+            continue
+        if any(start <= verb.start() and verb.end() <= end for start, end in payload_ranges):
+            continue
+        if any(start <= verb.start() and verb.end() <= end for start, end in quote_ranges):
+            continue
+        clause_start = max(
+            (match.end() for match in boundaries if match.end() <= verb.start()),
+            default=0,
+        )
+        clause_end = min(
+            (match.start() for match in boundaries if match.start() >= verb.end()),
+            default=len(source),
+        )
+        if _NEGATED_ACTION_RE.search(
+            _mask_quoted_text(source, clause_start, clause_end)
+        ):
+            return False
+    # Gerunds and participles are references to an action class, not imperative
+    # user steps, so they intentionally stay out of ``_USER_ACTION_VERB_RE``.
+    # They still carry negation authority: "skip clicking it" must not license
+    # an arbitrary inferred click/expand bridge.
+    inflected_pattern: re.Pattern[str] | None = None
+    if action.type in {
+        DesktopActionType.CLICK,
+        DesktopActionType.PERFORM_SECONDARY_ACTION,
+    }:
+        inflected_pattern = re.compile(
+            r"\b(?:click(?:ing|ed)|press(?:ing|ed)|open(?:ing|ed)|"
+            r"choosing|selected?|selecting|switching|entered?|entering|"
+            r"activating|executing|operating|using|deleting|closing|"
+            r"expanding|expanded|collapsing|collapsed|"
+            r"interact(?:ing|ed)?(?:\s+with)?|touch(?:ing|ed)?)\b",
+            re.IGNORECASE,
+        )
+    elif action.type == DesktopActionType.SCROLL:
+        inflected_pattern = re.compile(r"\bscroll(?:ing|ed)\b", re.IGNORECASE)
+    elif action.type == DesktopActionType.PRESS_KEY:
+        inflected_pattern = re.compile(r"\bpress(?:ing|ed)\b", re.IGNORECASE)
+    if inflected_pattern is not None:
+        clause_starts = (0, *(match.end() for match in boundaries))
+        clause_ends = (*(match.start() for match in boundaries), len(source))
+        for clause_start, clause_end in zip(clause_starts, clause_ends, strict=True):
+            clause = _mask_text_payloads(source, clause_start, clause_end)
+            if _NEGATED_ACTION_RE.search(clause) and inflected_pattern.search(clause):
+                return False
+    return True
+
+
+def user_action_step_has_explicit_outcome(user_text: str, *, step: int) -> bool:
+    """Return whether one spoken action requires a distinct authored result."""
+
+    verbs = _positive_user_action_verbs(user_text)
+    if step < 0 or step >= len(verbs):
+        return False
+    source = _normalized(user_text)
+    step_end = verbs[step + 1].start() if step + 1 < len(verbs) else len(source)
+    return _step_has_explicit_outcome(user_text, verbs[step], step_end)
 
 
 def user_action_step_clause(user_text: str, *, step: int) -> str | None:
@@ -2370,6 +3222,59 @@ def affirmatively_authorized_app_scope(candidate: str, user_text: str) -> bool:
         following = _mask_quoted_text(source, following_start, following_end)
         if not _NEGATED_ACTION_RE.search(following) and _AFFIRMATIVE_ACTION_RE.search(following):
             return True
+    return False
+
+
+def explicitly_negated_app_scope(candidate: str, user_text: str) -> bool:
+    """Return whether a negated control verb directly targets one application.
+
+    A location such as ``do not click Beta in Chrome`` negates the Beta click,
+    not every possible Chrome operation.  Conversely, ``do not operate Chrome``
+    directly denies that application.  Reuse the same payload, quote, clause,
+    and target parsing as positive action binding so dictated text and page
+    titles cannot manufacture an application deny.
+    """
+
+    if not candidate.strip():
+        return False
+    source = _normalized(user_text)
+    boundaries = tuple(_CLAUSE_BOUNDARY_RE.finditer(source))
+    payload_ranges = _text_payload_ranges(source)
+    quote_ranges = _quoted_ranges(source)
+    candidate_spans = tuple(_matching_spans(candidate, user_text))
+    for target_start, target_end in candidate_spans:
+        clause_start = max(
+            (match.end() for match in boundaries if match.end() <= target_start),
+            default=0,
+        )
+        clause_end = min(
+            (match.start() for match in boundaries if match.start() >= target_end),
+            default=len(source),
+        )
+        if any(
+            payload_start <= target_start and target_end <= payload_end
+            for payload_start, payload_end in payload_ranges
+        ) or any(
+            quote_start <= target_start and target_end <= quote_end
+            for quote_start, quote_end in quote_ranges
+        ):
+            continue
+        clause = _mask_quoted_text(source, clause_start, clause_end)
+        if not _NEGATED_ACTION_RE.search(clause):
+            continue
+        for verb in _USER_ACTION_VERB_RE.finditer(source, clause_start, clause_end):
+            if _APP_CONTROL_TARGET_RE.fullmatch(verb.group()) is None:
+                continue
+            if any(
+                start == target_start and end == target_end
+                for start, end, _local_start, _local_end in _target_spans_for_verb(
+                    candidate,
+                    user_text,
+                    verb,
+                    DesktopActionType.CLICK,
+                )
+            ):
+                return True
     return False
 
 
@@ -3445,10 +4350,7 @@ class DesktopSafetyPolicy:
             return _block("action is not bound to the current application observation")
         if "\ufffd" in observation.accessibility_text:
             return _block("accessibility state contains damaged Unicode")
-        normalized_task = _normalized(user_text)
-        if not unrestricted and _UNSUPPORTED_CONTROL_CONDITION_RE.search(
-            _mask_text_payloads(normalized_task, 0, len(normalized_task))
-        ):
+        if unsupported_control_condition_present(user_text):
             return _block(
                 "conditional desktop actions require unsupported local condition evaluation"
             )
@@ -3646,9 +4548,15 @@ class DesktopSafetyPolicy:
                     exact_local_dictation
                     or (
                         visual_text_input
-                        and _visual_navigation_payload_authorized(
-                            action_payload,
-                            user_text,
+                        and (
+                            _visual_navigation_payload_authorized(
+                                action_payload,
+                                user_text,
+                            )
+                            or _natural_search_payload_authorized(
+                                action_payload,
+                                user_text,
+                            )
                         )
                     )
                     or
@@ -3659,7 +4567,13 @@ class DesktopSafetyPolicy:
                     )
                     or (
                         _is_search_input(target)
-                        and _natural_search_payload_authorized(action_payload, user_text)
+                        and (
+                            _natural_search_payload_authorized(action_payload, user_text)
+                            or _visual_navigation_payload_authorized(
+                                action_payload,
+                                user_text,
+                            )
+                        )
                         and (
                             action.type == DesktopActionType.SET_VALUE
                             or (
@@ -4149,7 +5063,7 @@ class DesktopSafetyPolicy:
                         "armed visual text requires frame-transition verification"
                     )
                 return _allow(
-                    "local unrestricted profile allows one exact visual search payload"
+                    "local unrestricted profile allows one exact user-authored visual payload"
                 )
             if expectation is None or not expectation.text:
                 return _block("text input needs an exact local text-presence postcondition")
@@ -4167,6 +5081,10 @@ class DesktopSafetyPolicy:
                 trusted_target_label=text_confirmation_target,
             )
         if visual_search_submission:
+            if not visual_search_task_allows_submission(user_text):
+                return _block(
+                    "armed visual Enter is not authorized for a draft or non-search task"
+                )
             if (
                 expectation is None
                 or expectation.kind != DesktopExpectationKind.LAST_ACTION_VERIFIED

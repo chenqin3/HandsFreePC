@@ -30,7 +30,7 @@ $testTemp = Join-Path $PWD ('.pytest-tmp\run-' + [guid]::NewGuid().ToString('N')
 - StepPlanner 单步 JSON Schema、默认 Claude 严格 argv、Codex best-effort 显式门禁和输出拒绝；
 - 旧 `planner.enabled` one-shot fallback 只接受原句肯定、非引号/数据引用、精确授权的应用 UI 导航；云输出不能决定 feedback/pause/resume/wait/path/text/send；
 - `strict`/`personal_trusted` 在零/多/否定/顺带提及应用且无可信继承窗口时拒绝；`local_unrestricted` 则 fresh 枚举全部可见顶层 HWND、区分多 Chrome 窗口、允许跨 app 且不返回 `APP_SCOPE_REQUIRED`；
-- 已识别的 terminal/Run/UAC/认证/密码/凭据/支付/隐私 surface 在所有 profile 中 fail closed；`strict`/`personal_trusted` 另覆盖通用文本和已知副作用确认，`local_unrestricted` 另覆盖普通低风险导航/切换/Toggle/通用无风险对话框直通、显式 app/window/field exact binding、UIA 与渲染搜索各自的完整提交链，以及已知高影响副作用仍确认；未绑定/可复用坐标与任意 shell 始终阻断，视觉 viewport 的一次性 screenshot-local 点、Win32 focus/caret 绑定、单次搜索文字与搜索回车必须分别覆盖；
+- 已识别的 terminal/Run/UAC/认证/密码/凭据/支付/隐私 surface 在所有 profile 中 fail closed；`strict`/`personal_trusted` 另覆盖通用文本和已知副作用确认，`local_unrestricted` 另覆盖普通低风险导航/切换/Toggle/通用无风险对话框直通、显式 app/window/field exact binding、语义 UIA SearchBox/AddressBar 的完整提交链，以及已知高影响副作用仍确认；未绑定/可复用坐标与任意 shell 始终阻断。视觉 viewport 的一次性 screenshot-local 点、Win32 focus/caret 绑定、单次精确查询/筛选文字、等待即时结果和 fresh-frame 结果点击必须覆盖，并断言 viewport 永不暴露或接受 `PRESS_KEY`；
 - confirmation ID、随机四位挑战码、静态前缀拒绝、超时、重放、界面变化与再次分类；同一 `VoiceRuntime` 进程内已签发码在成功、取消或超时后都不回收，重复抽样有界耗尽时拒绝；
 - 通用 UI 确认摘要只原文显示用户原句中已验证的 exact target label；未授权 sibling/window label 的原文/语义只影响本地分类，不进入摘要，短 digest 仅是不可逆绑定元数据；
 - 每个通用 planner 动作的 expectation false-before/true-after、fresh observation、fingerprint change、精确 Unicode 输入和本地 completion expectation；
@@ -66,7 +66,7 @@ execution:
 
 `simulate` 验证兼容 parser/计划和状态机，不创建真实连续 desktop agent，也不证明 UIA、planner 或目标应用可用。
 
-确定性路径的 live 验收要另记：执行前 `path_open_state` 必须为 false，打开后必须为 true，且前台 HWND 必须不同于 before。目录还要求前台 Explorer 的规范化路径精确一致；文件当前只有“新前台标题包含精确文件名”的 best-effort 证据。应分别测试复用同一 HWND、同名文件和标题不显示文件名的应用，并把它们记为无法自动证明，不要写成 exact-path/exact-content PASS。
+确定性路径的 live 验收要另记：执行前 `path_open_state` 必须为 false，打开后必须为 true。目录要求当前前台 Explorer 的规范化路径精确一致；若同一 Explorer HWND 导航到该路径，应记为有效 PASS。普通文件仍要求前台 HWND 不同于 before，当前只有“新前台标题包含精确文件名”的 best-effort 证据。应分别测试 Explorer 同 HWND 目录导航、复用同一 HWND 的文件查看器、同名文件和标题不显示文件名的应用；后三者不得写成 exact-path/exact-content PASS。
 
 ## 3. 静态环境检查
 
@@ -160,7 +160,7 @@ ASCII 文本出现不算 Unicode PASS。退出码非 0、字段缺失或 verifie
 3. 第一条执行反馈期间说第二条，确认 FIFO；再在同一 VAD 话语内说两个 `over`，确认两条依次入队且末尾未完成正文保留为 pending；
 4. 说 `mouseover`、`voiceover`，确认不切分；
 5. 不说 `over`，然后“结束语音操作”，确认半条被丢弃；
-6. 测试急停、失败暂停、恢复和队列满反馈；
+6. 测试急停、失败暂停、恢复和队列满反馈；暂停/恢复只接受独立、完整、肯定的控制口令，并覆盖条件式、转述/引用式、否定式以及被短暂停顿/ASR 标点分隔的提及全部 fail closed、不改变状态；
 7. 分别测试 `overlay`、`voice`、`both`、`silent`。
 
 当前 `over` 同时有独立英文 Vosk KWS 主路径和所选正文 ASR 后备路径。KWS 验收还要确认词时间与无词时间 block fallback：marker 音频不送入正文 ASR，marker 前后有声片段分别转写，纯静音 padding 不得调用 ASR 或幻听成新 prompt；每个 marker 只完成它前面的 prompt，末段进入下一条 pending。同一 VAD 内单个/多个 marker 都不得丢前缀、吞后缀、重复入队或把 `over` 混入正文。分别记录 `PROMPT_DELIMITER_DETECTED` 与 `COMMAND_ENQUEUED`。
@@ -249,14 +249,14 @@ computer_control:
 3. 原始截图最大边超过 2048 px 时，planner 图片必须保持宽高比缩小；等于/小于上限时字节不必改写。planner canvas 的边界、横纵比例映射、四舍五入和原图右/下边界 clamp 都要有测试，执行器最终只接收映射后的原始 capture 坐标；
 4. 每个视觉 click/scroll 前重新截取当前 exact HWND 并复核窗口矩形。OCR click 还要唯一重绑同文同类近邻区域和 crop；viewport point 还要核对原图目标 patch，伪造/越界/旧 frame 全部拒绝；
 5. viewport point click 后不能立刻获得文字输入。下一次 fresh observe 只有在 Win32 `GetGUIThreadInfo` 证明 exact target PID/TID、active/focus/caret HWND、可见非空 caret rectangle、caret 属于同一窗口/进程且几何位置与点击相符时，才临时声明一次 `type_text`；API 缺失/失败、foreign HWND/PID、foreground race、零高 caret、坐标转换失败或 caret 远离点击点都必须拒绝；
-6. 渲染 `type_text` 只接受用户指令中的精确连续目标/搜索文字，拒绝截图文字、发明/改写/子串、消息正文、prompt、认证、凭据、付款和换行；执行前再验证同一 focus/caret identity 与未变化的点击点 patch，执行后立即消费文字能力；
-7. 输入后的 fresh screenshot 已出现结果时必须正常点击结果，不能按键。只有画面没有结果、点击位于受限搜索区域且同一 focus/caret binding 仍有效时，下一步才可声明一次 Enter/Return，并以 `LAST_ACTION_VERIFIED` 绑定；视觉路径不使用 UIA 专属的 `SEARCH_SUBMITTED` expectation。armed viewport 上只有明确指向该 viewport、单次左键且仍在顶部搜索区域的重复 click 才可确定性改写为恰好一次 Enter 并消费能力；唯一语义结果 `Button` 及搜索区之外的视觉 click 必须保留原 action。其他 key、第二次 Enter、Send/Submit、消息/回复语境、失焦或换窗全部拒绝；
-8. 每次只执行一个 click、单页 scroll、受限 `type_text` 或一次搜索 Enter/Return；每个动作后都要取得 fresh exact-window 截图并交给 planner 重规划/验证。旧截图、旧坐标、旧 caret、已消费 capability 或不重新规划都算 FAIL；
+6. 渲染 `type_text` 只接受当前口述步骤中的完整连续原文：搜索/导航目标，或用户明确要求写入但不发送的草稿、消息、prompt；拒绝截图文字、发明/改写/子串、认证、凭据、付款和换行。执行前再验证同一 focus/caret identity，并确认 planner frame 到 fresh pre-dispatch frame 没有字段替换/覆盖等实质变化；执行后立即消费文字能力；
+7. 任何 coordinate-only `VisualViewport` 的 fresh post-type observation 都不得声明 `PRESS_KEY`，包括 Enter/Return；即使 exact 查询/筛选 payload、受限顶部区域和同一 focus/caret binding 同时成立也必须拒绝，因为这些证据不能区分 SearchBox 与 composer。parser 不得把 click 改写为 Enter。视觉查询输入后应等待即时结果、取得 fresh screenshot 并点击精确结果；无结果时 fail closed。只有语义 UIA SearchBox/AddressBar 可测试 Enter/Return 与 `SEARCH_SUBMITTED`；
+8. 每次只执行一个 click、单页 scroll 或一次 exact `type_text`；每个动作后都要取得 fresh exact-window 截图并交给 planner 重规划/验证。旧截图、旧坐标、旧 caret、已消费 capability 或不重新规划都算 FAIL；
 9. 动作导致新 foreground HWND 时，同 PID 或可验证父子进程关系才可更新原动态 app binding；helper executable 只从 immediate parent 的唯一 profile match 继承 profile。覆盖微信主窗到 `WeChatAppEx` 搜一搜、父窗口继续可见时 active task alias 仍保留在子窗口的成功用例，以及无关进程、同名伪装窗、身份变化、alias 被父窗抢回和非前台窗的拒绝用例；
-10. WeChat 受控 live 用例只验搜索导航，不发送消息、不点击 Send/Submit；不得把受限搜索文字和一次搜索回车宣称为任意微信输入或发送。
+10. WeChat 受控 live 用例只验查询/筛选后的即时结果点击，不发送消息、不点击 Send/Submit、不按 viewport Enter；不得把受限视觉文字宣称为任意微信输入或发送。
 11. 断言发给云端 planner 的 observation 没有原始 HWND/`local_window_id`。第一条视觉 `DONE` 只能在返回后由 controller 用本地完整 observation 绑定截图 token；随后必须取得同一 app/window、更新 generation/capture time 的第二张 fresh screenshot 并再次得到视觉 `DONE`。模型自造 token、复用 generation、换窗或只判断一帧都应失败；
 12. 渲染搜索 helper 的 `TEXT_ABSENT` 特例只接受唯一 semantic `Button`：exact full label 必须包含用户精确 destination 并以“前往”或 `Go to` 结束，expectation 必须等于该完整标签。按钮消失只能验 navigation bridge，后续关联窗口仍须 fresh screenshot；部分标签、通用按钮、多个候选和以消失直接完成任务都应拒绝；
-13. 构造全窗无关区域持续动画的 before/fresh frame：非视觉 UIA target 仅在 app/window、唯一 index、`local_identity`、control type、enabled 与 addressable 全部不变时可以继续，并由 driver dispatch-time rebind 再验；任一 identity/state 改变应拒绝。对应视觉 point 即使只有无关区域变化可容忍，也必须保持点击附近 local patch 稳定，target patch 改变时必须拒绝。
+13. 构造全窗无关区域持续动画的 before/fresh frame：非视觉 UIA target 仅在 app/window、唯一 index 与完整元素 fingerprint 全部不变时可以继续，并由 driver dispatch-time rebind 再验；要覆盖同 `local_identity` 但标签换人、值/焦点/capability/风险分类漂移的拒绝用例。对应视觉 point 即使只有无关区域变化可容忍，也必须保持点击附近 local patch 稳定，target patch 改变时必须拒绝。
 
 受控 live 记录必须注明屏幕上下文实际离机范围。若使用 Codex，记录选中窗口 PNG 已进入 provider context；不要用包含真实聊天、通知、病历、学生/客户资料或凭据的桌面做截图测试。
 
@@ -303,7 +303,7 @@ apps:
 
 1. **最小观察**：`strict` 下用户原句只肯定命名一个 app 和目标控件；验证未命名、两个 app、否定提及和顺带提及都会拒绝。`personal_trusted` 另验同一控制器可继承上一条 fresh-verified app/window，而新控制器、窗口变化和 strict 不继承。断言 `CONTENT` 永不作为结构化元素进入 planner；strict 只含被点名控件，personal_trusted 最多再含安全导航控件与当前输入框；两者都不含原始窗口标题、进程 ID、value/automation ID、截图 bytes 或真实截图可用性。`local_unrestricted` 则按上一节单独验全部 fresh 顶层窗口、真实标题/UIA context 与 Codex 选中窗口截图，并断言未点名 app 不返回 `APP_SCOPE_REQUIRED`、明确点名的 app/window/field 仍 exact bind；
 2. **无副作用导航**：切换一个已知 tab，要求 after UIA 中出现选中状态或特定文本；
-3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；`strict` 必须等待随机四位码，静态“确认执行”无效；`personal_trusted` 只有本句完整口述、唯一聚焦非密码输入框可免确认。这两种模式都要求 exact UIA round-trip，且不能点击发送。`local_unrestricted` 的 UIA 搜索另验精确替换查询字段、按 Enter/Return，并以 fresh result transition 而非字段回显验收；渲染搜索按上一节单独验 focus/caret、exact target、fresh screenshot 和至多一次搜索回车，不能用 UIA round-trip 替它背书；
+3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；`strict` 必须等待随机四位码，静态“确认执行”无效；`personal_trusted` 只有本句完整口述、唯一聚焦非密码输入框可免确认。这两种模式都要求 exact UIA round-trip，且不能点击发送。`local_unrestricted` 还要分别验视觉未发送草稿（exact payload、fresh frame、无 Enter）与视觉查询/筛选（exact current-step target、等待即时结果、fresh-frame 点击结果）；无论焦点、caret 或顶部坐标如何，viewport 都不得出现 `PRESS_KEY`。只有语义 UIA SearchBox/AddressBar 才验 Enter 与 fresh result transition，不能用 UIA round-trip 替视觉输入背书；
 4. **多步任务**：每步后核对 generation 增加、fingerprint 变化，并记录同一任务 expectation 的 false-before 和 true-after；另断言推断的中间导航不冒充口述步骤，只完成第一段后返回 `done` 必须失败；
 5. **typed confirmation（所有 profile 的已识别高影响动作）**：用测试草稿的“发送”按钮触发确认，但先取消；验证错 ID、错误/旧四位码、过期、重放和确认前界面变化都拒绝。`local_unrestricted` 的普通低风险切换/导航/Toggle/通用无风险对话框应不确认，但发送/提交、删除、安装、上传/分享和关闭仍必须确认；
 6. **一次确认执行（所有 profile 的已识别高影响动作）**：只在测试账户发送无害内容，说出本轮随机四位码，确认仅执行原动作一次；不得因 `local_unrestricted` 跳过或伪造高影响 confirmation PASS；

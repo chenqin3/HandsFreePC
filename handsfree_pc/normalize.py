@@ -5,6 +5,8 @@ import unicodedata
 
 _PUNCTUATION_RE = re.compile(r"[，。！？；、,:：;!?]+")
 _SPACE_RE = re.compile(r"\s+")
+_WAKE_SUFFIX_TRIM = " \t\r\n,，.。;；!！?？:：、"
+_WAKE_CLOSING_QUOTES = frozenset('"\'”’」』》〉】)]}')
 
 
 def normalize_text(text: str) -> str:
@@ -50,6 +52,14 @@ def phrase_equals(text: str, phrases: list[str]) -> str | None:
 
 
 def wake_suffix(text: str, wake_phrases: list[str]) -> tuple[str | None, str]:
+    """Match an affirmative, utterance-initial wake phrase and return its suffix.
+
+    The configured phrase is data, so this does not assume any particular wake
+    words. Ordinary ASR whitespace and punctuation are ignored, but words
+    before the phrase are not: negations, quotations, and reported speech must
+    never be reinterpreted as an invocation merely because they contain it.
+    """
+
     compact_parts: list[str] = []
     source_end_by_compact_character: list[int] = []
     for source_index, character in enumerate(text):
@@ -61,11 +71,20 @@ def wake_suffix(text: str, wake_phrases: list[str]) -> tuple[str | None, str]:
         needle = compact_text(phrase)
         if not needle:
             continue
-        index = compact.find(needle)
-        if index >= 0:
-            last_compact_index = index + len(needle) - 1
-            source_end = source_end_by_compact_character[last_compact_index]
-            suffix = text[source_end:].lstrip(" \t\r\n,，.。;；!！?？:：、")
+        if compact.startswith(needle):
+            source_end = source_end_by_compact_character[len(needle) - 1]
+            raw_suffix = text[source_end:]
+            if (
+                needle[-1].isascii()
+                and needle[-1].isalnum()
+                and raw_suffix
+                and raw_suffix[0].isascii()
+                and raw_suffix[0].isalnum()
+            ):
+                continue
+            suffix = raw_suffix.lstrip(_WAKE_SUFFIX_TRIM)
+            if suffix and suffix[0] in _WAKE_CLOSING_QUOTES:
+                continue
             return phrase, suffix
     return None, ""
 

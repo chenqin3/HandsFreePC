@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -700,15 +699,11 @@ def _screenshot_visual_driver(
     )
 
 
-def _armed_visual_search_submission():
+def _typed_visual_filter():
     window = _window()
     native = FakeNative([window])
     native.focus_snapshot = _native_focus_snapshot(window)
     root = _VisualPngRoot()
-    clock = [0.0]
-
-    def sleep(duration):
-        clock[0] += duration
 
     def clicker(_x, _y):
         root.change_outside_target()
@@ -723,8 +718,6 @@ def _armed_visual_search_submission():
         root,
         native=native,
         clicker=clicker,
-        monotonic=lambda: clock[0],
-        sleeper=sleep,
     )
     initial = driver.observe("wechat")
     viewport = next(
@@ -755,11 +748,11 @@ def _armed_visual_search_submission():
         ),
         focused,
     )
-    submitted = driver.observe("wechat")
-    submitted_viewport = next(
-        item for item in submitted.elements if item.control_type == "VisualViewport"
+    filtered = driver.observe("wechat")
+    filtered_viewport = next(
+        item for item in filtered.elements if item.control_type == "VisualViewport"
     )
-    return native, driver, submitted, submitted_viewport
+    return native, driver, filtered, filtered_viewport
 
 
 def test_screenshot_visual_planning_does_not_require_or_call_ocr() -> None:
@@ -891,7 +884,7 @@ def test_visual_ocr_augments_three_shell_buttons_without_an_input() -> None:
     assert stats["visual_ocr_augmented_uia"] is True
 
 
-def test_visual_ocr_does_not_duplicate_a_real_accessible_composer() -> None:
+def test_visual_viewport_coexists_with_and_follows_a_real_accessible_composer() -> None:
     window = _window()
     native = FakeNative([window])
     root = _VisualPngRoot(
@@ -915,10 +908,13 @@ def test_visual_ocr_does_not_duplicate_a_real_accessible_composer() -> None:
     )
 
     observation = driver.observe("wechat")
+    stats = json.loads(observation.accessibility_text.splitlines()[0])["uia_stats"]
 
-    assert len(observation.elements) == 1
+    assert len(observation.elements) == 2
     assert observation.elements[0].composer is True
-    assert not any(item.visual_ocr for item in observation.elements)
+    assert observation.elements[1].control_type == "VisualViewport"
+    assert not any(item.control_type == "VisualText" for item in observation.elements)
+    assert stats["visual_semantic_uia_preferred"] is True
     assert observation.screenshot_png == root.raw_png()
 
 
@@ -1030,7 +1026,7 @@ def test_visual_viewport_point_click_is_screenshot_local_and_frame_bound() -> No
     assert after.screenshot_png != before.screenshot_png
 
 
-def test_visual_viewport_allows_one_exact_search_payload_after_a_bound_click() -> None:
+def test_visual_viewport_types_one_exact_filter_but_never_arms_enter() -> None:
     window = _window()
     native = FakeNative([window])
     native.focus_snapshot = _native_focus_snapshot(window)
@@ -1046,6 +1042,7 @@ def test_visual_viewport_allows_one_exact_search_payload_after_a_bound_click() -
 
     native.send_text = send_text
     driver = _screenshot_visual_driver(root, native=native, clicker=clicker)
+    driver.set_task_context("打开文件传输助手")
     initial = driver.observe("wechat")
     viewport = next(
         item for item in initial.elements if item.control_type == "VisualViewport"
@@ -1088,96 +1085,109 @@ def test_visual_viewport_allows_one_exact_search_payload_after_a_bound_click() -
     assert not any(call == ("send_hotkey", "enter") for call in native.calls)
     assert after.screenshot_png != focused.screenshot_png
     assert DesktopElementAction.TYPE_TEXT not in (final_viewport.supported_actions or ())
-    assert DesktopElementAction.PRESS_KEY in (final_viewport.supported_actions or ())
+    assert DesktopElementAction.PRESS_KEY not in (final_viewport.supported_actions or ())
 
 
-@pytest.mark.parametrize("key", ["tab", "escape"])
-def test_armed_visual_search_rejects_every_non_enter_navigation_key(key) -> None:
-    native, driver, submitted, viewport = _armed_visual_search_submission()
+def test_visual_unsent_draft_never_arms_enter_even_in_the_top_search_zone() -> None:
+    window = _window()
+    native = FakeNative([window])
+    native.focus_snapshot = _native_focus_snapshot(window)
+    root = _VisualPngRoot()
 
-    with pytest.raises(WindowsUiaDriverError, match="permits Enter/Return only"):
+    def clicker(_x, _y):
+        root.change_outside_target()
+
+    def send_text(text):
+        native.calls.append(("send_text", text))
+        native.text.append(text)
+        root.image.putpixel((160, 100), (78, 90, 123))
+
+    native.send_text = send_text
+    driver = _screenshot_visual_driver(root, native=native, clicker=clicker)
+    driver.set_task_context("在 Message 输入 hello，但不要发送")
+    initial = driver.observe("wechat")
+    viewport = next(
+        item for item in initial.elements if item.control_type == "VisualViewport"
+    )
+    driver.execute(
+        DesktopAction(
+            DesktopActionType.CLICK,
+            app="wechat",
+            generation=initial.generation,
+            element_index=viewport.index,
+            x=40,
+            y=30,
+        ),
+        initial,
+    )
+    focused = driver.observe("wechat")
+    focused_viewport = next(
+        item for item in focused.elements if item.control_type == "VisualViewport"
+    )
+    driver.execute(
+        DesktopAction(
+            DesktopActionType.TYPE_TEXT,
+            app="wechat",
+            generation=focused.generation,
+            element_index=focused_viewport.index,
+            text="hello",
+        ),
+        focused,
+    )
+
+    after = driver.observe("wechat")
+    final_viewport = next(
+        item for item in after.elements if item.control_type == "VisualViewport"
+    )
+
+    assert native.text == ["hello"]
+    assert DesktopElementAction.PRESS_KEY not in (final_viewport.supported_actions or ())
+    assert not any(call == ("send_hotkey", "enter") for call in native.calls)
+
+
+@pytest.mark.parametrize("key", ["enter", "return", "tab", "escape"])
+def test_coordinate_only_visual_viewport_rejects_every_key(key: str) -> None:
+    native, driver, filtered, viewport = _typed_visual_filter()
+
+    assert DesktopElementAction.PRESS_KEY not in (viewport.supported_actions or ())
+    with pytest.raises(WindowsUiaDriverError, match="keys, secondary actions"):
         driver.execute(
             DesktopAction(
                 DesktopActionType.PRESS_KEY,
                 app="wechat",
-                generation=submitted.generation,
+                generation=filtered.generation,
                 element_index=viewport.index,
                 key=key,
             ),
-            submitted,
+            filtered,
         )
 
     assert not any(call[0] == "send_hotkey" for call in native.calls)
 
 
-def test_armed_visual_search_sends_one_normalized_enter_hotkey() -> None:
-    native, driver, submitted, viewport = _armed_visual_search_submission()
+def test_focused_semantic_search_input_still_accepts_enter() -> None:
+    window = _window()
+    native = FakeNative([window])
+    search = FakeElement("Search", "Edit", value="文件传输助手", focused=True)
+    driver = _driver(
+        native=native,
+        desktop=FakeDesktop({window.hwnd: FakeRoot([search])}),
+    )
+    observation = driver.observe("claude")
 
     receipt = driver.execute(
         DesktopAction(
             DesktopActionType.PRESS_KEY,
-            app="wechat",
-            generation=submitted.generation,
-            element_index=viewport.index,
-            key="Enter",
+            app="claude",
+            generation=observation.generation,
+            element_index="0",
+            key="enter",
         ),
-        submitted,
+        observation,
     )
 
     assert receipt.accepted is True
-    assert [call for call in native.calls if call[0] == "send_hotkey"] == [
-        ("send_hotkey", "enter")
-    ]
-
-
-def test_external_cancel_interrupts_visual_enter_transition_poll() -> None:
-    native, driver, submitted, viewport = _armed_visual_search_submission()
-    cancel_event = threading.Event()
-    sleep_calls: list[float] = []
-
-    def cancel_after_first_interval(duration: float) -> None:
-        sleep_calls.append(duration)
-        cancel_event.set()
-
-    driver._sleep = cancel_after_first_interval
-
-    with pytest.raises(WindowsUiaDriverError, match="operation was cancelled"):
-        driver.execute(
-            DesktopAction(
-                DesktopActionType.PRESS_KEY,
-                app="wechat",
-                generation=submitted.generation,
-                element_index=viewport.index,
-                key="enter",
-            ),
-            submitted,
-            cancel_event=cancel_event,
-        )
-
-    assert sleep_calls == [0.05]
-    assert [call for call in native.calls if call[0] == "send_hotkey"] == [
-        ("send_hotkey", "enter")
-    ]
-    assert driver.cancel() is False
-
-
-def test_armed_visual_search_rechecks_focus_before_enter_and_fails_closed() -> None:
-    native, driver, submitted, viewport = _armed_visual_search_submission()
-    native.focus_snapshot = None
-
-    with pytest.raises(WindowsUiaStaleObservation, match="focus/caret evidence"):
-        driver.execute(
-            DesktopAction(
-                DesktopActionType.PRESS_KEY,
-                app="wechat",
-                generation=submitted.generation,
-                element_index=viewport.index,
-                key="enter",
-            ),
-            submitted,
-        )
-
-    assert not any(call[0] == "send_hotkey" for call in native.calls)
+    assert ("send_hotkey", "enter") in native.calls
 
 
 def test_visual_viewport_does_not_arm_text_without_positive_native_caret() -> None:
@@ -1536,6 +1546,17 @@ def test_unrestricted_inventory_exposes_each_top_level_window_as_a_unique_target
         first.title,
         second.title,
     }
+    chrome_ids_by_title = {
+        item["window_title"]: item["app"] for item in chrome_entries
+    }
+
+    native.windows = [second, explorer, first]
+    refreshed_chrome_ids_by_title = {
+        item["window_title"]: item["app"]
+        for item in json.loads(driver.list_apps())
+        if item["process_name"] == "chrome.exe"
+    }
+    assert refreshed_chrome_ids_by_title == chrome_ids_by_title
 
     second_app = next(
         item["app"] for item in chrome_entries if item["window_title"] == second.title
@@ -1549,6 +1570,305 @@ def test_unrestricted_inventory_exposes_each_top_level_window_as_a_unique_target
     assert desktop.handles == [second.hwnd]
     assert ("activate_window", second.hwnd) in native.calls
     assert ("assert_foreground", second.hwnd) in native.calls
+
+
+def test_unrestricted_window_id_survives_title_foreground_and_selected_state_changes():
+    window = WindowInfo(101, "Claude - First conversation", 5101, "claude.exe")
+    other = WindowInfo(202, "Downloads", 5202, "explorer.exe")
+    tab = FakeElement("Chat and Cowork", "TabItem", selected=False)
+    native = FakeNative([window, other])
+    desktop = FakeDesktop(
+        {
+            window.hwnd: FakeRoot([tab]),
+            other.hwnd: FakeRoot([FakeElement("Downloads", "TreeItem")]),
+        }
+    )
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: desktop,
+        discover_all_windows=True,
+    )
+
+    first_inventory = json.loads(driver.list_apps())
+    app_id = next(
+        item["app"]
+        for item in first_inventory
+        if item["window_title"] == window.title
+    )
+    assert driver.observe(app_id).elements[0].selected is False
+
+    renamed = WindowInfo(
+        window.hwnd,
+        "Claude - Chat and Cowork",
+        window.process_id,
+        window.process_name,
+    )
+    tab.selected = True
+    native.windows = [other, renamed]
+    native.foreground = other
+
+    second_inventory = json.loads(driver.list_apps())
+    renamed_entry = next(
+        item
+        for item in second_inventory
+        if item["window_title"] == renamed.title
+    )
+    assert renamed_entry["app"] == app_id
+    assert renamed_entry["foreground"] is False
+    assert driver.observe(app_id).elements[0].selected is True
+
+    native.foreground = renamed
+    third_inventory = json.loads(driver.list_apps())
+    foreground_entry = next(
+        item
+        for item in third_inventory
+        if item["window_title"] == renamed.title
+    )
+    assert foreground_entry["app"] == app_id
+    assert foreground_entry["foreground"] is True
+
+
+def test_unrestricted_window_id_is_not_reused_after_a_handle_lifecycle_ends():
+    original = WindowInfo(101, "Claude - Original", 5101, "claude.exe")
+    native = FakeNative([original])
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop(
+            {original.hwnd: FakeRoot([FakeElement("Chat", "TabItem")])}
+        ),
+        discover_all_windows=True,
+    )
+
+    original_id = json.loads(driver.list_apps())[0]["app"]
+    native.windows = []
+    native.foreground = None
+    assert json.loads(driver.list_apps()) == []
+
+    replacement = WindowInfo(
+        original.hwnd,
+        "Claude - Replacement",
+        original.process_id,
+        original.process_name,
+    )
+    native.windows = [replacement]
+    native.foreground = replacement
+    replacement_id = json.loads(driver.list_apps())[0]["app"]
+
+    assert replacement_id != original_id
+
+
+def test_unrestricted_visual_wildcard_retains_viewport_after_full_uia_budget():
+    window = WindowInfo(401, "Fixture - Chrome", 5401, "chrome.exe")
+    native = FakeNative([window])
+    root = _VisualPngRoot([FakeElement("Open", "Button")])
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop({window.hwnd: root}),
+        max_elements=1,
+        discover_all_windows=True,
+        visual_screenshot_enabled=True,
+        visual_ocr_apps=("*",),
+    )
+    app_id = json.loads(driver.list_apps())[0]["app"]
+
+    observation = driver.observe(app_id)
+
+    assert [item.control_type for item in observation.elements] == [
+        "Button",
+        "VisualViewport",
+    ]
+    assert observation.elements[0].name == "Open"
+    assert observation.screenshot_png == root.raw_png()
+
+
+def test_visual_wildcard_does_not_expand_without_all_window_discovery():
+    window = _window()
+    native = FakeNative([window])
+    root = _VisualPngRoot([FakeElement("Open", "Button")])
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop({window.hwnd: root}),
+        visual_screenshot_enabled=True,
+        visual_ocr_apps=("*",),
+    )
+
+    observation = driver.observe("claude")
+
+    assert [item.control_type for item in observation.elements] == ["Button"]
+    assert observation.screenshot_png is None
+
+
+def test_canonical_observe_replaces_same_hwnd_dynamic_alias_and_survives_refresh():
+    window = _window()
+    native = FakeNative([window])
+    desktop = FakeDesktop({window.hwnd: FakeRoot([FakeElement("Chat", "TabItem")])})
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: desktop,
+        discover_all_windows=True,
+    )
+    first_inventory = json.loads(driver.list_apps())
+    dynamic_app = first_inventory[0]["app"]
+    assert dynamic_app != "claude"
+    driver.observe(dynamic_app)
+
+    canonical = driver.observe("claude")
+    refreshed = json.loads(driver.list_apps())
+
+    assert canonical.app == "claude"
+    assert [item["app"] for item in refreshed] == ["claude"]
+    assert dynamic_app not in driver._dynamic_windows
+    assert dynamic_app not in driver._snapshots
+    assert driver._dynamic_windows["claude"].window.hwnd == window.hwnd
+
+
+def test_verified_native_hwnd_rebinds_canonical_alias_to_the_new_same_app_window():
+    first = _window(hwnd=401, title="Claude A")
+    second = _window(hwnd=402, title="Claude B")
+    native = FakeNative([first, second])
+    desktop = FakeDesktop(
+        {
+            first.hwnd: FakeRoot([FakeElement("First", "Button")]),
+            second.hwnd: FakeRoot([FakeElement("Second", "Button")]),
+        }
+    )
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: desktop,
+        discover_all_windows=True,
+        activate_on_observe=True,
+    )
+
+    first_observation = driver.observe("claude")
+    native.foreground = second
+    driver.bind_app_window("claude", second.hwnd)
+    second_observation = driver.observe("claude")
+    inventory = json.loads(driver.list_apps())
+
+    assert first_observation.local_window_id == f"hwnd:{first.hwnd}"
+    assert second_observation.local_window_id == f"hwnd:{second.hwnd}"
+    assert driver._dynamic_windows["claude"].window == second
+    assert next(item for item in inventory if item["app"] == "claude")[
+        "window_title"
+    ] == second.title
+    assert len(inventory) == 2
+
+
+def test_canonical_alias_cannot_bypass_pending_visual_frame_verification():
+    window = _window()
+    native = FakeNative([window])
+    root = _VisualPngRoot()
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop({window.hwnd: root}),
+        discover_all_windows=True,
+        visual_screenshot_enabled=True,
+        visual_ocr_apps=("claude",),
+        visual_clicker=lambda _x, _y: None,
+        sleeper=lambda _duration: None,
+    )
+    dynamic_app = json.loads(driver.list_apps())[0]["app"]
+    before = driver.observe(dynamic_app)
+    viewport = next(
+        item for item in before.elements if item.control_type == "VisualViewport"
+    )
+    driver.execute(
+        DesktopAction(
+            DesktopActionType.CLICK,
+            app=dynamic_app,
+            generation=before.generation,
+            element_index=viewport.index,
+            x=40,
+            y=30,
+        ),
+        before,
+    )
+
+    with pytest.raises(
+        WindowsUiaDriverError,
+        match="no observable exact-window change",
+    ):
+        driver.observe("claude")
+
+    root.change_outside_target()
+    canonical = driver.observe("claude")
+
+    assert canonical.app == "claude"
+    assert window.hwnd not in driver._pending_visual_change
+    assert dynamic_app not in driver._dynamic_windows
+    assert dynamic_app not in driver._snapshots
+    assert driver._dynamic_windows["claude"].window.hwnd == window.hwnd
+
+
+def test_pending_visual_frame_follows_a_verified_related_child_transition():
+    original = WindowInfo(101, "Before - rendered app", 5101, "rendered.exe")
+    child = WindowInfo(202, "Rendered child", 6202, "rendered_child.exe")
+    native = FakeNative([original])
+    original_root = _VisualPngRoot()
+    child_root = _VisualPngRoot()
+
+    def open_child(_x, _y):
+        native.windows = [child]
+        native.foreground = child
+
+    driver = WindowsUiaDriver(
+        {},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop(
+            {
+                original.hwnd: original_root,
+                child.hwnd: child_root,
+            }
+        ),
+        discover_all_windows=True,
+        activate_on_observe=True,
+        visual_screenshot_enabled=True,
+        visual_ocr_apps=("*",),
+        visual_clicker=open_child,
+        sleeper=lambda _duration: None,
+    )
+    driver._processes_are_related = (
+        lambda left, right: (left, right) == (original.process_id, child.process_id)
+    )
+    app_id = json.loads(driver.list_apps())[0]["app"]
+    before = driver.observe(app_id)
+    viewport = next(
+        item for item in before.elements if item.control_type == "VisualViewport"
+    )
+
+    receipt = driver.execute(
+        DesktopAction(
+            DesktopActionType.CLICK,
+            app=app_id,
+            generation=before.generation,
+            element_index=viewport.index,
+            x=40,
+            y=30,
+        ),
+        before,
+    )
+
+    assert receipt.after_local_window_id == f"hwnd:{child.hwnd}"
+    assert original.hwnd not in driver._pending_visual_change
+    assert child.hwnd in driver._pending_visual_change
+    with pytest.raises(
+        WindowsUiaDriverError,
+        match="no observable exact-window change",
+    ):
+        driver.observe(app_id)
+
+    child_root.change_outside_target()
+    after = driver.observe(app_id)
+
+    assert after.local_window_id == f"hwnd:{child.hwnd}"
+    assert child.hwnd not in driver._pending_visual_change
 
 
 def test_dynamic_window_uses_exact_configured_process_when_document_title_changes():

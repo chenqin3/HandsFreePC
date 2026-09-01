@@ -18,11 +18,575 @@ from handsfree_pc.desktop.safety import (
     DesktopSafetyDisposition,
     DesktopSafetyPolicy,
     action_matches_next_user_step,
+    action_matches_user_step_with_label_aliases,
+    action_type_matches_a_future_user_step,
+    dangling_negation_before_action_present,
     expectation_matches_user_step,
+    explicitly_negated_app_scope,
+    generic_navigation_bridge_action_is_unnegated,
     local_dictation_user_text,
     observation_credential_summary,
+    reported_action_reference_present,
+    semantic_search_text_action_matches_next_user_step,
+    unparsed_affirmative_action_present,
+    unsupported_control_condition_present,
     user_action_step_count,
+    visual_search_payload_matches_next_user_step,
+    visual_search_submission_payload_authorized,
+    visual_search_task_allows_submission,
+    visual_text_action_matches_next_user_step,
 )
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        ("click Alpha, but do not operate Chrome", True),
+        ("点击 Alpha，但不要操作 Chrome", True),
+        ("click Alpha, but do not click Beta in Chrome", False),
+        ('type "do not operate Chrome" into Message', False),
+    ],
+)
+def test_explicitly_negated_app_scope_requires_the_app_to_be_the_negated_target(
+    task: str,
+    expected: bool,
+) -> None:
+    assert explicitly_negated_app_scope("Chrome", task) is expected
+
+
+@pytest.mark.parametrize(
+    ("action", "task", "expected"),
+    [
+        (
+            DesktopAction(
+                DesktopActionType.SCROLL,
+                app="claude",
+                generation=1,
+                element_index="0",
+                direction="down",
+            ),
+            "click Open, but do not scroll down",
+            False,
+        ),
+        (
+            DesktopAction(
+                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                app="claude",
+                generation=1,
+                element_index="0",
+                action_name="expand",
+            ),
+            "click Open, but do not expand anything",
+            False,
+        ),
+        (
+            DesktopAction(
+                DesktopActionType.CLICK,
+                app="claude",
+                generation=1,
+                element_index="0",
+            ),
+            "click Open, but do not click anything else",
+            False,
+        ),
+        (
+            DesktopAction(
+                DesktopActionType.SCROLL,
+                app="claude",
+                generation=1,
+                element_index="0",
+                direction="down",
+            ),
+            "click Open",
+            True,
+        ),
+    ],
+)
+def test_generic_navigation_bridge_respects_negated_action_classes(
+    action: DesktopAction,
+    task: str,
+    expected: bool,
+) -> None:
+    assert generic_navigation_bridge_action_is_unnegated(action, task) is expected
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "search Alpha but do not press Enter",
+        "search Alpha but skip pressing Enter",
+        "search Alpha, never pressing Enter",
+        "search Alpha but do not submit",
+        "search Alpha but do not hit Enter",
+        "search Alpha but avoid pressing Enter",
+        "search Alpha but refrain from pressing Enter",
+        "search Alpha but do not press any key",
+        "search Alpha but do not press anything",
+        "search Alpha but do not use the keyboard",
+        "search Alpha, no keystrokes",
+        "搜索 Alpha，但不必按回车",
+        "搜索 Alpha，但不要提交",
+        "搜索 Alpha，但不要按任何键",
+        "搜索 Alpha，但不要用键盘",
+    ],
+)
+def test_natural_search_enter_respects_an_explicit_key_negation(task: str) -> None:
+    enter = DesktopAction(
+        DesktopActionType.PRESS_KEY,
+        app="claude",
+        generation=1,
+        element_index="0",
+        key="enter",
+    )
+
+    assert action_matches_next_user_step(
+        enter,
+        "Search",
+        "search Alpha",
+        completed_steps=0,
+    )
+    assert not action_matches_next_user_step(
+        enter,
+        "Search",
+        task,
+        completed_steps=0,
+    )
+    assert not visual_search_task_allows_submission(task)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "If Alpha is visible, click Beta",
+        "unless Alpha is visible, click Beta",
+        "如果 Alpha 可见，点击 Beta",
+    ],
+)
+def test_conditional_control_preflight_detects_real_conditions(task: str) -> None:
+    assert unsupported_control_condition_present(task)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "Open Claude, after that click Chat",
+        "打开 Claude，之后点击 Chat",
+        "打开 Claude 并进入 Chat",
+        "打开 Claude 再进入 Chat",
+        "打开 Claude 接着进入 Chat",
+        "打开 Claude进入 Chat",
+    ],
+)
+def test_spoken_sequence_connectors_create_distinct_unconditional_steps(task: str) -> None:
+    assert not unsupported_control_condition_present(task)
+    assert user_action_step_count(task) == 2
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "after Alpha appears, click Beta",
+        "Alpha 出现之后点击 Beta",
+        "点击 Alpha 之后如果出现 Beta 就点击 Gamma",
+    ],
+)
+def test_state_dependent_after_clauses_remain_unsupported_conditions(task: str) -> None:
+    assert unsupported_control_condition_present(task)
+
+
+def test_authored_should_outcome_is_not_misclassified_as_a_condition() -> None:
+    assert not unsupported_control_condition_present(
+        "click Menu, which should show Settings"
+    )
+    assert unsupported_control_condition_present(
+        "should Settings appear, click Menu"
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "The page says, click Beta",
+        "He said, click Beta",
+        "Claude says, click Beta",
+        "页面写着，点击 Beta",
+        "他说，点击 Beta",
+    ],
+)
+def test_reported_actions_are_not_imperative_authority(task: str) -> None:
+    assert reported_action_reference_present(task)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "Do not, click Beta",
+        "Please do not; click Beta",
+        "Never... click Beta",
+        "不要，点击 Beta",
+        "不要；点击 Beta",
+        "千万不要……点击 Beta",
+    ],
+)
+def test_spoken_negation_survives_asr_pause_punctuation(task: str) -> None:
+    assert dangling_negation_before_action_present(task)
+
+
+def test_independent_positive_sentence_is_not_a_dangling_negation() -> None:
+    assert not dangling_negation_before_action_present(
+        "Do not click Alpha. Click Beta"
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "click Alpha, but there is no need to click Beta",
+        "click Alpha, but don't need to click Beta",
+        "click Alpha, but need not click Beta",
+        "click Alpha, but skip clicking Beta",
+        "点击 Alpha，但不必点击 Beta",
+        "点击 Alpha，但跳过点击 Beta",
+    ],
+)
+def test_common_negated_action_phrases_do_not_create_positive_steps(task: str) -> None:
+    assert user_action_step_count(task) == 1
+
+
+def test_skip_named_button_is_not_misclassified_as_negation() -> None:
+    assert user_action_step_count("click Skip") == 1
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "click Alpha; afterwards click it",
+        "click Alpha, later click Beta",
+        "click Alpha; later on click it",
+        "click Alpha; at a later time click it",
+        "click Alpha; at some point later click it",
+        "click Alpha. Eventually click Beta",
+        "click Alpha; finally click it",
+        "click Alpha; ultimately click it",
+        "点击 Alpha，稍后点击 Beta",
+        "点击 Alpha，过一会儿再点击它",
+        "点击 Alpha，晚一点再点击它",
+        "点击 Alpha，等会儿再点击它",
+        "点击 Alpha，待会儿再点击它",
+        "点击 Alpha，回头再点击它",
+        "点击 Alpha，以后再点击它",
+        "点击 Alpha，最后再点击它",
+    ],
+)
+def test_unparsed_deferred_action_clause_is_detected(task: str) -> None:
+    assert unparsed_affirmative_action_present(task)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "click Alpha to open Settings",
+        "In Claude, select Open and drag Slider",
+        "打开 Claude 并开始语音输入",
+        "打开 Claude，接下来我会语音输入",
+    ],
+)
+def test_action_shaped_labels_and_supported_trailing_steps_are_not_deferred(
+    task: str,
+) -> None:
+    assert not unparsed_affirmative_action_present(task)
+
+
+@pytest.mark.parametrize(
+    ("task", "action_type", "expected"),
+    [
+        ("click Alpha, but skip clicking it", DesktopActionType.CLICK, False),
+        ("click Alpha, but never clicking it", DesktopActionType.CLICK, False),
+        ("click Alpha, but skip clicking it", DesktopActionType.PERFORM_SECONDARY_ACTION, False),
+        ("click Alpha, but do not interact with it", DesktopActionType.CLICK, False),
+        ("click Alpha, but do not touch it", DesktopActionType.PERFORM_SECONDARY_ACTION, False),
+        ("scroll down, but skip scrolling again", DesktopActionType.SCROLL, False),
+        ("click Skip", DesktopActionType.CLICK, True),
+    ],
+)
+def test_inflected_negated_action_class_cannot_authorize_a_generic_bridge(
+    task: str,
+    action_type: DesktopActionType,
+    expected: bool,
+) -> None:
+    action = DesktopAction(
+        action_type,
+        app="claude",
+        generation=1,
+        element_index="0",
+        **(
+            {"action_name": "expand"}
+            if action_type == DesktopActionType.PERFORM_SECONDARY_ACTION
+            else {"direction": "down"}
+            if action_type == DesktopActionType.SCROLL
+            else {}
+        ),
+    )
+    assert generic_navigation_bridge_action_is_unnegated(action, task) is expected
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "click Alpha only",
+        "only click Alpha",
+        "click Alpha and nothing else",
+        "click Alpha but do not perform any other action",
+        "点击 Alpha，不要做任何其他操作",
+    ],
+)
+@pytest.mark.parametrize(
+    "action",
+    [
+        DesktopAction(DesktopActionType.CLICK, "claude", 1, element_index="0"),
+        DesktopAction(
+            DesktopActionType.PERFORM_SECONDARY_ACTION,
+            "claude",
+            1,
+            element_index="0",
+            action_name="expand",
+        ),
+        DesktopAction(
+            DesktopActionType.SCROLL,
+            "claude",
+            1,
+            element_index="0",
+            direction="down",
+        ),
+    ],
+)
+def test_explicit_only_request_disables_all_inferred_navigation_bridges(
+    task: str,
+    action: DesktopAction,
+) -> None:
+    assert not generic_navigation_bridge_action_is_unnegated(action, task)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "click Alpha, no scrolling",
+        "click Alpha with no scrolling",
+        "click Alpha, scrolling disabled",
+        "click Alpha without scrolling",
+        "点击 Alpha，不滚动",
+    ],
+)
+def test_scroll_noun_negation_disables_an_inferred_scroll(task: str) -> None:
+    scroll = DesktopAction(
+        DesktopActionType.SCROLL,
+        "claude",
+        1,
+        element_index="0",
+        direction="down",
+    )
+    assert not generic_navigation_bridge_action_is_unnegated(scroll, task)
+
+
+@pytest.mark.parametrize(
+    ("task", "action"),
+    [
+        (
+            "click Alpha, then click it",
+            DesktopAction(
+                DesktopActionType.CLICK,
+                app="claude",
+                generation=1,
+                element_index="0",
+            ),
+        ),
+        (
+            "click Alpha, then scroll down",
+            DesktopAction(
+                DesktopActionType.SCROLL,
+                app="claude",
+                generation=1,
+                element_index="0",
+                direction="down",
+            ),
+        ),
+    ],
+)
+def test_future_same_class_action_is_detected_without_an_exact_target(
+    task: str,
+    action: DesktopAction,
+) -> None:
+    assert action_type_matches_a_future_user_step(
+        action,
+        task,
+        completed_steps=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "search Alpha so Settings appears",
+        "search Alpha, and Settings appears",
+    ],
+)
+def test_search_submission_cannot_replace_a_distinct_authored_outcome(
+    task: str,
+) -> None:
+    enter = DesktopAction(
+        DesktopActionType.PRESS_KEY,
+        app="chrome",
+        generation=1,
+        element_index="0",
+        key="enter",
+    )
+
+    assert not expectation_matches_user_step(
+        enter,
+        "Search",
+        DesktopExpectation(DesktopExpectationKind.SEARCH_SUBMITTED, "Alpha"),
+        task,
+        completed_steps=0,
+    )
+    assert expectation_matches_user_step(
+        enter,
+        "Search",
+        DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "Settings"),
+        task,
+        completed_steps=0,
+    )
+
+
+def test_visual_text_transition_cannot_replace_a_distinct_authored_outcome() -> None:
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="claude",
+        generation=1,
+        element_index="2",
+        text="hello",
+    )
+
+    assert not visual_text_action_matches_next_user_step(
+        action,
+        'In Claude, type "hello" into Message so Settings appears',
+        completed_steps=0,
+    )
+
+
+def test_semantic_search_bridge_rejects_an_explicitly_negated_same_payload() -> None:
+    search = DesktopElement(
+        "0",
+        "Search",
+        "Edit",
+        value="",
+        focused=True,
+        editable=True,
+        enabled=True,
+        addressable=True,
+        automation_id="SearchBox",
+        supported_actions=(DesktopElementAction.TYPE_TEXT,),
+    )
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="claude",
+        generation=1,
+        element_index="0",
+        text="Alpha",
+    )
+
+    assert semantic_search_text_action_matches_next_user_step(
+        action,
+        search,
+        "In Claude, open Alpha",
+        completed_steps=0,
+    )
+    for task in (
+        "In Claude, open Alpha, but do not type Alpha",
+        "In Claude, search Alpha, but do not type Alpha",
+        "在 Claude 打开 Alpha，但不要输入 Alpha",
+        "In Claude, search Alpha, but don't type anything",
+        "In Claude, search Alpha, but do not enter it",
+        "In Claude, search Alpha, but do not fill the field",
+        "In Claude, search Alpha, but leave the field empty",
+        "In Claude, open Alpha, but do not search",
+        "In Claude, open Alpha, but avoid searching",
+        "在 Claude 搜索 Alpha，但不要输入任何内容",
+        "在 Claude 打开 Alpha，但不要用搜索框",
+    ):
+        assert not semantic_search_text_action_matches_next_user_step(
+            action,
+            search,
+            task,
+            completed_steps=0,
+        )
+        assert not visual_search_payload_matches_next_user_step(
+            "Alpha",
+            task,
+            completed_steps=0,
+        )
+
+
+def test_direct_step_binding_honors_action_specific_negations() -> None:
+    click = DesktopAction(
+        DesktopActionType.CLICK,
+        app="claude",
+        generation=1,
+        element_index="0",
+    )
+    assert action_matches_user_step_with_label_aliases(
+        click,
+        "Alpha button",
+        "In Claude, open Alpha",
+        completed_steps=0,
+    )
+    for task in (
+        "In Claude, open Alpha, but do not click Alpha",
+        "In Claude, select Alpha, but do not click Alpha",
+    ):
+        assert not action_matches_user_step_with_label_aliases(
+            click,
+            "Alpha button",
+            task,
+            completed_steps=0,
+        )
+
+    type_text = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="claude",
+        generation=1,
+        element_index="0",
+        text="Alpha",
+    )
+    assert action_matches_next_user_step(
+        type_text,
+        "Message",
+        "In Claude, type Alpha into Message",
+        completed_steps=0,
+    )
+    for task in (
+        "In Claude, type Alpha into Message, but do not type Alpha",
+        "In Claude, type Alpha into Message, but do not write Alpha",
+    ):
+        assert not action_matches_next_user_step(
+            type_text,
+            "Message",
+            task,
+            completed_steps=0,
+        )
+
+    set_value = DesktopAction(
+        DesktopActionType.SET_VALUE,
+        app="claude",
+        generation=1,
+        element_index="0",
+        value="Alpha",
+    )
+    assert not action_matches_next_user_step(
+        set_value,
+        "Message",
+        "In Claude, write Alpha into Message, but do not write Alpha",
+        completed_steps=0,
+    )
 
 
 def test_local_dictation_marker_allows_only_exact_punctuation_rich_composer_payload() -> None:
@@ -231,8 +795,23 @@ def test_armed_visual_viewport_accepts_only_an_exact_navigation_search_name() ->
     assert unarmed.disposition == DesktopSafetyDisposition.BLOCK
 
 
+def test_coordinate_only_visual_search_never_allows_enter_submission() -> None:
+    task = 'In Claude, search Alpha, then type "hello" into Message'
+
+    assert visual_search_submission_payload_authorized("Alpha", task) is True
+    assert visual_search_submission_payload_authorized("hello", task) is False
+    assert visual_search_task_allows_submission(task) is False
+    assert visual_search_task_allows_submission("In Claude, open Alpha") is False
+    assert (
+        visual_search_task_allows_submission(
+            'In Claude, type "hello" into Message but do not send it'
+        )
+        is False
+    )
+
+
 @pytest.mark.parametrize("key", ["enter", "return"])
-def test_armed_visual_search_submit_allows_only_enter_or_return_with_null_receipt_expectation(
+def test_coordinate_only_visual_search_submit_is_blocked_even_if_advertised(
     key: str,
 ) -> None:
     viewport = DesktopElement(
@@ -250,14 +829,14 @@ def test_armed_visual_search_submit_allows_only_enter_or_return_with_null_receip
     result = DesktopSafetyPolicy("local_unrestricted").evaluate(
         _action(DesktopActionType.PRESS_KEY, app="wechat", index="2", key=key),
         _observation(app="wechat", elements=(viewport,)),
-        user_text="打开微信中的文件传输助手，只打开这个对话，不发送任何消息",
+        user_text="在微信中搜索文件传输助手",
         expectation=DesktopExpectation(
             DesktopExpectationKind.LAST_ACTION_VERIFIED,
             text=None,
         ),
     )
 
-    assert result.disposition == DesktopSafetyDisposition.ALLOW
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
 
 
 @pytest.mark.parametrize(
@@ -3794,6 +4373,31 @@ def test_last_action_verified_allows_one_exact_frame_visual_point_click() -> Non
         action,
         _observation(elements=(viewport,)),
         user_text="打开屏幕上的目标对话",
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_visual_viewport_allows_exact_user_authored_unsent_draft() -> None:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.TYPE_TEXT,),
+    )
+    action = _action(
+        DesktopActionType.TYPE_TEXT,
+        index="2",
+        text="这是测试",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        _observation(elements=(viewport,)),
+        user_text="在输入框中输入这是测试，但是不要发送",
         expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
     )
 

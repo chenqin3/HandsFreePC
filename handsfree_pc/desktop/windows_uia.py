@@ -5,6 +5,7 @@ import io
 import json
 import math
 import re
+import secrets
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -99,15 +100,6 @@ class _VisualTextFocusBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class _VisualSearchSubmissionBinding:
-    """One exact visual search value awaiting an Enter/Return transition."""
-
-    focus: _VisualTextFocusBinding
-    payload_sha256: str
-    payload_length: int
-
-
-@dataclass(frozen=True, slots=True)
 class _DynamicWindowBinding:
     """One inventory identifier pinned to one exact top-level window."""
 
@@ -115,6 +107,14 @@ class _DynamicWindowBinding:
     window: WindowInfo
     profile: AppProfile
     display_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingVisualChange:
+    """One pre-action frame bound to the exact window that must replace it."""
+
+    window: WindowInfo
+    frame_sha256: str
 
 
 @dataclass(slots=True)
@@ -502,13 +502,20 @@ class WindowsUiaDriver:
         self._generation = 0
         self._snapshots: dict[str, _Snapshot] = {}
         self._pending_observation: set[str] = set()
-        self._pending_visual_change: dict[str, str] = {}
+        # Visual postconditions belong to an exact top-level window, not to an
+        # app alias. A configured canonical name and a freshly enumerated
+        # dynamic ID may both refer to the same HWND across consecutive steps.
+        self._pending_visual_change: dict[int, _PendingVisualChange] = {}
         self._visual_text_click: dict[int, _VisualTextClickBinding] = {}
         self._visual_text_focus: dict[int, _VisualTextFocusBinding] = {}
-        self._visual_search_submission: dict[
-            int, _VisualSearchSubmissionBinding
-        ] = {}
         self._dynamic_windows: dict[str, _DynamicWindowBinding] = {}
+        # Dynamic IDs are opaque lifecycle aliases, not encodings of HWND/PID.
+        # The sequence never resets while this driver object exists, so a
+        # handle that disappears and is later reused cannot resurrect an old
+        # cloud-visible app ID.
+        self._dynamic_id_nonce = secrets.token_bytes(32)
+        self._dynamic_id_sequence = 0
+        self._issued_dynamic_ids: set[str] = set()
         self._active_cancellations: set[threading.Event] = set()
         self._task_context = ""
         self._lock = threading.RLock()
@@ -522,7 +529,6 @@ class WindowsUiaDriver:
             self._task_context = " ".join((task or "").casefold().split())
             self._visual_text_click.clear()
             self._visual_text_focus.clear()
-            self._visual_search_submission.clear()
 
     def _native_backend(self) -> NativeWindows:
         if self._native is None:
@@ -555,6 +561,53 @@ class WindowsUiaDriver:
             if binding is not None:
                 return binding.profile
         raise WindowsUiaDriverError(f"application is not configured: {app!r}")
+
+    def _visual_enabled_for_window(self, app: str, profile: AppProfile) -> bool:
+        """Match one configured app or every fresh dynamic window via ``*``.
+
+        The wildcard is deliberately effective only for the all-window driver
+        used by ``local_unrestricted``.  Direct driver construction therefore
+        cannot turn ``*`` into an implicit expansion of a configured-app scope.
+        """
+
+        if not self._visual_screenshot_enabled:
+            return False
+        if self._discover_all_windows and "*" in self._visual_ocr_apps:
+            return True
+        normalized = self._normalize_app(app)
+        return bool(
+            normalized in self._visual_ocr_apps
+            or profile.name.strip().casefold() in self._visual_ocr_apps
+        )
+
+    def _retain_canonical_dynamic_alias(
+        self,
+        *,
+        app: str,
+        window: WindowInfo,
+        profile: AppProfile,
+    ) -> None:
+        """Keep a successfully observed canonical app pinned to its exact HWND."""
+
+        if not self._discover_all_windows or app not in self.profiles:
+            return
+        binding = _DynamicWindowBinding(
+            app_id=app,
+            window=window,
+            profile=profile,
+            display_name=profile.name,
+        )
+        with self._lock:
+            duplicate_ids = tuple(
+                app_id
+                for app_id, candidate in self._dynamic_windows.items()
+                if app_id != app and candidate.window.hwnd == window.hwnd
+            )
+            for duplicate_id in duplicate_ids:
+                self._dynamic_windows.pop(duplicate_id, None)
+                self._snapshots.pop(duplicate_id, None)
+                self._pending_observation.discard(duplicate_id)
+            self._dynamic_windows[app] = binding
 
     @staticmethod
     def _same_window_identity(
@@ -643,20 +696,37 @@ class WindowsUiaDriver:
         slug = re.sub(r"[^a-z0-9_.+-]+", "-", source).strip("-._+")
         return slug[:48] or "window"
 
-    @classmethod
-    def _dynamic_window_id(cls, window: WindowInfo) -> str:
-        identity = json.dumps(
-            {
-                "hwnd": window.hwnd,
-                "process_id": window.process_id,
-                "process_name": window.process_name,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        token = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
-        return f"{cls._dynamic_window_slug(window)}-{token}"
+    def _allocate_dynamic_window_id(
+        self,
+        window: WindowInfo,
+        *,
+        reserved_ids: set[str],
+    ) -> str:
+        """Allocate one opaque ID that is never reused by this driver.
+
+        Stability comes from retaining the resulting binding for the lifetime
+        of its exact HWND, not from recomputing an identifier from mutable
+        inventory metadata.  The token contains no HWND, PID, title, or other
+        reversible local window identity.
+        """
+
+        slug = self._dynamic_window_slug(window)
+        with self._lock:
+            occupied = (
+                reserved_ids
+                | set(self.profiles)
+                | set(self._dynamic_windows)
+                | self._issued_dynamic_ids
+            )
+            while True:
+                self._dynamic_id_sequence += 1
+                sequence = self._dynamic_id_sequence.to_bytes(16, "big")
+                token = hashlib.sha256(self._dynamic_id_nonce + sequence).hexdigest()[:16]
+                candidate = f"{slug}-{token}"
+                if candidate in occupied:
+                    continue
+                self._issued_dynamic_ids.add(candidate)
+                return candidate
 
     @staticmethod
     def _immediate_parent_process_name(process_id: int) -> str | None:
@@ -882,8 +952,10 @@ class WindowsUiaDriver:
             or candidate.window_rect != window_rect
         ):
             with self._lock:
-                self._visual_text_click.pop(hwnd, None)
-                self._visual_text_focus.pop(hwnd, None)
+                if self._visual_text_click.get(hwnd) == pending:
+                    self._visual_text_click.pop(hwnd, None)
+                if self._visual_text_focus.get(hwnd) == existing:
+                    self._visual_text_focus.pop(hwnd, None)
             return False
         snapshot = self._native_focus_snapshot(hwnd)
         valid = self._focus_snapshot_matches_visual_click(snapshot, candidate)
@@ -892,8 +964,10 @@ class WindowsUiaDriver:
             valid = self._same_native_focus_identity(existing, snapshot)
         if not valid:
             with self._lock:
-                self._visual_text_click.pop(hwnd, None)
-                self._visual_text_focus.pop(hwnd, None)
+                if self._visual_text_click.get(hwnd) == pending:
+                    self._visual_text_click.pop(hwnd, None)
+                if self._visual_text_focus.get(hwnd) == existing:
+                    self._visual_text_focus.pop(hwnd, None)
             return False
         assert snapshot is not None
         focus_binding = _VisualTextFocusBinding(
@@ -904,8 +978,12 @@ class WindowsUiaDriver:
             caret_hwnd=snapshot.caret_hwnd,
         )
         with self._lock:
-            # A newer click for this HWND must not be overwritten by the query.
-            if pending is not None and self._visual_text_click.get(hwnd) != pending:
+            # A newer click or focus for this HWND must not be overwritten by
+            # an observation that started from older native focus evidence.
+            if (
+                self._visual_text_click.get(hwnd) != pending
+                or self._visual_text_focus.get(hwnd) != existing
+            ):
                 return False
             self._visual_text_click.pop(hwnd, None)
             self._visual_text_focus[hwnd] = focus_binding
@@ -931,38 +1009,6 @@ class WindowsUiaDriver:
                 "rendered text focus/caret evidence no longer matches the exact window"
             )
         return snapshot
-
-    @staticmethod
-    def _visual_click_is_in_search_zone(click: _VisualTextClickBinding) -> bool:
-        height = click.window_rect[3] - click.window_rect[1]
-        return bool(height > 0 and click.y <= max(48, int(height * 0.30)))
-
-    def _refresh_visual_search_submission(
-        self,
-        *,
-        hwnd: int,
-        window_rect: tuple[int, int, int, int],
-    ) -> bool:
-        with self._lock:
-            binding = self._visual_search_submission.get(hwnd)
-        if (
-            binding is None
-            or binding.focus.click.window_rect != window_rect
-            or not self._visual_click_is_in_search_zone(binding.focus.click)
-        ):
-            with self._lock:
-                self._visual_search_submission.pop(hwnd, None)
-            return False
-        try:
-            self._assert_visual_text_focus(
-                binding.focus,
-                allow_horizontal_drift=True,
-            )
-        except WindowsUiaStaleObservation:
-            with self._lock:
-                self._visual_search_submission.pop(hwnd, None)
-            return False
-        return True
 
     @staticmethod
     def _processes_are_related(left_process_id: int, right_process_id: int) -> bool:
@@ -1051,6 +1097,26 @@ class WindowsUiaDriver:
                 or not self._same_window_identity(binding.window, before_window)
             ):
                 return None
+            pending = self._pending_visual_change.get(before_window.hwnd)
+            if pending is not None:
+                if not self._same_window_identity(
+                    pending.window,
+                    before_window,
+                    allow_title_change=True,
+                ):
+                    raise WindowsUiaStaleObservation(
+                        "visual postcondition no longer belongs to the transition source"
+                    )
+                destination_pending = self._pending_visual_change.get(after_window.hwnd)
+                if destination_pending is not None and destination_pending != pending:
+                    raise WindowsUiaStaleObservation(
+                        "related window already has another pending visual postcondition"
+                    )
+                self._pending_visual_change.pop(before_window.hwnd, None)
+                self._pending_visual_change[after_window.hwnd] = replace(
+                    pending,
+                    window=after_window,
+                )
             self._dynamic_windows[app] = replace(
                 binding,
                 window=after_window,
@@ -1255,7 +1321,6 @@ class WindowsUiaDriver:
     def _visual_fallback(
         self,
         *,
-        app: str,
         hwnd: int,
         root: Any,
         screenshot_png: bytes,
@@ -1263,13 +1328,14 @@ class WindowsUiaDriver:
         wrappers: dict[str, Any],
         stats: dict[str, Any],
     ) -> tuple[tuple[DesktopElement, ...], dict[str, Any], dict[str, Any], bytes]:
-        if (
-            not self._visual_screenshot_enabled
-            or app not in self._visual_ocr_apps
-            or self._has_rich_uia_surface(elements)
-        ):
+        if not self._visual_screenshot_enabled:
             return elements, wrappers, stats, screenshot_png
-        client = self._visual_ocr_client
+        rich_uia_surface = self._has_rich_uia_surface(elements)
+        # A semantic UIA surface remains the preferred and first-listed action
+        # plane.  Keep the complete screenshot viewport as a fallback signal,
+        # but do not add duplicate OCR text regions when UIA already exposes a
+        # positively classified input/control surface.
+        client = None if rich_uia_surface else self._visual_ocr_client
         result = self._screenshot_result(screenshot_png)
         ocr_error: str | None = None
         if client is not None:
@@ -1287,10 +1353,6 @@ class WindowsUiaDriver:
             height=result.height,
         )
         visual_text_armed = self._refresh_visual_text_focus(
-            hwnd=hwnd,
-            window_rect=window_rect,
-        )
-        visual_search_submit_armed = self._refresh_visual_search_submission(
             hwnd=hwnd,
             window_rect=window_rect,
         )
@@ -1328,45 +1390,47 @@ class WindowsUiaDriver:
                     supported_actions=(DesktopElementAction.CLICK,),
                 )
             )
-        if capacity > len(visual_elements):
-            index = str(next_index)
-            binding = self._make_visual_binding(
-                hwnd=hwnd,
-                window_rect=window_rect,
-                result=result,
-                screenshot_png=screenshot_png,
-                block=None,
+        # The viewport is one mandatory frame binding, not another UIA node.
+        # It may therefore occupy one synthetic slot beyond ``max_elements``
+        # when the semantic UIA budget is already full.  Existing UIA elements
+        # remain first so the planner continues to prefer their exact actions.
+        index = str(next_index)
+        binding = self._make_visual_binding(
+            hwnd=hwnd,
+            window_rect=window_rect,
+            result=result,
+            screenshot_png=screenshot_png,
+            block=None,
+        )
+        bindings[index] = binding
+        viewport_actions = [
+            DesktopElementAction.CLICK,
+            DesktopElementAction.SCROLL,
+        ]
+        if visual_text_armed:
+            viewport_actions.append(DesktopElementAction.TYPE_TEXT)
+        visual_elements.append(
+            DesktopElement(
+                index=index,
+                name=binding.text,
+                control_type="VisualViewport",
+                enabled=True,
+                local_identity=binding.local_identity,
+                plane=ElementPlane.CONTROL,
+                editable=False,
+                addressable=True,
+                composer=False,
+                visual_ocr=True,
+                supported_actions=tuple(viewport_actions),
+                scroll_axes=(DesktopScrollAxis.VERTICAL,),
             )
-            bindings[index] = binding
-            viewport_actions = [
-                DesktopElementAction.CLICK,
-                DesktopElementAction.SCROLL,
-            ]
-            if visual_text_armed:
-                viewport_actions.append(DesktopElementAction.TYPE_TEXT)
-            if visual_search_submit_armed:
-                viewport_actions.append(DesktopElementAction.PRESS_KEY)
-            visual_elements.append(
-                DesktopElement(
-                    index=index,
-                    name=binding.text,
-                    control_type="VisualViewport",
-                    enabled=True,
-                    local_identity=binding.local_identity,
-                    plane=ElementPlane.CONTROL,
-                    editable=False,
-                    addressable=True,
-                    composer=False,
-                    visual_ocr=True,
-                    supported_actions=tuple(viewport_actions),
-                    scroll_axes=(DesktopScrollAxis.VERTICAL,),
-                )
-            )
+        )
         combined = elements + tuple(visual_elements)
         combined_wrappers = {**wrappers, **bindings}
         updated = dict(stats)
         updated["visual_screenshot_used"] = True
         updated["visual_ocr_used"] = client is not None and ocr_error is None
+        updated["visual_semantic_uia_preferred"] = rich_uia_surface
         if ocr_error is not None:
             updated["visual_ocr_error"] = ocr_error
         updated["visual_ocr_augmented_uia"] = bool(elements)
@@ -2474,6 +2538,58 @@ class WindowsUiaDriver:
         self._native_backend().assert_interactive_desktop()
         self._desktop()
 
+    def bind_app_window(self, app: str, hwnd: int) -> None:
+        """Rebind a configured canonical app to one verified foreground HWND.
+
+        Native deterministic actions return the exact HWND they activated. A
+        previous canonical alias may still point at another window of the same
+        application, so continuous control must consume that evidence instead
+        of reactivating the older alias.
+        """
+
+        normalized = self._normalize_app(app)
+        if not self._discover_all_windows or normalized not in self.profiles:
+            return
+        if isinstance(hwnd, bool) or not isinstance(hwnd, int) or hwnd <= 0:
+            raise WindowsUiaDriverError("native app binding requires a positive HWND")
+        native = self._native_backend()
+        native.assert_interactive_desktop()
+        matches = [window for window in native.enumerate_windows() if window.hwnd == hwnd]
+        if len(matches) != 1:
+            raise WindowsUiaStaleObservation(
+                "the native action HWND is not one unique visible top-level window"
+            )
+        window = matches[0]
+        profile = self.profiles[normalized]
+        matched_profile, _display_name = self._dynamic_profile(window)
+        if matched_profile != profile:
+            raise WindowsUiaStaleObservation(
+                "the native action HWND does not match the configured application"
+            )
+        native.assert_foreground(hwnd)
+        replacement = _DynamicWindowBinding(
+            app_id=normalized,
+            window=window,
+            profile=profile,
+            display_name=profile.name,
+        )
+        with self._lock:
+            previous = self._dynamic_windows.get(normalized)
+            if previous is not None and previous.window.hwnd != hwnd:
+                self._pending_visual_change.pop(previous.window.hwnd, None)
+            duplicate_ids = tuple(
+                app_id
+                for app_id, candidate in self._dynamic_windows.items()
+                if app_id != normalized and candidate.window.hwnd == hwnd
+            )
+            for duplicate_id in duplicate_ids:
+                self._dynamic_windows.pop(duplicate_id, None)
+                self._snapshots.pop(duplicate_id, None)
+                self._pending_observation.discard(duplicate_id)
+            self._snapshots.pop(normalized, None)
+            self._pending_observation.discard(normalized)
+            self._dynamic_windows[normalized] = replacement
+
     def list_apps(self, *, cancel_event: threading.Event | None = None) -> str:
         if cancel_event is not None and cancel_event.is_set():
             raise WindowsUiaDriverError("desktop operation was cancelled")
@@ -2504,21 +2620,11 @@ class WindowsUiaDriver:
                     profile = preserved.profile
                     display_name = preserved.display_name
                 else:
-                    app_id = self._dynamic_window_id(window)
+                    app_id = self._allocate_dynamic_window_id(
+                        window,
+                        reserved_ids=reserved_preserved_ids | set(bindings),
+                    )
                     profile, display_name = self._dynamic_profile(window)
-                    if app_id in reserved_preserved_ids:
-                        # A task-scoped alias can deliberately move from a
-                        # parent HWND to a related child HWND.  If the old
-                        # parent remains visible, its identity-derived ID is
-                        # now reserved for that child.  Give the newly seen
-                        # parent a deterministic alternate instead of stealing
-                        # the active task's alias during inventory refresh.
-                        suffix = 2
-                        candidate = f"{app_id}-visible-{suffix}"
-                        while candidate in reserved_preserved_ids or candidate in bindings:
-                            suffix += 1
-                            candidate = f"{app_id}-visible-{suffix}"
-                        app_id = candidate
                 if app_id in bindings:
                     # A duplicate HWND/PID record is not a second selectable window.
                     continue
@@ -2553,8 +2659,20 @@ class WindowsUiaDriver:
                     )
                 }
                 for app_id in invalidated_ids:
+                    old_window = old_bindings[app_id].window
                     self._snapshots.pop(app_id, None)
                     self._pending_observation.discard(app_id)
+                    pending = self._pending_visual_change.get(old_window.hwnd)
+                    if pending is not None and not any(
+                        candidate.window.hwnd == old_window.hwnd
+                        and self._same_window_identity(
+                            pending.window,
+                            candidate.window,
+                            allow_title_change=True,
+                        )
+                        for candidate in bindings.values()
+                    ):
+                        self._pending_visual_change.pop(old_window.hwnd, None)
             return json.dumps(visible, ensure_ascii=False, sort_keys=True)
         visible: list[dict[str, Any]] = []
         for app, profile in self.profiles.items():
@@ -2597,14 +2715,7 @@ class WindowsUiaDriver:
             native.assert_foreground(window.hwnd)
         root = self._root(window.hwnd)
         elements, wrappers, stats = self._elements(root, profile)
-        visual_app = (
-            normalized
-            if normalized in self._visual_ocr_apps
-            else profile.name.strip().casefold()
-        )
-        visual_enabled_for_window = bool(
-            self._visual_screenshot_enabled and visual_app in self._visual_ocr_apps
-        )
+        visual_enabled_for_window = self._visual_enabled_for_window(normalized, profile)
         screenshot_png = (
             self._capture_window_png(root)
             if self._capture_screenshots or visual_enabled_for_window
@@ -2616,21 +2727,28 @@ class WindowsUiaDriver:
             )
         raw_screenshot_png = screenshot_png
         with self._lock:
-            previous_visual_frame = self._pending_visual_change.get(normalized)
-        if previous_visual_frame is not None:
+            pending_visual_change = self._pending_visual_change.get(window.hwnd)
+        if pending_visual_change is not None:
+            if not self._same_window_identity(
+                pending_visual_change.window,
+                window,
+                allow_title_change=True,
+            ):
+                raise WindowsUiaStaleObservation(
+                    "visual postcondition belongs to a different window identity"
+                )
             if raw_screenshot_png is None:
                 raise WindowsUiaDriverError(
                     "visual action postcondition has no fresh window screenshot"
                 )
             current_frame = hashlib.sha256(raw_screenshot_png).hexdigest()
-            if current_frame == previous_visual_frame:
+            if current_frame == pending_visual_change.frame_sha256:
                 raise WindowsUiaDriverError(
                     "visual action produced no observable exact-window change"
                 )
         if visual_enabled_for_window:
             assert screenshot_png is not None
             elements, wrappers, stats, screenshot_png = self._visual_fallback(
-                app=visual_app,
                 hwnd=window.hwnd,
                 root=root,
                 screenshot_png=screenshot_png,
@@ -2640,7 +2758,17 @@ class WindowsUiaDriver:
             )
         if self._activate_on_observe:
             native.assert_foreground(window.hwnd)
+        self._retain_canonical_dynamic_alias(
+            app=normalized,
+            window=window,
+            profile=profile,
+        )
         with self._lock:
+            current_pending_visual_change = self._pending_visual_change.get(window.hwnd)
+            if current_pending_visual_change != pending_visual_change:
+                raise WindowsUiaStaleObservation(
+                    "visual verification state changed during window observation"
+                )
             self._generation += 1
             observation = DesktopObservation(
                 app=normalized,
@@ -2660,7 +2788,8 @@ class WindowsUiaDriver:
             )
             self._snapshots[normalized] = _Snapshot(window.hwnd, observation, wrappers)
             self._pending_observation.discard(normalized)
-            self._pending_visual_change.pop(normalized, None)
+            if pending_visual_change is not None:
+                self._pending_visual_change.pop(window.hwnd, None)
             return observation
 
     @staticmethod
@@ -3160,7 +3289,6 @@ class WindowsUiaDriver:
                     with self._lock:
                         self._visual_text_click.pop(snapshot.hwnd, None)
                         self._visual_text_focus.pop(snapshot.hwnd, None)
-                        self._visual_search_submission.pop(snapshot.hwnd, None)
                     self._assert_element_usable(wrapper)
 
             if isinstance(wrapper, _VisualTargetBinding):
@@ -3178,7 +3306,6 @@ class WindowsUiaDriver:
                     with self._lock:
                         self._visual_text_click.pop(snapshot.hwnd, None)
                         self._visual_text_focus.pop(snapshot.hwnd, None)
-                        self._visual_search_submission.pop(snapshot.hwnd, None)
                     if (
                         action.mouse_button not in {None, "left"}
                         or action.click_count not in {None, 1}
@@ -3284,8 +3411,6 @@ class WindowsUiaDriver:
                         )
                     assert action.text is not None
                     with self._lock:
-                        self._visual_search_submission.pop(snapshot.hwnd, None)
-                    with self._lock:
                         focus_binding = self._visual_text_focus.get(snapshot.hwnd)
                     if (
                         focus_binding is None
@@ -3316,76 +3441,14 @@ class WindowsUiaDriver:
                         focus_binding,
                         allow_horizontal_drift=True,
                     )
-                    if self._visual_click_is_in_search_zone(focus_binding.click):
-                        with self._lock:
-                            self._visual_search_submission[snapshot.hwnd] = (
-                                _VisualSearchSubmissionBinding(
-                                    focus=focus_binding,
-                                    payload_sha256=hashlib.sha256(
-                                        action.text.encode("utf-8")
-                                    ).hexdigest(),
-                                    payload_length=len(action.text),
-                                )
-                            )
                     method = (
                         "single-use exact user-authored visual text input with "
                         "native focus/caret binding"
-                    )
-                elif action.type == DesktopActionType.PRESS_KEY:
-                    if not wrapper.viewport:
-                        raise WindowsUiaDriverError(
-                            "visual search submission requires the exact visual viewport"
-                        )
-                    if (
-                        expected_element.supported_actions is None
-                        or DesktopElementAction.PRESS_KEY
-                        not in expected_element.supported_actions
-                    ):
-                        raise WindowsUiaDriverError(
-                            "visual search submission was not armed by exact text input"
-                        )
-                    if (action.key or "").strip().casefold() not in {"enter", "return"}:
-                        raise WindowsUiaDriverError(
-                            "visual search submission permits Enter/Return only"
-                        )
-                    with self._lock:
-                        submission_binding = self._visual_search_submission.get(
-                            snapshot.hwnd
-                        )
-                    if (
-                        submission_binding is None
-                        or not snapshot.observation.local_window_id
-                        or submission_binding.focus.click.local_window_id
-                        != snapshot.observation.local_window_id
-                        or submission_binding.focus.click.window_rect
-                        != wrapper.window_rect
-                        or not self._visual_click_is_in_search_zone(
-                            submission_binding.focus.click
-                        )
-                    ):
-                        raise WindowsUiaStaleObservation(
-                            "visual search submission binding is absent or stale"
-                        )
-                    native.assert_foreground(snapshot.hwnd)
-                    self._assert_visual_text_focus(
-                        submission_binding.focus,
-                        allow_horizontal_drift=True,
-                    )
-                    try:
-                        native.send_hotkey("enter")
-                    finally:
-                        with self._lock:
-                            self._visual_text_click.pop(snapshot.hwnd, None)
-                            self._visual_text_focus.pop(snapshot.hwnd, None)
-                            self._visual_search_submission.pop(snapshot.hwnd, None)
-                    method = (
-                        "single-use native-focus-bound visual search submission"
                     )
                 elif action.type == DesktopActionType.SCROLL:
                     with self._lock:
                         self._visual_text_click.pop(snapshot.hwnd, None)
                         self._visual_text_focus.pop(snapshot.hwnd, None)
-                        self._visual_search_submission.pop(snapshot.hwnd, None)
                     if not wrapper.viewport:
                         raise WindowsUiaDriverError(
                             "visual scrolling requires the exact visual viewport"
@@ -3415,9 +3478,12 @@ class WindowsUiaDriver:
                         "keys, secondary actions, drag, Enter, and send are disabled"
                     )
                 with self._lock:
-                    self._pending_visual_change[normalized] = hashlib.sha256(
-                        rebound_screenshot_png
-                    ).hexdigest()
+                    self._pending_visual_change[snapshot.hwnd] = _PendingVisualChange(
+                        window=window,
+                        frame_sha256=hashlib.sha256(
+                            rebound_screenshot_png
+                        ).hexdigest(),
+                    )
             elif action.type == DesktopActionType.CLICK:
                 if wrapper is None:
                     raise WindowsUiaDriverError("coordinate clicks are disabled")
@@ -3563,10 +3629,14 @@ class WindowsUiaDriver:
         except Exception:
             with self._lock:
                 self._snapshots.pop(normalized, None)
-                self._pending_visual_change.pop(normalized, None)
+                pending_hwnds = {snapshot.hwnd}
+                current_binding = self._dynamic_windows.get(normalized)
+                if current_binding is not None:
+                    pending_hwnds.add(current_binding.window.hwnd)
+                for pending_hwnd in pending_hwnds:
+                    self._pending_visual_change.pop(pending_hwnd, None)
                 self._visual_text_click.pop(snapshot.hwnd, None)
                 self._visual_text_focus.pop(snapshot.hwnd, None)
-                self._visual_search_submission.pop(snapshot.hwnd, None)
             raise
         finally:
             with self._lock:
@@ -3593,5 +3663,4 @@ class WindowsUiaDriver:
             self._pending_visual_change.clear()
             self._visual_text_click.clear()
             self._visual_text_focus.clear()
-            self._visual_search_submission.clear()
             self._dynamic_windows.clear()

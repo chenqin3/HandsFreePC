@@ -1,32 +1,39 @@
-# Screenshot-first visual fallback (optional OCR)
+# Exact-window visual fallback (optional OCR)
 
 HandsFreePC normally uses Windows UI Automation. Some Chromium/Qt windows expose
 no useful accessibility controls. For configured apps, the optional visual
-fallback captures only the exact selected top-level window and uses the complete
-PNG as the primary planner signal. It always provides one frame-bound visual
-viewport; PaddleOCR text boxes are a separate, optional enhancement.
+fallback captures only the exact selected top-level window and retains the
+complete PNG as the visual fallback signal. It always provides one frame-bound
+visual viewport; semantic UIA controls stay first and preferred, and PaddleOCR
+text boxes are a separate, optional enhancement.
 
-This feature is off by default and is used only when a listed app lacks a rich
-actionable UIA surface. It supports read-only observation, one rebound left
-click on an optional OCR text region, one screenshot-local viewport point click,
-one-page vertical viewport scroll, and a narrowly bound rendered-search flow.
+This feature is off by default. Every matched window retains the exact-window
+viewport even when it also has a rich UIA surface; semantic UIA controls remain
+first and are preferred, while duplicate OCR text regions are omitted. It supports
+read-only observation, one rebound left click on an optional OCR text region, one
+screenshot-local viewport point click, one-page vertical viewport scroll, and
+narrowly bound rendered input flows.
 A point is bound to the exact HWND, window rectangle, observation and target
 patch; it is not a reusable naked coordinate.
 
-Rendered search is not arbitrary visual typing. A viewport click can expose one
+Rendered input is not arbitrary visual typing. A viewport click can expose one
 `type_text` action only on the next fresh observation and only after local Win32
 `GetGUIThreadInfo` evidence binds the exact target process/thread, active/focus/
 caret HWNDs, a visible system caret, and the clicked screenshot point. The text
-must be one exact contiguous destination/search span copied from the user's
-instruction. It cannot be a message body, prompt, credential, payment value, or
-text copied from the screen. If the fresh screenshot after typing shows no
-result and the same focus/caret binding still holds, one Enter/Return may be
-used with a `LAST_ACTION_VERIFIED` expectation. The fresh screenshot transition
-and the next planning step establish what the search produced; this visual path
-does not claim the UIA-only `SEARCH_SUBMITTED` semantic expectation. It never authorizes Send, Submit,
-reply, arbitrary keys, authentication, credentials, or payment surfaces.
-Listing `wechat` therefore enables visual search navigation, not arbitrary
-WeChat text entry or message sending.
+must be one exact contiguous payload from the current spoken step: either an
+exact query/filter or an explicitly requested unsent draft, message, or prompt.
+It cannot be invented, rewritten, copied from the screen, multiline, a
+credential, or a payment value. After input, the planner waits for immediate
+results, obtains a fresh screenshot, and clicks the exact result; a draft simply
+stops after the fresh post-type review. A coordinate-only `VisualViewport` never
+exposes or accepts `PRESS_KEY`, including Enter/Return. Focus/caret evidence and
+a point near the top of a window prove only an editable location, not a semantic
+SearchBox rather than a message composer. If there is no immediate clickable
+result, the visual path fails closed. Only a semantic UIA SearchBox/AddressBar
+may submit with Enter/Return and the UIA-only `SEARCH_SUBMITTED` expectation.
+The parser never rewrites a click into Enter. This visual path never authorizes
+message sending, arbitrary keys, authentication, credentials, or payment
+surfaces.
 
 ## Optional PaddleOCR regions
 
@@ -68,13 +75,16 @@ visual_ocr:
   ocr_regions_enabled: false
   endpoint: http://127.0.0.1:8766/layout-parsing
   allow_remote_screen_ocr: false
-  apps: [codex, wechat]
+  # Explicitly cover every fresh visible dynamic window in local_unrestricted.
+  apps: ["*"]
 
 execution:
   dry_run: false
 ```
 
 `visual_ocr.enabled` activates screenshot-first fallback for the listed apps.
+The explicit `"*"` wildcard is accepted only with `local_unrestricted` and
+enabled visual planning; it covers every window in the fresh dynamic inventory.
 With `ocr_regions_enabled: false`, HandsFreePC does not call the endpoint and
 the complete screenshot viewport remains available. Set it to `true` only to
 add PaddleOCR text regions; an OCR error still leaves the screenshot viewport
@@ -108,13 +118,14 @@ so unrelated animated pixels may change but the target may not.
 Unrelated full-window animation has one narrower non-visual exception. A UIA
 action may proceed only when the planned and fresh observations retain the same
 app and local window, the element index is still unique, and its non-visual
-`local_identity`, control type, enabled state, and addressability are identical.
+the complete element fingerprint is identical, including `local_identity`, name, value,
+focus, capabilities, addressability, and risk metadata.
 The driver revalidates that element again at dispatch. A visual point never uses
 this semantic bridge; its local target patch must still be stable.
 
 The driver executes exactly one atomic visual action: one click, one-page
-vertical scroll, one caret-proven search-text insertion, or one separately
-proven search Enter/Return. It then captures a fresh full-window frame. The next
+vertical scroll, or one caret-proven exact text insertion. It then captures a
+fresh full-window frame. The next
 step is planned and verified from that new frame; an old image, region, point,
 caret witness, or consumed capability is never reused. A changed frame is
 transition evidence only--the task-specific verifier and a later fresh visual
@@ -135,7 +146,7 @@ after the second visual `DONE` is locally bound to that newer frame for the same
 app/window. A window transition, reused generation, or one-frame judgment fails
 closed.
 
-## Rendered-search focus evidence
+## Rendered-input focus evidence
 
 A point click records the exact HWND, local window identity, window rectangle,
 and original-capture point. On the following observation, `GetGUIThreadInfo`
@@ -154,26 +165,31 @@ witness. The same witness and point patch are checked again immediately before
 Unicode text input. The `type_text` capability is single-use and is removed
 after the call.
 
-After typing, the fresh screenshot is sent back to the planner. If a result is
-already visible, the planner must click it normally. Only when no result is
-visible, the click was in the bounded search zone, and the same focus/caret
-identity remains valid may the next fresh viewport expose a single Enter/Return.
-That key is consumed as a search transition and followed by another fresh
-screenshot. It is never treated as a generic submit or message-send key.
+After typing, the fresh screenshot is sent back to the planner. An unsent draft
+stops there. An exact query/filter waits for the app's immediate results and the
+planner clicks an exact result from a fresh frame. The bounded top zone and an
+unchanged focus/caret identity still do not identify a semantic SearchBox: the
+same evidence can belong to a message composer. Therefore a coordinate-only
+`VisualViewport` never exposes `PRESS_KEY`, including Enter/Return, and a missing
+immediate result fails closed.
 
-This is also deterministic at the parser boundary. If exactly one fresh armed
-`VisualViewport` supports `PRESS_KEY`, the parser replaces a click only when it
-targets that viewport with one left-click point still inside the same bounded
-top search zone. It then uses the viewport's single-use Enter and a
-`LAST_ACTION_VERIFIED` expectation. A semantic result `Button`, a visual result
-outside the search zone, or any other target remains a click. The rewrite does
-not authorize a second key, another key value, Send, Submit, or another click
-replay.
+This boundary is deterministic at both parser and driver. Every click remains a
+click; there is no implicit click-to-Enter rewrite. Only an addressable semantic
+UIA SearchBox/AddressBar can receive Enter/Return through the normal UIA key
+path and prove a fresh `SEARCH_SUBMITTED` transition.
+
+For spoken use on rendered interfaces, prefer one complete rendered target or
+atomic action per `over` segment. Keep an explicit negation such as "do not
+send" or "do not press Enter" in the same segment as the draft or target it
+limits. The FIFO preserves segment order even while the previous item is still
+running, and each segment starts from a fresh screenshot and binding. This is a
+precision recommendation, not permission to reuse a prior coordinate or skip
+post-action verification.
 
 ## Related rendered windows
 
 Some apps open a separate foreground renderer for search. After an accepted
-click or search Enter/Return, HandsFreePC may continue only when the new HWND is
+click, HandsFreePC may continue only when the new HWND is
 the foreground window and its PID is the same as the old window's PID or the two
 processes have a verifiable parent/child relationship. The dynamic app binding
 is then replaced with the new exact HWND/PID/process/title before observation.

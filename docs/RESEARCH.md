@@ -86,6 +86,7 @@ HandsFreePC 是登录用户会话中的普通常驻进程，不是系统服务�
 
 - 麦克风采集、UI 观察和实际动作都留在当前交互用户会话；默认不写音频或转写文件；
 - 会话状态以 `ARMED -> ACTIVE -> DRAINING/PAUSED` 为主：开始口令接收任务，结束口令拒绝新任务、丢弃未完成半条并排空已接受队列，急停请求取消当前任务并清空待处理任务；
+- 暂停/恢复只把独立、完整、肯定的本地口令当作状态控制；条件式、转述/引用式和否定式提及整体 fail closed，不能因短暂停顿或 ASR 标点而变成无条件暂停/恢复；
 - 音频采集和单 worker 执行位于不同线程；急停是 cooperative cancellation，不能撤回已经到达 Windows 或外部服务的一次副作用；
 - Vosk 本地检测开始、结束、急停、确认和恢复等控制词；没有说话人识别，结束会话、`silent` 和 drain 都不等于关闭麦克风；
 - 默认 Windows UIA driver 在真实动作前要求当前输入桌面为 interactive `Default`，并复核已配置目标窗口的 HWND 为前台；锁屏、Winlogon 和 UAC secure desktop 会被阻断，普通权限进程受 UIPI 限制而无法可靠输入更高完整性窗口时必须按动作失败处理；
@@ -123,14 +124,14 @@ Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/wi
 6. 动作只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。已被本地词形/属性识别的认证、密码、terminal/shell、UAC/Windows Security、付款、隐私/公开链接 surface，以及剪贴板和未绑定/可复用坐标操作 fail closed；截图 fallback 只允许当前 planner canvas 的一次点并映射回原图；
 7. `strict` 的通用 `type_text`/`set_value` 需要确认，`personal_trusted` 仅豁免未发送的完整口述草稿；`local_unrestricted` 的普通切换/菜单/选项卡/Toggle/未命中风险分类的通用 OK/Continue 对话框不确认。所有 profile 的点击/按键上下文一旦命中已知发送/提交、删除、安装/卸载、上传/共享、关闭词形，仍先生成绑定参数、expectation 和 observation fingerprint 的 confirmation。副作用词表不是完整语义证明，未知词形可能漏分；确认前 fresh observe 并重绑定新 generation，再由 runtime 加上随机四位一次性码；
 8. 每个通用动作先 fresh observe，确认任务相关 expectation 此时为 false，再执行一次；driver `accepted` 只说明动作已发出。随后 `DesktopVerifier` 要求更高 generation、同一应用、状态 fingerprint 变化且同一 expectation 为 true；UIA `type_text`/`set_value` 还必须在新 UIA 状态中看到精确文本。UIA 自然“搜索 X”进一步要求搜索/地址字段精确等于 `X`、按 Enter/Return，并出现 fresh `SEARCH_SUBMITTED` 结果语义 transition；
-9. UIA 贫乏窗口以完整 exact-window screenshot 为视觉主信号，PaddleOCR 只是可选文字区域。原图过大时等比缩到最大边 2048 px 的 planner canvas，point 再映射回原图。渲染搜索输入只有在 viewport 点击后的 fresh `GetGUIThreadInfo` 证明 exact process/thread、active/focus/caret HWND、可见 system caret 与点击点一致时开放一次，并只可输入用户指令中的精确目标文字；输入后画面没有结果且同一绑定仍成立时才允许一次 Enter/Return，绝不扩展为消息 Send 或任意 Submit；
-10. planner 的 `done` 只能给出本地可检查的有限 expectation。每次视觉 click/scroll/type/search-enter 后也必须 fresh screenshot、重规划和验证；只有 `DesktopVerifier` 通过才终止为 `LOCAL_VERIFIED_COMPLETION`。
+9. 命中的视觉窗口始终以完整 exact-window screenshot 提供一个 viewport；rich UIA 仍优先，PaddleOCR 只在 UIA 不充分时作为可选文字区域。`local_unrestricted` 可用显式 `apps: ["*"]` 覆盖 fresh 可见动态窗口。原图过大时等比缩到最大边 2048 px 的 planner canvas，point 再映射回原图。视觉输入只有在 viewport 点击后的 fresh `GetGUIThreadInfo` 证明 exact process/thread、active/focus/caret HWND、可见 system caret 与点击点一致时开放一次，并只可输入当前口述步骤中的完整连续文字（精确查询/筛选或明确要求的不发送草稿、消息、prompt）。coordinate-only `VisualViewport` 永不获得 `PRESS_KEY`，因为 focus/caret 与顶部坐标不能证明 SearchBox 而非 composer；视觉查询必须等待即时结果并在 fresh screenshot 上点击结果。只有可寻址的语义 UIA SearchBox/AddressBar 可按 Enter/Return 并验证 `SEARCH_SUBMITTED`。planner frame 到执行前 frame 若出现字段替换或新结果等实质变化则先重规划；
+10. planner 的 `done` 只能给出本地可检查的有限 expectation。每次视觉 click/scroll/type 后也必须 fresh screenshot、重规划和验证；只有 `DesktopVerifier` 通过才终止为 `LOCAL_VERIFIED_COMPLETION`。
 
 另有一个仅为兼容旧 `VoiceRuntime` 保留的顶层 `planner.enabled` one-shot fallback，不属于上述逐步 desktop planner。其云输出只可提出原句肯定、非引号/数据引用且精确授权的应用内导航（激活、项目/对话/tab/mode、听写、应用内语音）；反馈、暂停/恢复/等待、路径、文本和发送动作即使出现在云 plan 中也会被本地 safety 阻断。需要确认时，运行时绑定完整 plan/source、规范路径、stat 身份和普通文件 SHA-256，并在确认后重新 prepare、重新 safety、重新 binding；任何变化都取消。
 
 早期 0.1.0 的 UIA 研究已经识别出“唯一匹配、前台 HWND、非密码输入、动作后检查”等正确方向，但当时 `SendInput` 接收、Enter 发送或 Shell dispatch 仍可能只是调度证据。0.4 的本地 verifier 提高了动作级证据强度；它仍不能把 UIA 文本变化或截图变化等同于网络服务已经接受消息、文件已持久保存或其他外部业务后置条件。
 
-确定性 `OPEN_PATH` 当前也采用 false-before/true-after，并要求动作后的前台 HWND 与动作前不同：Explorer 目录再用 Shell.Application 返回的规范化路径做精确比较；普通文件则只检查新前台窗口标题是否包含精确文件名，仍是 best-effort。复用同一 HWND 的查看器会保守失败；同名文件和不显示文件名的查看器仍需人工核对，这不是 exact-path 或 exact-content 证明。
+确定性 `OPEN_PATH` 当前也采用 false-before/true-after。Explorer 目录用 Shell.Application 返回的规范化路径做精确比较；若同一前台 Explorer HWND 在动作后已精确导航到目标路径，也可验收。普通文件仍要求新前台 HWND，且只检查窗口标题是否包含精确文件名，仍是 best-effort。复用同一 HWND 的文件查看器会保守失败；同名文件和不显示文件名的查看器仍需人工核对，这不是 exact-path 或 exact-content 证明。
 
 确定性 `OPEN_MODE` 不把稳定语音名直接当作当前 UI 标签。只有 `apps.*.mode_names` 显式列出的 canonical key 才能进入 native route；labels 按配置顺序映射为版本相关的精确 accessible labels（如 `Chat and Cowork`、`Chat`）。缺少映射会在输入前拒绝，绝不把任意用户单词当作按钮名。执行器还拒绝 fuzzy-only 命中，并要求最终 mode 精确标签变为 selected；focus-only 只证明控件收到点击，不证明导航完成。
 
@@ -153,7 +154,7 @@ Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/wi
 
 - 0.4 默认 desktop planner 为 Claude `-p`，因为当前 CLI 能显式使用空 tools、restricted/safe mode 与严格 MCP 配置。Codex `exec` 保留为 `codex_cli_best_effort`，只有 `allow_codex_cli_host_read: true` 后才启用；截图视觉步骤需要 Codex，项目不承诺任一订阅覆盖所有调用、固定模型或额度。
 - 两个 planner 每次调用只能返回一个严格的 `observe`、`action`、`done` 或 `fail` 决定。一次 response 最多一个动作；多步任务由本地 agent loop 逐轮执行，并受 `max_steps` 与总 timeout 限制。最近最多 8 条**本地已验收历史**可进入上下文，这不是“一次返回 8 步计划”。
-- 0.4 桌面动作 Schema 只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。`strict` 的通用文本输入需要本轮随机四位一次性确认，`personal_trusted` 只豁免未发送的完整口述草稿；`local_unrestricted` 允许普通低风险语义动作和上文严格绑定的视觉搜索直通，但被识别的发送/删除/安装/上传/分享/关闭仍确认。执行前还必须通过当前 observation 绑定、本地界面/动作风险分类、false-before 和动作后 exact true-after 验收。planner 不能请求 shell、可复用坐标、密码读取、确认绕过或 UAC 同意。
+- 0.4 桌面动作 Schema 只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。`strict` 的通用文本输入需要本轮随机四位一次性确认，`personal_trusted` 只豁免未发送的完整口述草稿；`local_unrestricted` 允许普通低风险语义动作和上文严格绑定的视觉输入/即时结果点击，但 viewport 不获得 `press_key`，被识别的发送/删除/安装/上传/分享/关闭仍确认。执行前还必须通过当前 observation 绑定、本地界面/动作风险分类、false-before 和动作后 exact true-after 验收。planner 不能请求 shell、可复用坐标、密码读取、确认绕过或 UAC 同意。
 - Claude adapter 使用独立 system policy、空 tools、safe/restricted 模式、严格 MCP 配置、非交互权限模式和无会话持久化。Codex adapter 使用 ephemeral 空临时目录、结构化输出 Schema、忽略用户配置/规则、过滤环境变量、read-only sandbox 并尽量禁用当前已知工具。两者都没有 HandsFreePC 的 `DesktopDriver`。
 - 启动、非零退出、超时、取消或不合 Schema 的输出全部失败关闭，并返回泛化错误，不回显原始 prompt 或 provider stderr。失败不会自动切换到 `legacy_codex_cli`。
 - Codex CLI 自身仍是当前用户进程；read-only sandbox、deny list、空目录、环境过滤和 prompt 禁令都不是 no-tools 或主机级秘密隔离保证。Claude 空 tools 提供更窄工具面，但认证、遥测和服务端保留仍由提供商与账户设置决定。

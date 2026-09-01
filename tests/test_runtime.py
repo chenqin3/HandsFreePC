@@ -157,6 +157,78 @@ def test_continuous_session_queues_only_at_over_and_stays_active(settings) -> No
         runtime.stop()
 
 
+def test_continuous_session_accepts_initial_wake_with_command_suffix(settings) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        outcome = runtime.handle_session_text("开始语音操作 打开 Claude over")
+
+        assert outcome.success
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["打开 Claude"]
+        assert runtime.session_state == SessionState.ACTIVE
+    finally:
+        runtime.stop()
+
+
+def test_continuous_session_uses_custom_configured_initial_wake(settings) -> None:
+    settings.app.wake_phrases = ["芝麻开门"]
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        outcome = runtime.handle_session_text("芝麻开门 打开 Claude over")
+
+        assert outcome.success
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["打开 Claude"]
+    finally:
+        runtime.stop()
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "不要开始语音操作",
+        "我说的是开始语音操作",
+        "他说开始语音操作",
+        "“开始语音操作”",
+    ],
+)
+def test_continuous_session_rejects_non_invocation_wake(
+    settings,
+    utterance: str,
+) -> None:
+    enable_computer_control(settings)
+    controller = FakeController()
+    runtime = VoiceRuntime(
+        settings,
+        FakeExecutor(),
+        feedback=FakeFeedback(),
+        controller=controller,
+    )
+    try:
+        outcome = runtime.handle_session_text(utterance)
+
+        assert outcome.handled is False
+        assert outcome.success is False
+        assert runtime.session_state == SessionState.ARMED
+        assert controller.calls == []
+    finally:
+        runtime.stop()
+
+
 @pytest.mark.parametrize(
     ("pending_fragment", "prefix_transcript", "expected"),
     [
@@ -1651,10 +1723,28 @@ def test_requires_wake_phrase(settings) -> None:
 
 def test_wake_and_command_same_utterance(settings) -> None:
     runtime, executor, _ = build_runtime(settings)
-    outcome = runtime.handle_text("现在开始语音操作 打开D盘", require_wake=True)
+    outcome = runtime.handle_text("开始语音操作 打开D盘", require_wake=True)
     assert outcome.handled is True
     assert outcome.state == RuntimeState.ARMED
     assert len(executor.plans) == 1
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "不要开始语音操作",
+        "我说的是开始语音操作",
+        "“开始语音操作”",
+    ],
+)
+def test_legacy_wake_rejects_non_invocations(settings, utterance: str) -> None:
+    runtime, executor, _ = build_runtime(settings)
+
+    outcome = runtime.handle_text(utterance, require_wake=True)
+
+    assert outcome.handled is False
+    assert outcome.state == RuntimeState.ARMED
+    assert executor.plans == []
 
 
 @pytest.mark.parametrize(
@@ -1678,7 +1768,7 @@ def test_one_shot_runtime_never_executes_a_partial_deterministic_match(settings,
 def test_codex_command_enters_own_dictation(settings) -> None:
     runtime, executor, _ = build_runtime(settings)
     outcome = runtime.handle_text(
-        "现在开始语音操作 切换到codex app，打开演示项目下的语音设计对话，打开语音输入"
+        "开始语音操作 切换到codex app，打开演示项目下的语音设计对话，打开语音输入"
     )
     assert outcome.state == RuntimeState.DICTATION
     outcome = runtime.handle_text("请检查这个项目里的测试", require_wake=False)
@@ -2045,7 +2135,27 @@ def test_stop_is_global_and_wake_resumes(settings) -> None:
     runtime, _, _ = build_runtime(settings)
     runtime.state = RuntimeState.DICTATION
     assert runtime.handle_text("停止所有操作", require_wake=False).state == RuntimeState.PAUSED
-    assert runtime.handle_text("现在开始语音操作", require_wake=False).state == RuntimeState.ARMED
+    assert runtime.handle_text("开始语音操作", require_wake=False).state == RuntimeState.ARMED
+
+
+def test_legacy_stop_and_resume_require_complete_utterances(settings) -> None:
+    runtime, _, _ = build_runtime(settings)
+    runtime.state = RuntimeState.DICTATION
+
+    stop = runtime.handle_text("不要停止所有操作", require_wake=False)
+
+    assert stop.state != RuntimeState.PAUSED
+
+    runtime.state = RuntimeState.PAUSED
+    resume = runtime.handle_text("不要恢复监听", require_wake=False)
+
+    assert resume.handled is False
+    assert resume.state == RuntimeState.PAUSED
+
+    exact_resume = runtime.handle_text("恢复监听", require_wake=False)
+
+    assert exact_resume.handled is True
+    assert exact_resume.state == RuntimeState.ARMED
 
 
 def test_awake_timeout_returns_to_armed(settings) -> None:

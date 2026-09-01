@@ -776,17 +776,63 @@ class DesktopObservation:
                 ),
             },
         }
-        for item in self.elements:
+        # A screenshot is not actionable unless the planner also receives its
+        # exact frame-bound viewport index.  Rich UIA trees can consume the
+        # whole character budget before the synthetic viewport (which is kept
+        # last so semantic controls remain preferred), so reserve that one
+        # payload before admitting ordinary elements.
+        mandatory_viewport = next(
+            (
+                item
+                for item in self.elements
+                if item.visual_ocr
+                and item.control_type == "VisualViewport"
+                and item.enabled
+                and item.addressable
+            ),
+            None,
+        )
+        mandatory_payload = (
+            mandatory_viewport.planner_payload()
+            if mandatory_viewport is not None
+            else None
+        )
+        ordinary_elements = tuple(
+            item for item in self.elements if item is not mandatory_viewport
+        )
+        if mandatory_payload is not None:
+            payload["elements"] = [mandatory_payload]
+            while (
+                len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > max_chars
+                and text
+            ):
+                overflow = len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) - max_chars
+                text = text[: max(0, len(text) - max(1, overflow))]
+                payload["accessibility_text"] = redact_credential_like_text(text)
+                payload["accessibility_truncated"] = True
+            payload["elements"] = []
+        for item in ordinary_elements:
             candidate = [*payload["elements"], item.planner_payload()]
+            if mandatory_payload is not None:
+                candidate.append(mandatory_payload)
             payload["elements"] = candidate
             if len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > max_chars:
-                payload["elements"].pop()
+                if mandatory_payload is not None:
+                    payload["elements"] = candidate[:-2]
+                else:
+                    payload["elements"].pop()
                 payload["elements_truncated"] = True
                 break
+            if mandatory_payload is not None:
+                payload["elements"].pop()
+        if mandatory_payload is not None:
+            payload["elements"].append(mandatory_payload)
+            if len(ordinary_elements) > len(payload["elements"]) - 1:
+                payload["elements_truncated"] = True
         while len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > max_chars and text:
             overflow = len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) - max_chars
             text = text[: max(0, len(text) - max(1, overflow))]
-            payload["accessibility_text"] = text
+            payload["accessibility_text"] = redact_credential_like_text(text)
             payload["accessibility_truncated"] = True
         if len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > max_chars:
             raise ValueError("max_chars is too small for desktop observation metadata")

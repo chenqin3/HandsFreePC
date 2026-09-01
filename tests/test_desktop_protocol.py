@@ -338,6 +338,44 @@ def test_planner_context_bounds_combined_accessibility_and_element_payload_size(
     assert context["elements_truncated"] is True
 
 
+def test_planner_context_reserves_the_frame_bound_viewport_after_rich_uia():
+    viewport = DesktopElement(
+        index="999",
+        name="Visual screenshot viewport",
+        control_type="VisualViewport",
+        enabled=True,
+        addressable=True,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    observation = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text="rich UIA " * 4000,
+        screenshot_png=b"fixture",
+        elements=tuple(
+            DesktopElement(
+                index=str(index),
+                name=f"Long semantic control {index} " + "x" * 800,
+                control_type="Button",
+            )
+            for index in range(300)
+        )
+        + (viewport,),
+    )
+
+    context = observation.planner_context(max_chars=24000)
+    serialized = json.dumps(context, ensure_ascii=False, sort_keys=True)
+
+    assert len(serialized) <= 24000
+    assert context["elements_truncated"] is True
+    assert context["elements"][-1]["index"] == "999"
+    assert context["elements"][-1]["control_type"] == "VisualViewport"
+    assert sum(
+        item["control_type"] == "VisualViewport" for item in context["elements"]
+    ) == 1
+
+
 def test_automation_id_stays_local_but_remains_part_of_freshness_fingerprint():
     first = DesktopObservation(
         app="claude",

@@ -55,6 +55,8 @@
 
 `enabled: false` 时可以测试麦克风和兼容 parser，但不会启动连续桌面 agent。
 
+如果口述中提到了“暂停/恢复”却没有改变状态，先确认它是否是独立、完整、肯定的控制口令。条件式（“如果……就暂停”）、转述/引用式（“他说暂停”“输入‘暂停语音操作’”）、否定式（“不要暂停”），以及被短暂停顿或 ASR 标点拆开的同类说法都应 fail closed；不要把这类拒绝当作麦克风权限故障，也不要改成子串匹配。
+
 ## `Claude` 被听成 `cloud`，或中英混说无法绑定应用
 
 先开启本地原文日志并复现一次：
@@ -200,7 +202,7 @@ computer_control:
   safety_profile: local_unrestricted
 ```
 
-这个模式不要求每条口述点名/预配置唯一应用，也不再套用 `strict`/`personal_trusted` 的 app-scope 与普通低风险导航确认；窗口/选项卡切换、菜单、Toggle 和未命中风险分类的通用 OK/Continue 对话框可由 planner 推断。若口述明确指定 app/window/field，最终用户步骤仍必须绑定所说窗口和字段；看到动作落在别的应用或相似编辑框应视为失败，不要删掉 binding 检查。UIA 可寻址的“搜索 X”必须精确设置字段、按 Enter/Return，并在 fresh observation 中看到结果语义变化。渲染搜索则先要求截图点击后的 Win32 focus/caret 证明，只输入用户本句中的精确目标；输入后的同一绑定仍有效且画面没有结果时，才允许一次 Enter/Return。该回车不能用于消息、prompt、回复、Send 或任意 Submit。识别到的发送/提交、删除、安装、上传/分享和关闭仍需本轮确认。每个允许动作仍要求 fresh bind 和 false-before/true-after 本地验收；`done` 前会重新观察同一窗口，多段明确动作必须按顺序完成。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、未绑定/可复用坐标和任意 shell 继续被阻断。
+这个模式不要求每条口述点名/预配置唯一应用，也不再套用 `strict`/`personal_trusted` 的 app-scope 与普通低风险导航确认；窗口/选项卡切换、菜单、Toggle 和未命中风险分类的通用 OK/Continue 对话框可由 planner 推断。若口述明确指定 app/window/field，最终用户步骤仍必须绑定所说窗口和字段；看到动作落在别的应用或相似编辑框应视为失败，不要删掉 binding 检查。UIA 可寻址的语义 SearchBox/AddressBar 必须精确设置字段、按 Enter/Return，并在 fresh observation 中看到结果语义变化。渲染输入则先要求截图点击后的 Win32 focus/caret 证明，只输入当前口述步骤中的完整连续原文：查询/筛选目标，或明确要求写入但不发送的草稿、消息、prompt。coordinate-only `VisualViewport` 永不获得 Enter/Return；视觉查询只能等待即时结果并在 fresh screenshot 上点击精确结果，没有结果就 fail closed。识别到的发送/提交、删除、安装、上传/分享和关闭仍需本轮确认。每个允许动作仍要求 fresh bind 和 false-before/true-after 本地验收；`done` 前会重新观察同一窗口，多段明确动作必须按顺序完成。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、未绑定/可复用坐标和任意 shell 继续被阻断。
 
 ## 已设置 `local_unrestricted`，仍看到 `APP_SCOPE_REQUIRED`
 
@@ -260,9 +262,9 @@ apps:
 
 ## 打开路径后仍显示失败，或打开了同名文件
 
-确定性 `OPEN_PATH` 不是只检查 Shell dispatch 返回值：执行前目标后置条件必须为 false；打开后必须成为 true，而且前台 HWND 必须与 before 不同。
+确定性 `OPEN_PATH` 不是只检查 Shell dispatch 返回值：执行前目标后置条件必须为 false，打开后必须成为 true。目录与文件的后置证据不同：
 
-- 目录：前台 Explorer 的规范化路径必须与目标精确一致，证据较强；
+- 目录：前台 Explorer 的规范化路径必须与目标精确一致；导航后可以复用同一 HWND，证据较强；
 - 文件：当前只能检查新前台窗口标题是否包含精确文件名，这是 best-effort；复用同一 HWND 的查看器会保守失败。
 
 因此同名文件、查看器复用旧窗口、标题不显示文件名、启动后仍有选择器/登录页时都可能无法证明或存在误判。增加完整父目录只会改善解析，不会把文件标题验证升级为内容验证；重要文件请人工看屏幕核对，不要放宽 verifier。
@@ -310,15 +312,15 @@ visual_ocr:
   ocr_regions_enabled: false
 ```
 
-`ocr_regions_enabled: false` 不会调用 PaddleOCR，但完整目标窗口截图和 frame-bound `VisualViewport` 仍应交给 Codex；没有编号文字框并不是失败。只有确实需要文字区域时，才把它改为 `true`、启动 [VISUAL_OCR.md](VISUAL_OCR.md) 中的 PaddleOCR loopback 服务并检查 `/health`。OCR 服务超时或报错时，系统会保留截图 viewport，不应把 OCR 当成截图规划的前置条件。若窗口已经暴露 rich actionable UIA，driver 会优先用 UIA，也不会额外合成视觉区域。
+`ocr_regions_enabled: false` 不会调用 PaddleOCR，但完整目标窗口截图和 frame-bound `VisualViewport` 仍应交给 Codex；没有编号文字框并不是失败。若希望本机 `local_unrestricted` 覆盖 Claude、Chrome、资源管理器和其他 fresh 可见窗口，将 `visual_ocr.apps` 显式设为 `["*"]`；通配符不会在其他 profile 中展开。只有确实需要文字区域时，才把 OCR 开关改为 `true`、启动 [VISUAL_OCR.md](VISUAL_OCR.md) 中的 PaddleOCR loopback 服务并检查 `/health`。OCR 服务超时或报错时，系统会保留截图 viewport，不应把 OCR 当成截图规划的前置条件。窗口已经暴露 rich actionable UIA 时，driver 仍保留完整截图 viewport，但语义 UIA 元素排在前面并优先使用，也不会额外合成重复 OCR 文字区域。
 
 Codex 看到的图片可能不是原始像素尺寸：全窗 PNG 最大边超过 2048 px 时会等比缩到 planner canvas，返回的 `x/y` 再映射回原始截图坐标。若点击位置看起来成比例偏移，检查图片宽高读取、canvas 边界、横纵比例映射和 Windows DPI；不要手工写死缩放倍数或直接复用 planner 坐标。
 
-每个视觉动作前都会重新截取当前绑定 HWND：窗口移动/缩放、OCR 文本区域不再唯一、区域 crop 变化、viewport 点击点附近 patch 变化都会使旧计划失效。一次 click、单页纵向 scroll、受限搜索输入或一次搜索 Enter/Return 后，都必须取得 fresh exact-window 完整截图并用它重新规划/验证；`visual action produced no observable exact-window change` 表示本地没有观察到状态转换，不应通过复用旧坐标、重复点击或跳过 fresh observe 绕过。
+每个视觉动作前都会重新截取当前绑定 HWND：窗口移动/缩放、OCR 文本区域不再唯一、区域 crop 变化、viewport 点击点附近 patch 变化都会使旧计划失效。agent loop 还比较 planner frame 与执行前 fresh frame：视觉点只比较点击附近 32 px 局部，视觉文字只容忍很小的 caret 闪烁；字段被覆盖、即时结果出现或其他实质画面变化都会先重规划而不下发旧动作。一次 click、单页纵向 scroll 或一次 exact 视觉输入后，都必须取得 fresh exact-window 完整截图并用它重新规划/验证；`visual action produced no observable exact-window change` 表示本地没有观察到状态转换，不应通过复用旧坐标、重复点击或跳过 fresh observe 绕过。
 
-如果只是窗口其他区域的 loading/animation 改变，非视觉 UIA action 可以继续，但条件非常窄：fresh state 必须仍是同一 app/exact window、同一唯一 element index，目标的 `local_identity`、control type、enabled 与 addressable 全部不变，driver 还会在 dispatch 前重验。任一项变化都应视为 stale。截图 viewport point 不走这条例外；即使全窗动画无关，点击附近的 local patch 也必须稳定。
+如果只是窗口其他区域的 loading/animation 改变，非视觉 UIA action 可以继续，但条件非常窄：fresh state 必须仍是同一 app/exact window、同一唯一 element index，目标的完整元素 fingerprint 不变，包括 `local_identity`、标签、值、焦点、capabilities 与风险分类；driver 还会在 dispatch 前重验。任一项变化都应视为 stale 并重新规划。截图 viewport point 不走这条例外；即使全窗动画无关，点击附近的 local patch 也必须稳定。
 
-## 视觉搜索框点中了，但不能输入或不能按回车
+## 视觉搜索框点中了，但不能输入或找不到结果
 
 渲染搜索不是 OCR 文本输入。viewport 点一次之后，下一次 fresh observe 必须由 Win32 `GetGUIThreadInfo` 同时证明：目标 PID/TID 未变，active/focus/caret HWND 属于 exact target window，system caret 可见且非空，并且 caret rectangle 与刚才的原始截图点击点足够接近。任一证据缺失时不会在 viewport 上声明 `type_text`。常见原因包括：
 
@@ -328,9 +330,11 @@ Codex 看到的图片可能不是原始像素尺寸：全窗 PNG 最大边超过
 - 点击后窗口、目标 patch、foreground、PID/TID 或 caret identity 已变化；
 - 点击并不位于受限的搜索区域。
 
-这是 focus/caret 证据不足，不一定是麦克风或管理员权限问题。不要用 OCR 命中、截图看起来像文本框或无条件 `SendInput` 绕过。证据成立时也只会输入用户指令中的精确目标/搜索文字；消息正文、prompt、凭据、付款内容、换行或屏幕上抄来的文字都会拒绝。
+这是 focus/caret 证据不足，不一定是麦克风或管理员权限问题。不要用 OCR 命中、截图看起来像文本框或无条件 `SendInput` 绕过。证据成立时也只会输入当前口述步骤中的完整连续原文：搜索/导航目标，或用户明确要求的不发送草稿、消息、prompt；凭据、付款内容、换行、屏幕抄取、发明或改写仍会拒绝。
 
-输入后会 fresh screenshot。若截图已经出现可点击结果，下一步应点击结果；只有画面没有结果且同一 focus/caret binding 仍有效时，才允许一次 Enter/Return 触发搜索。此时 `VisualViewport` 已 armed；只有 planner 再次点击该 viewport、单次左键点仍位于受限顶部搜索区域时，parser 才会确定性把它推进为这一次 Enter，并以 `LAST_ACTION_VERIFIED` 验收。当前帧中的语义结果按钮及其他截图区域仍保持 click。该能力用后即失效；失焦、换窗、第二次回车、其他 key、Send/Submit 或消息/回复语境都会拒绝。即使默认列表包含 `wechat`，这仍不表示任意微信输入或发送已支持。
+输入后会 fresh screenshot。未发送草稿到此结束；查询/筛选文字则等待应用产生即时结果，再点击 fresh frame 中的精确结果。coordinate-only `VisualViewport` 永不出现 `PRESS_KEY`，包括 Enter/Return：focus/caret 与顶部坐标无法证明这里是 SearchBox 而不是聊天 composer。parser 也绝不会把 click 改写为 Enter。若没有即时可点击结果，保守失败是正确行为；只能改用语义 UIA SearchBox/AddressBar 的 Enter 路径或重新分段/描述目标，不能给 viewport 增加回车。即使默认列表包含 `wechat`，这仍不表示任意微信发送已支持。
+
+如果一条语音里包含多个渲染目标或多次截图点击，将它们拆成“每个 rendered target/完整原子操作一个 `over`”。“不要发送”“不要按回车”等否定语要和对应草稿/payload 放在同一段，不要单独切成下一条。各段依然按 FIFO 执行，因此可在前一条运行时继续口述；每条都会从 fresh frame 重新规划，比在一条 prompt 中让模型区分多个截图坐标和否定作用域更稳定。
 
 若搜索 helper 中出现唯一 semantic result `Button`，只有其 exact full label 包含用户精确目标并以“前往”或 `Go to` 结束时，系统才允许用该**完整标签消失**确认一次 navigation bridge。按钮消失不等于目标已打开，更不等于任务完成；下一窗口仍要 fresh screenshot。看到相似按钮、多条结果或只有部分标签时，保守失败是预期行为。
 
@@ -392,7 +396,7 @@ computer_control:
   allow_screen_context_to_cloud: true
 ```
 
-许可不是形式开关。`strict`/`personal_trusted` 会发送当前 task、唯一授权 app 摘要、裁剪后的 UIA 控件和本地验收历史，但不会发送真实窗口标题或截图。`local_unrestricted` 会发送全部 fresh 可见顶层窗口的标题/进程摘要；observe 后还发送真实窗口标题和经凭据过滤的可寻址 UIA context。若 planner 是 Codex，选中窗口 PNG 还会作为临时 `--image` 输入；视觉 fallback 以完整 exact-window capture 为主规划信号，图片过大时发送等比缩小的 planner canvas，`ocr_regions_enabled` 只决定是否另调用 PaddleOCR 增加文本框。关联微信窗口精确重绑后，新的窗口截图也可能进入后续调用。Claude 当前只接收文本 context。结构化 `CONTENT` 节点、automation ID、element value、原始 Win32 focus/caret handles 和 PCM 不发送，但截图像素仍可能显示正文或通知。CLI/provider 还可能处理账户/组织、认证、网络、CLI/OS/runtime、临时 cwd、用量、错误和诊断/遥测等自身元数据；项目开关不能证明这些数据为零。若不接受任何屏幕信息离机，使用 `planner_backend: none`，此时只能执行命中的本地 deterministic skills。
+许可不是形式开关。`strict`/`personal_trusted` 会发送当前 task、唯一授权 app 摘要、裁剪后的 UIA 控件和本地验收历史，但不会发送真实窗口标题或截图。`local_unrestricted` 会发送全部 fresh 可见顶层窗口的标题/进程摘要；observe 后还发送真实窗口标题和经凭据过滤的可寻址 UIA context。若 planner 是 Codex，选中窗口 PNG 还会作为临时 `--image` 输入；视觉 fallback 始终保留完整 exact-window capture 作为视觉补充，但语义 UIA 元素排在前面并优先，图片过大时发送等比缩小的 planner canvas，`ocr_regions_enabled` 只决定是否另调用 PaddleOCR 增加文本框。关联微信窗口精确重绑后，新的窗口截图也可能进入后续调用。Claude 当前只接收文本 context。结构化 `CONTENT` 节点、automation ID、element value、原始 Win32 focus/caret handles 和 PCM 不发送，但截图像素仍可能显示正文或通知。CLI/provider 还可能处理账户/组织、认证、网络、CLI/OS/runtime、临时 cwd、用量、错误和诊断/遥测等自身元数据；项目开关不能证明这些数据为零。若不接受任何屏幕信息离机，使用 `planner_backend: none`，此时只能执行命中的本地 deterministic skills。
 
 ## 等待确认但“确认执行”无效
 

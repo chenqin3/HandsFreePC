@@ -195,6 +195,11 @@ class NativeSkillRouter:
     def _clear_path_context_for_app_plan(self, plan: Plan) -> None:
         if not any(action.app for action in plan.actions):
             return
+        self.clear_path_context()
+
+    def clear_path_context(self) -> None:
+        """Forget relative-path state when another controller takes over navigation."""
+
         with self._path_context_lock:
             self._path_context = None
             self._path_context_updated_at = 0.0

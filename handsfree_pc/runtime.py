@@ -1165,7 +1165,7 @@ class VoiceRuntime:
             return TurnOutcome(False, self.state, "运行时已停止", success=False)
         if expired := self._expire_timeouts():
             return expired
-        if phrase_in_text(text, self.settings.app.stop_phrases):
+        if phrase_equals(text, self.settings.app.stop_phrases):
             with self._plan_confirmation_lock:
                 self._clear_plan_confirmation(invalidate=True)
                 self.state = RuntimeState.PAUSED
@@ -1174,7 +1174,7 @@ class VoiceRuntime:
 
         if self.state == RuntimeState.PAUSED:
             resume_phrases = ["恢复语音操作", "恢复监听", *self.settings.app.wake_phrases]
-            if phrase_in_text(text, resume_phrases):
+            if phrase_equals(text, resume_phrases):
                 self.state = RuntimeState.ARMED
                 self.feedback.emit("语音操作已恢复", kind="success")
                 return TurnOutcome(True, self.state, "已恢复")
@@ -1867,7 +1867,7 @@ class VoiceRuntime:
                         speech.source.drain()
                     if self.state in {RuntimeState.ARMED, RuntimeState.PAUSED}:
                         matched, audio = speech.wait_for_phrase(stop_event=self.stop_event)
-                        if phrase_in_text(matched, self.settings.app.stop_phrases):
+                        if phrase_equals(matched, self.settings.app.stop_phrases):
                             self.handle_text(matched, require_wake=False)
                             continue
                         if self.state == RuntimeState.PAUSED:

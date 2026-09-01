@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import re
 import threading
@@ -18,6 +19,7 @@ from .protocol import (
     DesktopDecisionKind,
     DesktopDriver,
     DesktopElement,
+    DesktopElementAction,
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
@@ -33,19 +35,46 @@ from .safety import (
     DesktopSafetyPolicy,
     DesktopSafetyProfile,
     action_matches_next_user_step,
+    action_matches_user_step_with_label_aliases,
+    action_type_matches_a_future_user_step,
     affirmatively_authorized_app_scope,
+    dangling_negation_before_action_present,
     expectation_is_terminal_user_condition,
     expectation_matches_user_step,
+    expectation_matches_user_step_with_label_aliases,
+    explicitly_negated_app_scope,
+    generic_navigation_bridge_action_is_unnegated,
+    generic_navigation_bridge_avoids_negated_targets,
     local_dictation_user_text,
-    natural_search_step_count,
+    reported_action_reference_present,
+    semantic_search_text_action_matches_next_user_step,
     target_matches_explicit_text_step,
     text_step_has_explicit_target,
+    unparsed_affirmative_action_present,
+    unsupported_control_condition_present,
     user_action_step_clause,
     user_action_step_count,
+    user_action_step_has_explicit_outcome,
+    visual_point_click_is_unambiguous_for_task,
+    visual_point_click_matches_next_user_step,
+    visual_search_payload_matches_next_user_step,
+    visual_search_submission_matches_next_user_step,
+    visual_search_task_allows_submission,
+    visual_text_action_matches_next_user_step,
     window_activation_matches_next_user_step,
 )
 from .step_planner import DesktopPlannerError, DesktopStepPlanner
 from .verifier import DesktopVerifier, VerificationResult
+
+
+@dataclass(frozen=True, slots=True)
+class _VisualSearchStepBinding:
+    """One verified visual search payload bound to the still-current spoken step."""
+
+    app: str
+    local_window_id: str
+    payload: str
+    completed_steps: int
 
 
 @dataclass(slots=True)
@@ -77,6 +106,9 @@ class _TaskState:
     related_window_navigation_pending: bool = False
     related_window_id: str | None = None
     related_window_destination: str | None = None
+    last_action_counted_as_user_step: bool = False
+    last_action_was_visual_viewport: bool = False
+    visual_search_submission: _VisualSearchStepBinding | None = None
 
 
 @dataclass(slots=True)
@@ -444,6 +476,173 @@ def _visual_point_click_signature(
     )
 
 
+def _visual_point_patch_is_still_bound(
+    action: DesktopAction,
+    planned: DesktopObservation,
+    fresh: DesktopObservation,
+    *,
+    radius: int = 32,
+) -> bool:
+    """Keep screenshot coordinates only when their local target patch survived."""
+
+    if (
+        _visual_point_click_signature(action, planned) is None
+        or _visual_point_click_signature(action, fresh) is None
+        or planned.app.strip().casefold() != fresh.app.strip().casefold()
+        or not planned.local_window_id
+        or planned.local_window_id != fresh.local_window_id
+        or planned.screenshot_png is None
+        or fresh.screenshot_png is None
+        or action.x is None
+        or action.y is None
+    ):
+        return False
+    planned_targets = tuple(
+        element
+        for element in planned.elements
+        if element.index == action.element_index
+        and element.visual_ocr
+        and element.control_type == "VisualViewport"
+        and element.enabled
+        and element.addressable
+    )
+    fresh_targets = tuple(
+        element
+        for element in fresh.elements
+        if element.index == action.element_index
+        and element.visual_ocr
+        and element.control_type == "VisualViewport"
+        and element.enabled
+        and element.addressable
+    )
+    if len(planned_targets) != 1 or len(fresh_targets) != 1:
+        return False
+    if planned.screenshot_png == fresh.screenshot_png:
+        return True
+    try:
+        from PIL import Image
+
+        planned_image = Image.open(io.BytesIO(planned.screenshot_png)).convert("RGB")
+        fresh_image = Image.open(io.BytesIO(fresh.screenshot_png)).convert("RGB")
+        if planned_image.size != fresh_image.size:
+            return False
+        width, height = planned_image.size
+        x, y = int(action.x), int(action.y)
+        if not (0 <= x < width and 0 <= y < height):
+            return False
+        left = max(0, x - radius)
+        top = max(0, y - radius)
+        right = min(width, x + radius + 1)
+        bottom = min(height, y + radius + 1)
+        planned_crop = planned_image.crop((left, top, right, bottom))
+        fresh_crop = fresh_image.crop((left, top, right, bottom))
+        if (
+            planned_crop.size != fresh_crop.size
+            or planned_crop.width < 1
+            or planned_crop.height < 1
+        ):
+            return False
+        changed_pixels = 0
+        absolute_difference = 0
+        planned_bytes = planned_crop.tobytes()
+        fresh_bytes = fresh_crop.tobytes()
+        for offset in range(0, len(planned_bytes), 3):
+            channel_difference = tuple(
+                abs(before - after)
+                for before, after in zip(
+                    planned_bytes[offset : offset + 3],
+                    fresh_bytes[offset : offset + 3],
+                    strict=True,
+                )
+            )
+            absolute_difference += sum(channel_difference)
+            if max(channel_difference) > 24:
+                changed_pixels += 1
+        pixel_count = planned_crop.width * planned_crop.height
+        return bool(
+            changed_pixels <= max(24, int(pixel_count * 0.04))
+            and absolute_difference <= pixel_count * 3 * 6
+        )
+    except Exception:
+        return False
+
+
+def _visual_input_frame_is_still_bound(
+    action: DesktopAction,
+    planned: DesktopObservation,
+    fresh: DesktopObservation,
+) -> bool:
+    """Reject visual text/key input when the planner's frame materially changed."""
+
+    if action.type not in {
+        DesktopActionType.TYPE_TEXT,
+        DesktopActionType.PRESS_KEY,
+    }:
+        return False
+    if (
+        planned.app.strip().casefold() != fresh.app.strip().casefold()
+        or not planned.local_window_id
+        or planned.local_window_id != fresh.local_window_id
+        or planned.screenshot_png is None
+        or fresh.screenshot_png is None
+    ):
+        return False
+    planned_targets = tuple(
+        element
+        for element in planned.elements
+        if element.index == action.element_index
+        and element.visual_ocr
+        and element.control_type == "VisualViewport"
+        and element.enabled
+        and element.addressable
+    )
+    fresh_targets = tuple(
+        element
+        for element in fresh.elements
+        if element.index == action.element_index
+        and element.visual_ocr
+        and element.control_type == "VisualViewport"
+        and element.enabled
+        and element.addressable
+    )
+    if len(planned_targets) != 1 or len(fresh_targets) != 1:
+        return False
+    if planned.screenshot_png == fresh.screenshot_png:
+        return True
+    try:
+        from PIL import Image
+
+        planned_image = Image.open(io.BytesIO(planned.screenshot_png)).convert("RGB")
+        fresh_image = Image.open(io.BytesIO(fresh.screenshot_png)).convert("RGB")
+        if planned_image.size != fresh_image.size:
+            return False
+        planned_bytes = planned_image.tobytes()
+        fresh_bytes = fresh_image.tobytes()
+        changed_pixels = 0
+        absolute_difference = 0
+        for offset in range(0, len(planned_bytes), 3):
+            channel_difference = tuple(
+                abs(before - after)
+                for before, after in zip(
+                    planned_bytes[offset : offset + 3],
+                    fresh_bytes[offset : offset + 3],
+                    strict=True,
+                )
+            )
+            absolute_difference += sum(channel_difference)
+            if max(channel_difference) > 24:
+                changed_pixels += 1
+        pixel_count = planned_image.width * planned_image.height
+        # Permit a small caret blink, but replan for a newly rendered result,
+        # field replacement, overlay, or any other material visual transition.
+        return bool(
+            changed_pixels <= max(48, int(pixel_count * 0.00005))
+            and absolute_difference <= pixel_count * 3
+        )
+    except Exception:
+        return False
+
+
 def _related_result_destination(target_name: str, task: str) -> str | None:
     """Return the exact destination prefix of one explicit result affordance."""
 
@@ -534,7 +733,13 @@ def _fresh_semantic_target_is_still_bound(
         and after_target.enabled
         and before_target.local_identity
         and before_target.local_identity == after_target.local_identity
-        and before_target.control_type == after_target.control_type
+        # A RuntimeId may survive virtualization while the represented row,
+        # button, or input changes.  The user-step binding was established from
+        # the planner frame's complete local element semantics, so only that
+        # exact target snapshot may cross an unrelated full-window animation.
+        # Any name, value, focus, capability, or risk-classification drift must
+        # return to the planner before dispatch.
+        and before_target.fingerprint_payload() == after_target.fingerprint_payload()
     )
 
 
@@ -544,6 +749,41 @@ def _safe_exception_message(exc: Exception) -> str:
         return name
     value = redact_credential_like_text(str(exc).strip()) or name
     return value[:240]
+
+
+def _native_failure_error_code(message: str) -> str:
+    """Preserve a content-free native failure class without logging its details."""
+
+    prefix = str(message or "").partition(":")[0].strip().upper()
+    if prefix in {
+        "NATIVE_PREPARE_FAILED",
+        "NATIVE_PATH_BINDING_FAILED",
+        "NATIVE_EXECUTION_FAILED",
+    }:
+        return prefix
+    return "NATIVE_ROUTE_FAILED"
+
+
+def _verified_native_app_hwnd(execution_results: tuple[object, ...], app: str) -> int | None:
+    """Return the final exact HWND proven by a successful native app action."""
+
+    normalized = app.strip().casefold()
+    for result in reversed(execution_results):
+        action = getattr(result, "action", None)
+        evidence = getattr(result, "evidence", None)
+        if (
+            getattr(result, "success", False) is not True
+            or action is None
+            or not isinstance(getattr(action, "app", None), str)
+            or action.app.strip().casefold() != normalized
+            or not isinstance(evidence, dict)
+            or evidence.get("postcondition_verified") is not True
+        ):
+            continue
+        hwnd = evidence.get("hwnd")
+        if isinstance(hwnd, int) and not isinstance(hwnd, bool) and hwnd > 0:
+            return hwnd
+    return None
 
 
 def _visible_apps(payload: str) -> tuple[str, ...]:
@@ -692,6 +932,27 @@ def _window_candidate_labels(
     if selected is None:
         return ()
     return _window_entry_labels(selected, observed_title=observation.window_title)
+
+
+def _explicitly_negated_apps(task: str, inventory: str) -> frozenset[str]:
+    """Resolve trusted application identities directly denied by the utterance."""
+
+    try:
+        entries = json.loads(inventory)
+    except (TypeError, json.JSONDecodeError):
+        return frozenset()
+    if not isinstance(entries, list):
+        return frozenset()
+    denied: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("app"), str):
+            continue
+        if any(
+            explicitly_negated_app_scope(label, task)
+            for label in _window_entry_labels(entry, include_window_titles=False)
+        ):
+            denied.add(entry["app"].strip().casefold())
+    return frozenset(denied)
 
 
 def _explicit_step_window_scope(
@@ -1322,7 +1583,11 @@ class DesktopAgentLoopController:
             context_expected = bool(
                 result.plan is not None
                 and self.driver is not None
-                and self.safety.profile == DesktopSafetyProfile.PERSONAL_TRUSTED
+                and self.safety.profile
+                in {
+                    DesktopSafetyProfile.PERSONAL_TRUSTED,
+                    DesktopSafetyProfile.LOCAL_UNRESTRICTED,
+                }
                 and len(
                     {
                         action.app.strip().casefold()
@@ -1334,9 +1599,24 @@ class DesktopAgentLoopController:
             )
             context_refreshed = self._refresh_trusted_context_after_native(
                 result.plan,
+                execution_results=result.execution_results,
                 user_text=instruction,
                 cancel_event=cancel_event,
             )
+            if context_expected:
+                self._trace(
+                    stage="native_route",
+                    error_code=(
+                        "NATIVE_CONTEXT_BOUND"
+                        if context_refreshed
+                        else "NATIVE_CONTEXT_BINDING_FAILED"
+                    ),
+                    safe_message=(
+                        "The verified native application action was bound to its exact window"
+                        if context_refreshed
+                        else "The verified native application action did not retain an exact window"
+                    ),
+                )
             return self._publish_native_success(
                 "LOCAL_VERIFIED_COMPLETION: 确定性本机技能已完成并返回本地证据",
                 cancel_event=cancel_event,
@@ -1384,14 +1664,14 @@ class DesktopAgentLoopController:
                     stage="native_route",
                     error_code="NATIVE_UI_WORKFLOW_FALLBACK",
                     safe_message=(
-                        "A failed app-only native workflow fell back to fresh generic UI control"
+                        "A failed app workflow fell back to fresh generic UI control"
                     ),
                 )
                 return None
         return self._failure(
             "确定性本机技能未能完成该操作",
             stage="native_route",
-            error_code="NATIVE_ROUTE_FAILED",
+            error_code=_native_failure_error_code(result.message),
         )
 
     def _ensure_generic_components(self) -> ComputerControlResult | None:
@@ -1573,6 +1853,7 @@ class DesktopAgentLoopController:
         self,
         plan: Plan | None,
         *,
+        execution_results: tuple[object, ...] = (),
         user_text: str,
         cancel_event: threading.Event | None,
     ) -> bool:
@@ -1606,6 +1887,10 @@ class DesktopAgentLoopController:
         try:
             self._set_driver_task_context(user_text)
             self.driver.start()
+            verified_hwnd = _verified_native_app_hwnd(execution_results, app)
+            bind_app_window = getattr(self.driver, "bind_app_window", None)
+            if verified_hwnd is not None and callable(bind_app_window):
+                bind_app_window(app, verified_hwnd)
             observation = self.driver.observe(
                 app,
                 cancel_event=self._current_cancel,
@@ -1660,6 +1945,9 @@ class DesktopAgentLoopController:
                         inventory,
                         state.unobservable_dynamic_apps,
                     )
+                    denied_apps = _explicitly_negated_apps(state.task, inventory)
+                    if denied_apps:
+                        inventory = _without_inventory_apps(inventory, set(denied_apps))
                     visible_apps = _visible_apps(inventory)
                 except Exception as exc:
                     return self._failure(
@@ -1702,12 +1990,34 @@ class DesktopAgentLoopController:
                     if state.observation is not None
                     else None
                 )
+                self._trace(
+                    stage="plan",
+                    error_code="PLANNER_CALL_STARTED",
+                    safe_message="The desktop planner started one bounded decision call",
+                    app=(planner_observation.app if planner_observation is not None else None),
+                    generation=(
+                        planner_observation.generation
+                        if planner_observation is not None
+                        else None
+                    ),
+                )
                 decision = self.planner.decide(
                     state.task,
                     apps=state.apps,
                     observation=planner_observation,
                     history=state.history,
                     cancel_event=self._current_cancel,
+                )
+                self._trace(
+                    stage="plan",
+                    error_code="PLANNER_CALL_FINISHED",
+                    safe_message="The desktop planner completed one bounded decision call",
+                    app=(planner_observation.app if planner_observation is not None else None),
+                    generation=(
+                        planner_observation.generation
+                        if planner_observation is not None
+                        else None
+                    ),
                 )
                 if (
                     decision.kind == DesktopDecisionKind.DONE
@@ -1795,6 +2105,29 @@ class DesktopAgentLoopController:
                         stage="plan",
                         error_code="PLANNER_APP_SCOPE_VIOLATION",
                     )
+                spoken_step_count = user_action_step_count(state.task)
+                if (
+                    unrestricted
+                    and state.verified_user_step_count >= spoken_step_count
+                ):
+                    return self._failure(
+                        "用户口述步骤已经全部完成，规划器只能提交完成验收",
+                        stage="plan",
+                        error_code="OBSERVE_AFTER_USER_STEPS_COMPLETE",
+                    )
+                if unrestricted:
+                    explicit_scope, scoped_apps = _explicit_step_window_scope(
+                        state.task,
+                        inventory=state.apps,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                    if explicit_scope and requested_app not in scoped_apps:
+                        return self._failure(
+                            "规划器不能在当前口述步骤之前激活另一个窗口",
+                            stage="plan",
+                            error_code="EXPLICIT_STEP_WINDOW_MISMATCH",
+                            app=decision.app,
+                        )
                 try:
                     observation = self.driver.observe(
                         decision.app,
@@ -1816,6 +2149,15 @@ class DesktopAgentLoopController:
                                 fresh_inventory,
                                 state.unobservable_dynamic_apps,
                             )
+                            denied_apps = _explicitly_negated_apps(
+                                state.task,
+                                fresh_inventory,
+                            )
+                            if denied_apps:
+                                fresh_inventory = _without_inventory_apps(
+                                    fresh_inventory,
+                                    set(denied_apps),
+                                )
                             remaining_apps = _visible_apps(fresh_inventory)
                         except Exception as refresh_exc:
                             return self._failure(
@@ -1904,6 +2246,28 @@ class DesktopAgentLoopController:
                     app=observation.app,
                     generation=observation.generation,
                 )
+                has_visual_viewport = any(
+                    element.visual_ocr
+                    and element.control_type == "VisualViewport"
+                    and element.addressable
+                    and element.enabled
+                    for element in observation.elements
+                )
+                self._trace(
+                    stage="observe_driver",
+                    error_code=(
+                        "VISUAL_VIEWPORT_AVAILABLE"
+                        if has_visual_viewport
+                        else "VISUAL_VIEWPORT_UNAVAILABLE"
+                    ),
+                    safe_message=(
+                        "A fresh exact-window visual action viewport is available"
+                        if has_visual_viewport
+                        else "The fresh window observation exposes semantic controls only"
+                    ),
+                    app=observation.app,
+                    generation=observation.generation,
+                )
                 state.history.append(
                     f"observed {observation.app} generation {observation.generation}"
                 )
@@ -1923,6 +2287,34 @@ class DesktopAgentLoopController:
                         stage="plan",
                         error_code="PLANNER_APP_SCOPE_VIOLATION",
                     )
+                if unrestricted:
+                    spoken_step_count = user_action_step_count(state.task)
+                    if (
+                        state.verified_user_step_count >= spoken_step_count
+                    ):
+                        return self._failure(
+                            "用户口述步骤已经全部完成，不能再执行额外动作",
+                            stage="action_safety",
+                            error_code="ACTION_AFTER_USER_STEPS_COMPLETE",
+                            app=state.observation.app,
+                            generation=state.observation.generation,
+                        )
+                    explicit_scope, scoped_apps = _explicit_step_window_scope(
+                        state.task,
+                        inventory=state.apps,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                    if (
+                        explicit_scope
+                        and action.app.strip().casefold() not in scoped_apps
+                    ):
+                        return self._failure(
+                            "动作没有在当前口述步骤明确指定的窗口中执行",
+                            stage="action_safety",
+                            error_code="EXPLICIT_STEP_WINDOW_MISMATCH",
+                            app=state.observation.app,
+                            generation=state.observation.generation,
+                        )
                 target = next(
                     (
                         element
@@ -1932,6 +2324,82 @@ class DesktopAgentLoopController:
                     None,
                 )
                 target_label = target.name if target is not None else ""
+                visual_viewport_target = bool(
+                    unrestricted
+                    and target is not None
+                    and target.visual_ocr
+                    and target.control_type == "VisualViewport"
+                    and target.enabled
+                    and target.addressable
+                )
+                armed_visual_text = bool(
+                    visual_viewport_target
+                    and action.type == DesktopActionType.TYPE_TEXT
+                    and DesktopElementAction.TYPE_TEXT
+                    in (target.supported_actions or ())
+                )
+                visual_point_click = bool(
+                    visual_viewport_target
+                    and action.type == DesktopActionType.CLICK
+                    and action.x is not None
+                    and action.y is not None
+                )
+                visual_point_click_unambiguous = bool(
+                    visual_point_click
+                    and visual_point_click_is_unambiguous_for_task(
+                        action,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                )
+                visual_text_user_step = bool(
+                    armed_visual_text
+                    and visual_text_action_matches_next_user_step(
+                        action,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                )
+                visual_search_payload_step = bool(
+                    armed_visual_text
+                    and action.text
+                    and visual_search_payload_matches_next_user_step(
+                        action.text,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                )
+                pending_visual_search = state.visual_search_submission
+                visual_search_submission_bound_to_step = bool(
+                    visual_viewport_target
+                    and action.type == DesktopActionType.PRESS_KEY
+                    and (action.key or "").strip().casefold() in {"enter", "return"}
+                    and DesktopElementAction.PRESS_KEY
+                    in (target.supported_actions or ())
+                    and pending_visual_search is not None
+                    and pending_visual_search.app
+                    == state.observation.app.strip().casefold()
+                    and pending_visual_search.local_window_id
+                    == state.observation.local_window_id
+                    and pending_visual_search.completed_steps
+                    == state.verified_user_step_count
+                    and visual_search_payload_matches_next_user_step(
+                        pending_visual_search.payload,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                    and visual_search_task_allows_submission(state.task)
+                )
+                visual_search_submission_user_step = bool(
+                    visual_search_submission_bound_to_step
+                    and pending_visual_search is not None
+                    and visual_search_submission_matches_next_user_step(
+                        action,
+                        pending_visual_search.payload,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                )
                 if unrestricted:
                     explicit_scope, scoped_apps = _explicit_step_window_scope(
                         state.task,
@@ -1966,7 +2434,8 @@ class DesktopAgentLoopController:
                         scoped_apps=scoped_apps,
                     )
                     target_matches_text_field = bool(
-                        target_matches_explicit_text_step(
+                        visual_text_user_step
+                        or target_matches_explicit_text_step(
                             target_label,
                             state.task,
                             step=state.verified_user_step_count,
@@ -2001,7 +2470,7 @@ class DesktopAgentLoopController:
                             app=state.observation.app,
                             generation=state.observation.generation,
                         )
-                direct_action_match = action_matches_next_user_step(
+                direct_action_match = action_matches_user_step_with_label_aliases(
                     action,
                     target_label,
                     state.task,
@@ -2009,12 +2478,51 @@ class DesktopAgentLoopController:
                 )
                 direct_expectation_match = bool(
                     decision.expectation is not None
-                    and expectation_matches_user_step(
+                    and expectation_matches_user_step_with_label_aliases(
                         action,
                         target_label,
                         decision.expectation,
                         state.task,
                         completed_steps=state.verified_user_step_count,
+                    )
+                )
+                semantic_search_payload_step = bool(
+                    unrestricted
+                    and not visual_viewport_target
+                    and semantic_search_text_action_matches_next_user_step(
+                        action,
+                        target,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                )
+                future_action_match = any(
+                    action_matches_user_step_with_label_aliases(
+                        action,
+                        target_label,
+                        state.task,
+                        completed_steps=future_step,
+                    )
+                    for future_step in range(
+                        state.verified_user_step_count + 1,
+                        user_action_step_count(state.task),
+                    )
+                )
+                generic_navigation_bridge_allowed = bool(
+                    user_action_step_count(state.task) > 0
+                    and not action_type_matches_a_future_user_step(
+                        action,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                    and generic_navigation_bridge_action_is_unnegated(
+                        action,
+                        state.task,
+                    )
+                    and generic_navigation_bridge_avoids_negated_targets(
+                        target_label,
+                        decision.expectation,
+                        state.task,
                     )
                 )
                 instrumental_reveal = bool(
@@ -2026,15 +2534,62 @@ class DesktopAgentLoopController:
                     # navigation bridges, but only an exact match for the next
                     # spoken action advances the explicit user-step counter.
                     # Reveal-only bridges are bounded separately below.
-                    binding = (
-                        DesktopActionBinding.USER_STEP
-                        if (
-                            not instrumental_reveal
-                            and direct_action_match
-                            and direct_expectation_match
+                    if visual_point_click and not visual_point_click_unambiguous:
+                        binding = None
+                    elif visual_viewport_target and action.type == DesktopActionType.TYPE_TEXT:
+                        binding = (
+                            DesktopActionBinding.USER_STEP
+                            if visual_text_user_step
+                            else DesktopActionBinding.NAVIGATION_BRIDGE
+                            if visual_search_payload_step
+                            else None
                         )
-                        else DesktopActionBinding.NAVIGATION_BRIDGE
-                    )
+                    elif (
+                        visual_viewport_target
+                        and action.type == DesktopActionType.PRESS_KEY
+                    ):
+                        binding = (
+                            DesktopActionBinding.USER_STEP
+                            if visual_search_submission_user_step
+                            else DesktopActionBinding.NAVIGATION_BRIDGE
+                            if visual_search_submission_bound_to_step
+                            else None
+                        )
+                    elif action.type in {
+                        DesktopActionType.TYPE_TEXT,
+                        DesktopActionType.SET_VALUE,
+                    }:
+                        binding = (
+                            DesktopActionBinding.USER_STEP
+                            if direct_action_match and direct_expectation_match
+                            else DesktopActionBinding.NAVIGATION_BRIDGE
+                            if semantic_search_payload_step
+                            else None
+                        )
+                    elif action.type in {
+                        DesktopActionType.PRESS_KEY,
+                        DesktopActionType.DRAG,
+                    }:
+                        binding = (
+                            DesktopActionBinding.USER_STEP
+                            if direct_action_match and direct_expectation_match
+                            else None
+                        )
+                    else:
+                        binding = (
+                            DesktopActionBinding.USER_STEP
+                            if (
+                                not instrumental_reveal
+                                and direct_action_match
+                                and direct_expectation_match
+                            )
+                            else None
+                            if (
+                                future_action_match
+                                or not generic_navigation_bridge_allowed
+                            )
+                            else DesktopActionBinding.NAVIGATION_BRIDGE
+                        )
                 else:
                     binding = (
                         DesktopActionBinding.USER_STEP
@@ -2113,6 +2668,12 @@ class DesktopAgentLoopController:
                     action,
                     expectation=decision.expectation,
                     counts_as_user_step=binding == DesktopActionBinding.USER_STEP,
+                    visual_search_payload=(
+                        action.text
+                        if visual_search_payload_step
+                        and visual_search_task_allows_submission(state.task)
+                        else None
+                    ),
                     cancel_event=cancel_event,
                 )
                 if action_result is not None:
@@ -2363,13 +2924,57 @@ class DesktopAgentLoopController:
                     last_action=state.last_action,
                     last_action_target=state.last_action_target,
                 )
-                related_destination_terminal = bool(
+                related_window_is_current = bool(
                     state.related_window_navigation_pending
                     and state.related_window_id
                     and state.observation.local_window_id == state.related_window_id
-                    and _related_destination_terminal_condition(
-                        decision.expectation,
+                )
+                related_destination_step_bound = bool(
+                    related_window_is_current
+                    and state.last_action is not None
+                    and state.related_window_destination is not None
+                    and action_matches_next_user_step(
+                        state.last_action,
                         state.related_window_destination,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                )
+                related_step_has_explicit_outcome = (
+                    user_action_step_has_explicit_outcome(
+                        state.task,
+                        step=state.verified_user_step_count,
+                    )
+                    if related_destination_step_bound
+                    else False
+                )
+                related_outcome_terminal = bool(
+                    related_destination_step_bound
+                    and state.last_action is not None
+                    and state.related_window_destination is not None
+                    and decision.expectation is not None
+                    and expectation_matches_user_step(
+                        state.last_action,
+                        state.related_window_destination,
+                        decision.expectation,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
+                    )
+                )
+                related_destination_terminal = bool(
+                    related_destination_step_bound
+                    and (
+                        related_outcome_terminal
+                        or (
+                            not related_step_has_explicit_outcome
+                            and (
+                                visual_state_completion
+                                or _related_destination_terminal_condition(
+                                    decision.expectation,
+                                    state.related_window_destination,
+                                )
+                            )
+                        )
                     )
                 )
                 last_action_was_visual_point = bool(
@@ -2377,6 +2982,16 @@ class DesktopAgentLoopController:
                     and state.last_action.type == DesktopActionType.CLICK
                     and state.last_action.x is not None
                     and state.last_action.y is not None
+                )
+                last_action_was_bound_visual_text_or_search = bool(
+                    state.last_action_counted_as_user_step
+                    and state.last_action is not None
+                    and state.last_action.type
+                    in {
+                        DesktopActionType.TYPE_TEXT,
+                        DesktopActionType.PRESS_KEY,
+                    }
+                    and state.last_action_was_visual_viewport
                 )
                 last_action_has_terminal_evidence = expectation_is_terminal_user_condition(
                     state.last_action_expectation,
@@ -2392,33 +3007,35 @@ class DesktopAgentLoopController:
                     and state.last_verification.verified
                     and (
                         last_action_was_visual_point
+                        or last_action_was_bound_visual_text_or_search
                         or last_action_has_terminal_evidence
-                        or (
-                            state.related_window_navigation_pending
-                            and state.related_window_id
-                            and state.observation.local_window_id
-                            == state.related_window_id
-                        )
+                        or related_destination_terminal
+                    )
+                )
+                visual_point_terminal_credit = bool(
+                    visual_state_completion
+                    and last_action_was_visual_point
+                    and state.last_action is not None
+                    and visual_point_click_matches_next_user_step(
+                        state.last_action,
+                        state.task,
+                        completed_steps=state.verified_user_step_count,
                     )
                 )
                 terminal_step_credit = bool(
                     spoken_step_count > 0
                     and state.verified_user_step_count == spoken_step_count - 1
-                    and (related_destination_terminal or visual_terminal_evidence)
+                    and not state.last_action_counted_as_user_step
+                    and (
+                        zero_action_switch
+                        or related_destination_terminal
+                        or visual_point_terminal_credit
+                    )
                 )
                 effective_verified_user_steps = state.verified_user_step_count + int(
                     terminal_step_credit
                 )
-                if (
-                    (
-                        not unrestricted
-                        or spoken_step_count > 1
-                        or natural_search_step_count(state.task) > 0
-                        or visual_state_completion
-                        or related_destination_terminal
-                    )
-                    and effective_verified_user_steps != spoken_step_count
-                ):
+                if effective_verified_user_steps != spoken_step_count:
                     return self._failure(
                         "尚未按顺序完成用户明确要求的全部桌面步骤",
                         stage="verify_completion",
@@ -2505,6 +3122,7 @@ class DesktopAgentLoopController:
         *,
         expectation: DesktopExpectation | None,
         counts_as_user_step: bool = True,
+        visual_search_payload: str | None = None,
         confirmed_binding: DesktopConfirmation | None = None,
         cancel_event: threading.Event | None,
     ) -> ComputerControlResult | None:
@@ -2564,9 +3182,42 @@ class DesktopAgentLoopController:
                 before,
             )
         )
+        visual_point_action = (
+            _visual_point_click_signature(action, planner_observation) is not None
+        )
+        visual_point_patch_changed = bool(
+            visual_point_action
+            and not _visual_point_patch_is_still_bound(
+                action,
+                planner_observation,
+                before,
+            )
+        )
+        visual_input_frame_changed = bool(
+            action.type
+            in {
+                DesktopActionType.TYPE_TEXT,
+                DesktopActionType.PRESS_KEY,
+            }
+            and not _visual_input_frame_is_still_bound(
+                action,
+                planner_observation,
+                before,
+            )
+            and any(
+                element.index == action.element_index
+                and element.visual_ocr
+                and element.control_type == "VisualViewport"
+                for element in planner_observation.elements
+            )
+        )
         if (
-            before.fingerprint != planner_observation.fingerprint
-            and not semantic_target_survived_animation
+            (
+                before.fingerprint != planner_observation.fingerprint
+                and not semantic_target_survived_animation
+            )
+            or visual_point_patch_changed
+            or visual_input_frame_changed
         ):
             if (
                 not planner_observation.local_window_id
@@ -2588,11 +3239,24 @@ class DesktopAgentLoopController:
                     error_code="UI_STATE_UNSTABLE",
                     app=before.app,
                     generation=before.generation,
-                )
-            state.observation = before
-            state.history.append(
-                "refreshed changed UI in the same local window; previous action was not executed"
             )
+            state.observation = before
+            if visual_point_patch_changed:
+                stale_history = (
+                    "refreshed a changed visual click patch; "
+                    "previous coordinates were not executed"
+                )
+            elif visual_input_frame_changed:
+                stale_history = (
+                    "refreshed a changed visual input frame; "
+                    "previous text/key action was not executed"
+                )
+            else:
+                stale_history = (
+                    "refreshed changed UI in the same local window; "
+                    "previous action was not executed"
+                )
+            state.history.append(stale_history)
             return None
         rebound = replace(action, generation=before.generation)
         visual_point_signature = _visual_point_click_signature(rebound, before)
@@ -2778,6 +3442,7 @@ class DesktopAgentLoopController:
                 last_action_result=verified,
             )
         )
+        requested_postcondition_verified = expected_result.verified
         related_window_transition = bool(
             self.safety.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
             and verified.verified
@@ -2795,7 +3460,7 @@ class DesktopAgentLoopController:
                 DesktopActionType.PERFORM_SECONDARY_ACTION,
             }
         )
-        disappearance_destination = (
+        related_destination = (
             _related_result_destination(target.name, state.task)
             if (
                 related_window_transition
@@ -2809,9 +3474,51 @@ class DesktopAgentLoopController:
             )
             else None
         )
+        if (
+            related_destination is None
+            and related_window_transition
+            and target is not None
+            and action_matches_next_user_step(
+                rebound,
+                target.name,
+                state.task,
+                completed_steps=state.verified_user_step_count,
+            )
+        ):
+            related_destination = " ".join(target.name.split())
+        if (
+            related_destination is None
+            and related_window_transition
+            and expectation.text
+            and expectation.kind
+            in {
+                DesktopExpectationKind.TEXT_PRESENT,
+                DesktopExpectationKind.ELEMENT_SELECTED,
+                DesktopExpectationKind.FOCUSED_CONTAINS,
+            }
+            and action_matches_next_user_step(
+                rebound,
+                expectation.text,
+                state.task,
+                completed_steps=state.verified_user_step_count,
+            )
+        ):
+            # Some rendered search results expose only a generic semantic
+            # button such as "Go to".  Preserve the planner's exact local
+            # postcondition as the child destination only when it binds to the
+            # still-current spoken click/open step.  A later type step can
+            # therefore never receive credit merely because a child opened.
+            related_destination = " ".join(expectation.text.split())
         related_window_transition_bridge = bool(
             related_window_transition
-            and (not expected_result.verified or disappearance_destination is not None)
+            and (not expected_result.verified or related_destination is not None)
+        )
+        counted_user_step = bool(
+            counts_as_user_step
+            and (
+                not related_window_transition_bridge
+                or requested_postcondition_verified
+            )
         )
         if related_window_transition_bridge:
             # The exact semantic control produced a driver-proven related HWND
@@ -2846,6 +3553,7 @@ class DesktopAgentLoopController:
             )
         state.observation = after
         if instrumental_reveal:
+            state.visual_search_submission = None
             assert reveal_signature is not None
             state.instrumental_reveal_count += 1
             state.instrumental_reveal_action_counts[reveal_signature] = (
@@ -2862,18 +3570,40 @@ class DesktopAgentLoopController:
                 )
             state.last_verification = expected_result
             state.last_action_expectation = (
-                None if related_window_transition_bridge else expectation
+                None
+                if related_window_transition_bridge
+                and not requested_postcondition_verified
+                else expectation
             )
             state.last_action = rebound
             state.last_action_target = target.name if target is not None else None
-            state.related_window_navigation_pending = related_window_transition_bridge
+            state.last_action_counted_as_user_step = counted_user_step
+            state.last_action_was_visual_viewport = bool(
+                target is not None
+                and target.visual_ocr
+                and target.control_type == "VisualViewport"
+            )
+            state.related_window_navigation_pending = bool(
+                related_window_transition_bridge and not counted_user_step
+            )
             state.related_window_id = (
-                after.local_window_id if related_window_transition_bridge else None
+                after.local_window_id
+                if state.related_window_navigation_pending
+                else None
             )
             state.related_window_destination = (
-                disappearance_destination if related_window_transition_bridge else None
+                related_destination if state.related_window_navigation_pending else None
             )
-            if counts_as_user_step:
+            if visual_search_payload is not None:
+                state.visual_search_submission = _VisualSearchStepBinding(
+                    app=after.app.strip().casefold(),
+                    local_window_id=after.local_window_id or "",
+                    payload=visual_search_payload,
+                    completed_steps=state.verified_user_step_count,
+                )
+            else:
+                state.visual_search_submission = None
+            if counted_user_step:
                 state.verified_user_step_count += 1
             state.verified_action_count += 1
         state.stale_replans = 0
@@ -3256,6 +3986,34 @@ class DesktopAgentLoopController:
                 else:
                     instruction = raw_instruction.strip()
 
+                if unsupported_control_condition_present(instruction):
+                    self._clear_dictation_context()
+                    return self._failure(
+                        "条件式桌面动作尚未建立可本地核验的条件绑定",
+                        stage="preflight",
+                        error_code="CONDITIONAL_ACTION_UNSUPPORTED",
+                    )
+                if reported_action_reference_present(instruction):
+                    self._clear_dictation_context()
+                    return self._failure(
+                        "页面文字或转述内容不能自动变成桌面操作权限",
+                        stage="preflight",
+                        error_code="REPORTED_ACTION_UNSUPPORTED",
+                    )
+                if dangling_negation_before_action_present(instruction):
+                    self._clear_dictation_context()
+                    return self._failure(
+                        "检测到否定词后的语音停顿，未把后半句当成正向操作",
+                        stage="preflight",
+                        error_code="NEGATED_ACTION_UNSUPPORTED",
+                    )
+                if unparsed_affirmative_action_present(instruction):
+                    self._clear_dictation_context()
+                    return self._failure(
+                        "检测到规划器尚未绑定的延后动作从句",
+                        stage="preflight",
+                        error_code="UNPARSED_ACTION_UNSUPPORTED",
+                    )
                 self._set_driver_task_context(instruction)
                 current_composer_result = self._bind_current_trusted_composer(
                     instruction,
@@ -3320,11 +4078,21 @@ class DesktopAgentLoopController:
                     # complete locally enumerated window set is the planner's
                     # scope; the user no longer needs to name a preconfigured
                     # application before each natural-language instruction.
+                    denied_apps = _explicitly_negated_apps(instruction, inventory)
+                    if denied_apps:
+                        inventory = _without_inventory_apps(inventory, set(denied_apps))
+                        visible_apps = _visible_apps(inventory)
                     if not visible_apps:
                         return self._failure(
-                            "当前没有可供桌面规划器观察的可见窗口",
+                            "当前没有符合本句明确约束的可观察窗口",
                             stage="list_apps",
                             error_code="NO_VISIBLE_WINDOWS",
+                        )
+                    if user_action_step_count(instruction) == 0:
+                        return self._failure(
+                            "本句没有可按顺序绑定和验收的正向桌面动作",
+                            stage="list_apps",
+                            error_code="NO_POSITIVE_USER_ACTION",
                         )
                     allowed_apps = frozenset(visible_apps)
                     apps = inventory
@@ -3645,6 +4413,7 @@ class DesktopAgentLoopController:
         )
         context_refreshed = self._refresh_trusted_context_after_native(
             evaluated,
+            execution_results=results,
             user_text=pending.native_user_text,
             cancel_event=cancel_event,
         )

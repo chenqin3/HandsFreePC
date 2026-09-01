@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import threading
@@ -63,6 +64,7 @@ class FakeNativeRouter:
     def __init__(self, result):
         self.result = result
         self.calls = []
+        self.path_context_clears = 0
         self.executor = FakeNativeExecutor()
         self.safety = type(
             "FakeNativeSafety",
@@ -73,6 +75,9 @@ class FakeNativeRouter:
     def route(self, text):
         self.calls.append(text)
         return self.result
+
+    def clear_path_context(self):
+        self.path_context_clears += 1
 
 
 class FakeDriver:
@@ -137,6 +142,11 @@ class ContextRecordingDriver(FakeDriver):
 
     def set_task_context(self, task):
         self.task_contexts.append(task)
+
+
+class NativeHwndBindingDriver(FakeDriver):
+    def bind_app_window(self, app, hwnd):
+        self.calls.append(("bind_app_window", app, hwnd))
 
 
 class SequencePlanner:
@@ -711,6 +721,44 @@ def test_local_unrestricted_next_control_gets_previous_fresh_window_and_full_inv
     assert json.loads(planner.app_payloads[0]) == inventory
 
 
+def test_native_success_rebinds_the_canonical_app_to_its_verified_exact_hwnd():
+    action = Action(ActionType.ACTIVATE_APP, app="claude")
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.SUCCEEDED,
+            "verified",
+            plan=Plan("activate Claude", [action]),
+            execution_results=(
+                ExecutionResult(
+                    True,
+                    "verified",
+                    action=action,
+                    evidence={"hwnd": 202, "postcondition_verified": True},
+                ),
+            ),
+        )
+    )
+    driver = NativeHwndBindingDriver(
+        [_selection_observation(1, local_window_id="hwnd:202")]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开 Claude")
+
+    assert result.success
+    assert driver.calls[:3] == [
+        ("start",),
+        ("bind_app_window", "claude", 202),
+        ("observe", "claude"),
+    ]
+    assert controller._trusted_context() == ("claude", "hwnd:202")
+
+
 def test_failed_native_app_workflow_falls_back_to_generic_uia_and_succeeds():
     failed_plan = Plan(
         "open Claude mode",
@@ -750,13 +798,47 @@ def test_failed_native_app_workflow_falls_back_to_generic_uia_and_succeeds():
     assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
 
 
-def test_failed_native_path_never_falls_back_to_generic_uia():
+def test_failed_native_path_never_loses_its_obligation_to_generic_ui():
     failed_plan = Plan(
         "open path",
         [Action(ActionType.OPEN_PATH, path=r"G:\deep\file.txt")],
     )
     router = FakeNativeRouter(
-        NativeSkillResult(NativeRouteStatus.FAILED, "failed", plan=failed_plan)
+        NativeSkillResult(
+            NativeRouteStatus.FAILED,
+            "NATIVE_PREPARE_FAILED: bounded failure",
+            plan=failed_plan,
+        )
+    )
+    planner = SequencePlanner([])
+    driver = FakeDriver([])
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(r"打开 G:\deep\file.txt")
+
+    assert not result.success
+    assert result.error_code == "NATIVE_PREPARE_FAILED"
+    assert driver.calls == []
+    assert planner.calls == []
+    assert router.path_context_clears == 0
+
+
+def test_dispatched_native_path_failure_never_repeats_through_generic_ui():
+    failed_plan = Plan(
+        "open path",
+        [Action(ActionType.OPEN_PATH, path=r"G:\deep\file.txt")],
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.FAILED,
+            "NATIVE_EXECUTION_FAILED: postcondition missing",
+            plan=failed_plan,
+        )
     )
     driver = FakeDriver([])
     planner = SequencePlanner([])
@@ -770,9 +852,33 @@ def test_failed_native_path_never_falls_back_to_generic_uia():
     result = controller.run(r"打开 G:\deep\file.txt")
 
     assert not result.success
-    assert result.error_code == "NATIVE_ROUTE_FAILED"
+    assert result.error_code == "NATIVE_EXECUTION_FAILED"
     assert driver.calls == []
     assert planner.calls == []
+    assert router.path_context_clears == 0
+
+
+def test_native_failure_preserves_content_free_failure_code():
+    plan = Plan("open path", [Action(ActionType.OPEN_PATH, path=r"G:\deep\file.txt")])
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.FAILED,
+            "NATIVE_PATH_BINDING_FAILED: private path detail",
+            plan=plan,
+        )
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=None,
+        planner=None,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(r"打开 G:\deep\file.txt")
+
+    assert not result.success
+    assert result.error_code == "NATIVE_PATH_BINDING_FAILED"
+    assert "private path detail" not in result.safe_message
 
 
 def test_unrestricted_observe_quarantines_one_bad_dynamic_window_then_uses_another():
@@ -933,15 +1039,13 @@ def test_unrestricted_observe_failure_after_action_never_switches_windows():
     result = controller.run("在 Claude 里选择 Alpha")
 
     assert not result.success
-    assert result.stage == "observe_driver"
-    assert result.error_code == "OBSERVE_DRIVER_FAILED"
+    assert result.stage == "plan"
+    assert result.error_code == "OBSERVE_AFTER_USER_STEPS_COMPLETE"
     assert len(planner.calls) == 3
     assert [call for call in driver.calls if call[0] == "execute"] == [
         ("execute", "click", 2)
     ]
-    assert [call for call in driver.calls if call == ("observe", bad_app)] == [
-        ("observe", bad_app)
-    ]
+    assert not any(call == ("observe", bad_app) for call in driver.calls)
 
 
 @pytest.mark.parametrize("spoken", ["ChatGPT", "chat gpt", "聊天GPT"])
@@ -992,7 +1096,8 @@ def test_local_unrestricted_cannot_claim_an_arbitrary_task_done_after_only_obser
     result = controller.run("继续处理当前界面")
 
     assert result.success is False
-    assert result.error_code == "NO_VERIFIED_ACTIONS"
+    assert result.error_code == "NO_POSITIVE_USER_ACTION"
+    assert not any(call[0] == "observe" for call in driver.calls)
 
 
 def test_local_unrestricted_accepts_verified_intermediate_navigation_not_named_by_user():
@@ -1003,6 +1108,18 @@ def test_local_unrestricted_accepts_verified_intermediate_navigation_not_named_b
             events.append(kwargs)
 
     destination = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "最终页面")
+
+    def terminal(generation: int, *, selected: bool) -> DesktopObservation:
+        target = DesktopElement("2", "最终页面", "Button", selected=selected)
+        return _observation(
+            generation,
+            (
+                '2 name="最终页面" control_type="Button" '
+                f"selected={str(selected).lower()}"
+            ),
+            elements=(target,),
+            local_window_id="window-a",
+        )
     planner = SequencePlanner(
         [
             _observe_decision(),
@@ -1018,15 +1135,32 @@ def test_local_unrestricted_accepts_verified_intermediate_navigation_not_named_b
                 ),
                 expectation=destination,
             ),
-            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "最终页面"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "activate the exact revealed user target",
+                app="claude",
+                action=DesktopAction(
+                    DesktopActionType.CLICK,
+                    app="claude",
+                    generation=3,
+                    element_index="2",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.ELEMENT_SELECTED,
+                    "最终页面",
+                ),
+            ),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "最终页面"),
         ]
     )
     driver = FakeDriver(
         [
             _selection_observation(1),
             _selection_observation(2),
-            _selection_observation(3, marker="最终页面"),
-            _selection_observation(4, marker="最终页面"),
+            terminal(3, selected=False),
+            terminal(4, selected=False),
+            terminal(5, selected=True),
+            terminal(6, selected=True),
         ]
     )
     controller = DesktopAgentLoopController(
@@ -1043,8 +1177,11 @@ def test_local_unrestricted_accepts_verified_intermediate_navigation_not_named_b
     assert any(call[0] == "execute" for call in driver.calls)
     codes = [event["error_code"] for event in events]
     assert "APP_SCOPE_RESOLVED" in codes
+    assert "PLANNER_CALL_STARTED" in codes
+    assert "PLANNER_CALL_FINISHED" in codes
     assert "PLANNER_DECISION_OBSERVE" in codes
     assert "PLANNER_DECISION_ACTION" in codes
+    assert "VISUAL_VIEWPORT_UNAVAILABLE" in codes
     assert "ACTION_DISPATCHED" in codes
     assert "ACTION_VERIFIED" in codes
 
@@ -1474,6 +1611,235 @@ def test_visual_point_region_signature_separates_app_and_exact_window():
     )
 
 
+def _visual_png(*, target: tuple[int, int, int], distant: tuple[int, int, int]) -> bytes:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (256, 160), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((92, 60, 132, 100), fill=target)
+    draw.rectangle((205, 15, 225, 35), fill=distant)
+    payload = io.BytesIO()
+    image.save(payload, format="PNG")
+    return payload.getvalue()
+
+
+def _visual_patch_observation(
+    generation: int,
+    screenshot_png: bytes,
+    *,
+    text: str = "stable visual viewport",
+) -> DesktopObservation:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    return DesktopObservation(
+        app="claude",
+        generation=generation,
+        accessibility_text=(
+            '2 name="Visual screenshot viewport" control_type="VisualViewport" '
+            + text
+        ),
+        screenshot_png=screenshot_png,
+        window_title="Claude",
+        elements=(viewport,),
+        local_window_id="window-a",
+    )
+
+
+def _visual_bound_input_observation(
+    generation: int,
+    screenshot_png: bytes,
+    capability: DesktopElementAction,
+) -> DesktopObservation:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK, capability),
+    )
+    return DesktopObservation(
+        app="claude",
+        generation=generation,
+        accessibility_text=(
+            '2 name="Visual screenshot viewport" control_type="VisualViewport" '
+            "stable-armed-input"
+        ),
+        screenshot_png=screenshot_png,
+        window_title="Claude",
+        elements=(viewport,),
+        local_window_id="window-a",
+    )
+
+
+def test_visual_point_click_replans_when_the_planned_local_patch_changed() -> None:
+    planned = _visual_patch_observation(
+        1,
+        _visual_png(target=(20, 80, 180), distant=(10, 120, 10)),
+    )
+    fresh = _visual_patch_observation(
+        2,
+        _visual_png(target=(210, 30, 30), distant=(10, 120, 10)),
+    )
+    assert planned.fingerprint == fresh.fingerprint
+    state = _visual_click_task_state(planned)
+    driver = FakeDriver([fresh])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+    decision = _loop_visual_click_decision(1, 112, 80)
+
+    result = controller._perform_action(
+        state,
+        decision.action,
+        expectation=decision.expectation,
+        counts_as_user_step=False,
+        cancel_event=None,
+    )
+
+    assert result is None
+    assert state.observation is fresh
+    assert state.stale_replans == 1
+    assert state.verified_action_count == 0
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_visual_text_replans_if_the_armed_field_changes_before_dispatch() -> None:
+    planned = _visual_bound_input_observation(
+        1,
+        _visual_png(target=(20, 80, 180), distant=(10, 120, 10)),
+        DesktopElementAction.TYPE_TEXT,
+    )
+    fresh = _visual_bound_input_observation(
+        2,
+        _visual_png(target=(210, 30, 30), distant=(10, 120, 10)),
+        DesktopElementAction.TYPE_TEXT,
+    )
+    assert planned.fingerprint == fresh.fingerprint
+    state = _visual_click_task_state(planned)
+    state.task = 'In Claude, type "hello" into Message'
+    driver = FakeDriver([fresh])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="claude",
+        generation=1,
+        element_index="2",
+        text="hello",
+    )
+
+    result = controller._perform_action(
+        state,
+        action,
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+        counts_as_user_step=True,
+        cancel_event=None,
+    )
+
+    assert result is None
+    assert state.observation is fresh
+    assert state.stale_replans == 1
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_visual_enter_replans_when_a_result_appears_before_dispatch() -> None:
+    planned = _visual_bound_input_observation(
+        1,
+        _visual_png(target=(20, 80, 180), distant=(10, 120, 10)),
+        DesktopElementAction.PRESS_KEY,
+    )
+    fresh = _visual_bound_input_observation(
+        2,
+        _visual_png(target=(20, 80, 180), distant=(220, 80, 10)),
+        DesktopElementAction.PRESS_KEY,
+    )
+    assert planned.fingerprint == fresh.fingerprint
+    state = _visual_click_task_state(planned)
+    state.task = "In Claude, search for Alpha"
+    driver = FakeDriver([fresh])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+    action = DesktopAction(
+        DesktopActionType.PRESS_KEY,
+        app="claude",
+        generation=1,
+        element_index="2",
+        key="enter",
+    )
+
+    result = controller._perform_action(
+        state,
+        action,
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+        counts_as_user_step=True,
+        cancel_event=None,
+    )
+
+    assert result is None
+    assert state.observation is fresh
+    assert state.stale_replans == 1
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_visual_point_click_ignores_a_distant_animation_and_executes_once() -> None:
+    planned = _visual_patch_observation(
+        1,
+        _visual_png(target=(20, 80, 180), distant=(10, 120, 10)),
+    )
+    fresh = _visual_patch_observation(
+        2,
+        _visual_png(target=(20, 80, 180), distant=(220, 80, 10)),
+    )
+    after = _visual_patch_observation(
+        3,
+        _visual_png(target=(20, 80, 180), distant=(20, 20, 220)),
+        text="post-action visual viewport",
+    )
+    assert planned.fingerprint == fresh.fingerprint
+    state = _visual_click_task_state(planned)
+    driver = FakeDriver([fresh, after])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+    decision = _loop_visual_click_decision(1, 112, 80)
+
+    result = controller._perform_action(
+        state,
+        decision.action,
+        expectation=decision.expectation,
+        counts_as_user_step=False,
+        cancel_event=None,
+    )
+
+    assert result is None
+    assert state.verified_action_count == 1
+    assert state.stale_replans == 0
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
 def test_frame_bound_visual_click_replans_from_fresh_screenshot_and_can_complete():
     def visual_observation(generation, marker):
         viewport = DesktopElement(
@@ -1545,6 +1911,596 @@ def test_frame_bound_visual_click_replans_from_fresh_screenshot_and_can_complete
     assert result.success is True
     assert len([call for call in driver.calls if call[0] == "execute"]) == 1
     assert not driver.observations
+
+
+def _visual_input_observation(
+    generation: int,
+    marker: str,
+    supported_actions: tuple[DesktopElementAction, ...],
+) -> DesktopObservation:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=supported_actions,
+    )
+    return DesktopObservation(
+        app="claude",
+        generation=generation,
+        accessibility_text=(
+            '2 name="Visual screenshot viewport" control_type="VisualViewport" '
+            f"state={marker}"
+        ),
+        screenshot_png=f"visual-input:{marker}".encode(),
+        window_title="Claude",
+        elements=(viewport,),
+        local_window_id="window-a",
+    )
+
+
+def _visual_type_decision(generation: int, payload: str) -> DesktopDecision:
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "type the exact user payload into the armed visual field",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.TYPE_TEXT,
+            app="claude",
+            generation=generation,
+            element_index="2",
+            text=payload,
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+
+def _visual_enter_decision(generation: int) -> DesktopDecision:
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "submit the exact armed visual search",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.PRESS_KEY,
+            app="claude",
+            generation=generation,
+            element_index="2",
+            key="enter",
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+
+def test_visual_unsent_draft_counts_as_the_current_user_step_without_enter() -> None:
+    armed = (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT)
+    unarmed = (DesktopElementAction.CLICK,)
+    initial = _visual_input_observation(1, "draft-focus", armed)
+    pre_type = _visual_input_observation(2, "draft-focus", armed)
+    after_type = _visual_input_observation(3, "draft-typed", unarmed)
+    confirmation = _visual_input_observation(4, "draft-confirmed", unarmed)
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _visual_type_decision(1, "hello"),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_type),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver([initial, pre_type, after_type, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run('In Claude, type "hello" into Message but do not send it')
+
+    assert result.success is True
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "type_text"
+    ]
+
+
+def test_one_visual_draft_cannot_receive_credit_for_a_second_text_step() -> None:
+    armed = (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT)
+    unarmed = (DesktopElementAction.CLICK,)
+    initial = _visual_input_observation(1, "first-focus", armed)
+    pre_type = _visual_input_observation(2, "first-focus", armed)
+    after_type = _visual_input_observation(3, "hello-typed", unarmed)
+    confirmation = _visual_input_observation(4, "world-still-missing", unarmed)
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _visual_type_decision(1, "hello"),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_type),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver([initial, pre_type, after_type, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        'In Claude, type "hello" into Message, then type "world" into Prompt'
+    )
+
+    assert result.success is False
+    assert result.error_code == "USER_STEPS_INCOMPLETE"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "type_text"
+    ]
+
+
+def test_visual_click_cannot_replace_the_only_requested_text_step() -> None:
+    click_only = (DesktopElementAction.CLICK,)
+    initial = _visual_input_observation(1, "message-visible", click_only)
+    pre_click = _visual_input_observation(2, "message-visible", click_only)
+    after_click = _visual_input_observation(3, "message-focused", click_only)
+    confirmation = _visual_input_observation(4, "message-still-empty", click_only)
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _loop_visual_click_decision(1, 20, 20),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_click),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver([initial, pre_click, after_click, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run('In Claude, type "hello" into Message')
+
+    assert result.success is False
+    assert result.error_code == "USER_STEPS_INCOMPLETE"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "In Claude, click Message to show Settings",
+        "In Claude, click Message which should show Settings",
+        "In Claude, click Message should show Settings",
+        "在 Claude 点击消息这样就能看到设置",
+        "在 Claude 点击消息以便显示设置",
+    ],
+)
+def test_visual_click_cannot_replace_a_distinct_authored_outcome(task: str) -> None:
+    click_only = (DesktopElementAction.CLICK,)
+    initial = _visual_input_observation(1, "message-visible", click_only)
+    pre_click = _visual_input_observation(2, "message-visible", click_only)
+    after_click = _visual_input_observation(3, "message-only", click_only)
+    confirmation = _visual_input_observation(4, "settings-missing", click_only)
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _loop_visual_click_decision(1, 20, 20),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_click),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver([initial, pre_click, after_click, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "USER_STEPS_INCOMPLETE"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
+
+
+def test_visual_search_and_focus_click_cannot_replace_the_later_text_step() -> None:
+    text_armed = (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT)
+    enter_armed = (DesktopElementAction.CLICK, DesktopElementAction.PRESS_KEY)
+    click_only = (DesktopElementAction.CLICK,)
+    initial = _visual_input_observation(1, "search-focus", text_armed)
+    pre_type = _visual_input_observation(2, "search-focus", text_armed)
+    after_type = _visual_input_observation(3, "search-typed", enter_armed)
+    pre_enter = _visual_input_observation(4, "search-typed", enter_armed)
+    after_enter = _visual_input_observation(5, "search-results", click_only)
+    pre_click = _visual_input_observation(6, "search-results", click_only)
+    after_click = _visual_input_observation(7, "message-focused", click_only)
+    confirmation = _visual_input_observation(8, "message-still-empty", click_only)
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _visual_type_decision(1, "Alpha"),
+            _visual_enter_decision(3),
+            _loop_visual_click_decision(5, 20, 20),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_click),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            initial,
+            pre_type,
+            after_type,
+            pre_enter,
+            after_enter,
+            pre_click,
+            after_click,
+            confirmation,
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        'In Claude, search for Alpha, then type "hello" into Message'
+    )
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "type_text",
+    ]
+
+
+def test_visual_natural_search_rejects_viewport_enter_after_exact_filter() -> None:
+    text_armed = (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT)
+    enter_armed = (DesktopElementAction.CLICK, DesktopElementAction.PRESS_KEY)
+    unarmed = (DesktopElementAction.CLICK,)
+    initial = _visual_input_observation(1, "search-focus", text_armed)
+    pre_type = _visual_input_observation(2, "search-focus", text_armed)
+    after_type = _visual_input_observation(3, "search-typed", enter_armed)
+    pre_enter = _visual_input_observation(4, "search-typed", enter_armed)
+    after_enter = _visual_input_observation(5, "search-result", unarmed)
+    confirmation = _visual_input_observation(6, "search-confirmed", unarmed)
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _visual_type_decision(1, "Alpha"),
+            _visual_enter_decision(3),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_enter),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver(
+        [initial, pre_type, after_type, pre_enter, after_enter, confirmation]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, search for Alpha")
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "type_text",
+    ]
+
+
+def test_visual_navigation_search_enter_cannot_complete_open_without_the_result() -> None:
+    text_armed = (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT)
+    enter_armed = (DesktopElementAction.CLICK, DesktopElementAction.PRESS_KEY)
+    results_only = (DesktopElementAction.CLICK,)
+    initial = _visual_input_observation(1, "navigation-focus", text_armed)
+    pre_type = _visual_input_observation(2, "navigation-focus", text_armed)
+    after_type = _visual_input_observation(3, "navigation-query", enter_armed)
+    pre_enter = _visual_input_observation(4, "navigation-query", enter_armed)
+    after_enter = _visual_input_observation(5, "search-results-only", results_only)
+    confirmation = _visual_input_observation(
+        6,
+        "search-results-only-confirmed",
+        results_only,
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _visual_type_decision(1, "Alpha"),
+            _visual_enter_decision(3),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_enter),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver(
+        [initial, pre_type, after_type, pre_enter, after_enter, confirmation]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, open Alpha")
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "type_text",
+    ]
+
+
+def test_semantic_search_query_can_bridge_to_the_exact_current_open_target() -> None:
+    def observation(
+        generation: int,
+        *,
+        query: str,
+        include_result: bool,
+        selected: bool = False,
+    ) -> DesktopObservation:
+        search = DesktopElement(
+            "0",
+            "Search",
+            "Edit",
+            value=query,
+            focused=True,
+            editable=True,
+            enabled=True,
+            addressable=True,
+            automation_id="SearchBox",
+            supported_actions=(DesktopElementAction.TYPE_TEXT,),
+        )
+        elements = [search]
+        if include_result:
+            elements.append(
+                DesktopElement(
+                    "1",
+                    "Alpha",
+                    "Button",
+                    selected=selected,
+                    enabled=True,
+                    addressable=True,
+                    supported_actions=(DesktopElementAction.CLICK,),
+                )
+            )
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=(
+                f'0 name="Search" control_type="Edit" focused=true value="{query}"'
+                + (
+                    f'\n1 name="Alpha" control_type="Button" selected={str(selected).lower()}'
+                    if include_result
+                    else ""
+                )
+            ),
+            window_title="Claude",
+            elements=tuple(elements),
+            local_window_id="window-a",
+        )
+
+    type_query = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "filter the local result list with the exact current target",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.TYPE_TEXT,
+            app="claude",
+            generation=1,
+            element_index="0",
+            text="Alpha",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            "Alpha",
+        ),
+    )
+    click_result = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "open the exact semantic result",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=3,
+            element_index="1",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            "Alpha",
+        ),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            type_query,
+            click_result,
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            observation(1, query="", include_result=False),
+            observation(2, query="", include_result=False),
+            observation(3, query="Alpha", include_result=True),
+            observation(4, query="Alpha", include_result=True),
+            observation(5, query="Alpha", include_result=True, selected=True),
+            observation(6, query="Alpha", include_result=True, selected=True),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, open Alpha")
+
+    assert result.success is True
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "type_text",
+        "click",
+    ]
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "In Claude, open Alpha, but do not type Alpha",
+        "In Claude, search Alpha, but do not type Alpha",
+        "在 Claude 打开 Alpha，但不要输入 Alpha",
+    ],
+)
+def test_semantic_search_bridge_never_types_an_explicitly_negated_payload(
+    task: str,
+) -> None:
+    search = DesktopElement(
+        "0",
+        "Search",
+        "Edit",
+        value="",
+        focused=True,
+        editable=True,
+        enabled=True,
+        addressable=True,
+        automation_id="SearchBox",
+        supported_actions=(DesktopElementAction.TYPE_TEXT,),
+    )
+    initial = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text=(
+            '0 name="Search" control_type="Edit" focused=true value=""'
+        ),
+        window_title="Claude",
+        elements=(search,),
+        local_window_id="window-a",
+    )
+    type_query = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "a negated payload must not become an inferred search bridge",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.TYPE_TEXT,
+            app="claude",
+            generation=1,
+            element_index="0",
+            text="Alpha",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            "Alpha",
+        ),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([_observe_decision(), type_query]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_mixed_search_then_draft_blocks_the_first_viewport_enter_before_dispatch() -> None:
+    click_only = (DesktopElementAction.CLICK,)
+    text_armed = (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT)
+    enter_armed = (DesktopElementAction.CLICK, DesktopElementAction.PRESS_KEY)
+    observations = [
+        _visual_input_observation(1, "initial", click_only),
+        _visual_input_observation(2, "initial", click_only),
+        _visual_input_observation(3, "search-focus", text_armed),
+        _visual_input_observation(4, "search-focus", text_armed),
+        _visual_input_observation(5, "search-typed", enter_armed),
+        _visual_input_observation(6, "search-typed", enter_armed),
+        _visual_input_observation(7, "search-result", click_only),
+        _visual_input_observation(8, "search-result", click_only),
+        _visual_input_observation(9, "draft-focus", text_armed),
+        _visual_input_observation(10, "draft-focus", text_armed),
+        # Even if a malicious or stale driver advertises Enter later, the
+        # controller must reject the first viewport Enter before reaching it.
+        _visual_input_observation(11, "draft-typed", enter_armed),
+    ]
+    decisions = [
+        _observe_decision(),
+        _loop_visual_click_decision(1, 20, 20),
+        _visual_type_decision(3, "Alpha"),
+        _visual_enter_decision(5),
+        _loop_visual_click_decision(7, 20, 20),
+        _visual_type_decision(9, "hello"),
+        _visual_enter_decision(11),
+    ]
+    driver = FakeDriver(observations)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(decisions),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run('In Claude, search for Alpha, then type "hello" into Message')
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "click",
+        "type_text",
+    ]
 
 
 def test_task_specific_semantic_click_can_finish_with_visual_review():
@@ -1664,13 +2620,17 @@ def test_visual_click_can_upgrade_transition_proof_to_fresh_structured_terminal_
         )
 
     def terminal_observation(generation: int, marker: bytes) -> DesktopObservation:
+        selected_target = DesktopElement("0", "Target", "Button", selected=True)
         return DesktopObservation(
             app="claude",
             generation=generation,
-            accessibility_text='0 name="Target" control_type="Text"',
+            accessibility_text=(
+                '0 name="Target" control_type="Button" selected=true\n'
+                '2 name="Visual screenshot viewport" control_type="VisualViewport"'
+            ),
             screenshot_png=marker,
             window_title="Target",
-            elements=(DesktopElement("0", "Target", "Text", addressable=False),),
+            elements=(selected_target, viewport),
             local_window_id="window-a",
         )
 
@@ -1688,19 +2648,28 @@ def test_visual_click_can_upgrade_transition_proof_to_fresh_structured_terminal_
         ),
         expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
     )
+    after = terminal_observation(3, b"after-rendered-target")
+    confirmation = terminal_observation(4, b"fresh-terminal-target")
     planner = SequencePlanner(
         [
             _observe_decision(),
             action,
-            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Target"),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
         ]
     )
     driver = FakeDriver(
         [
             before_observation(1),
             before_observation(2),
-            terminal_observation(3, b"after-rendered-target"),
-            terminal_observation(4, b"fresh-terminal-target"),
+            after,
+            confirmation,
         ]
     )
     controller = DesktopAgentLoopController(
@@ -1714,6 +2683,89 @@ def test_visual_click_can_upgrade_transition_proof_to_fresh_structured_terminal_
 
     assert result.success is True
     assert len([call for call in driver.calls if call[0] == "execute"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("task", "revealed_label"),
+    [
+        ("In Claude, open Target", "Target"),
+        ("In Claude, click Message to show Settings", "Settings"),
+    ],
+)
+def test_revealing_a_target_label_does_not_prove_that_the_target_was_opened(
+    task: str,
+    revealed_label: str,
+) -> None:
+    menu = DesktopElement(
+        "0",
+        "Menu",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def source(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="Menu" control_type="Button"',
+            window_title="Claude",
+            elements=(menu,),
+            local_window_id="window-a",
+        )
+
+    def revealed(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=(
+                f'0 name="{revealed_label}" control_type="Text"'
+            ),
+            window_title="Claude",
+            elements=(
+                DesktopElement("0", revealed_label, "Text", addressable=False),
+            ),
+            local_window_id="window-a",
+        )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "reveal the target label without opening it",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_PRESENT,
+            revealed_label,
+        ),
+    )
+    driver = FakeDriver([source(1), source(2), revealed(3), revealed(4)])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(
+            [
+                _observe_decision(),
+                action,
+                _done_decision(
+                    DesktopExpectationKind.TEXT_PRESENT,
+                    revealed_label,
+                ),
+            ]
+        ),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "USER_STEPS_INCOMPLETE"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
 
 
 def test_related_semantic_window_transition_replans_rendered_destination_before_done():
@@ -1901,6 +2953,640 @@ def test_related_result_disappearance_is_a_bridge_to_fresh_child_terminal_state(
     assert not driver.observations
 
 
+def test_same_window_navigation_bridge_cannot_replace_a_requested_text_step() -> None:
+    open_button = DesktopElement(
+        "0",
+        "Open",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    message_text = DesktopElement("0", "Message", "Text", addressable=False)
+
+    def source(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="Open" control_type="Button"',
+            window_title="Claude",
+            elements=(open_button,),
+            local_window_id="window-a",
+        )
+
+    def destination(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="Message" control_type="Text"',
+            window_title="Claude",
+            elements=(message_text,),
+            local_window_id="window-a",
+        )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "open a semantic affordance before the requested text field",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "Message"),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Message"),
+        ]
+    )
+    driver = FakeDriver([source(1), source(2), destination(3), destination(4)])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run('In Claude, type "hello" into Message')
+
+    assert result.success is False
+    assert result.error_code == "USER_STEPS_INCOMPLETE"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
+
+
+def test_related_window_navigation_bridge_cannot_replace_a_requested_text_step() -> None:
+    label = "Message 前往"
+    result_button = DesktopElement(
+        "7",
+        label,
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    message_text = DesktopElement("0", "Message", "Text", addressable=False)
+
+    def source(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=f'7 name="{label}" control_type="Button"',
+            window_title="Search",
+            elements=(result_button,),
+            local_window_id="window-a",
+        )
+
+    def destination(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="Message" control_type="Text"',
+            window_title="Claude",
+            elements=(message_text,),
+            local_window_id="window-b",
+        )
+
+    class RelatedWindowDriver(FakeDriver):
+        def execute(self, action, before, *, cancel_event=None):
+            self.calls.append(("execute", action.type.value, before.generation))
+            return ActionReceipt(
+                action,
+                True,
+                before.generation,
+                "accepted related transition",
+                after_local_window_id="window-b",
+            )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "open the semantic bridge, but do not treat it as text entry",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="7",
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.TEXT_ABSENT, label),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Message"),
+        ]
+    )
+    driver = RelatedWindowDriver(
+        [source(1), source(2), destination(3), destination(4)]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run('In Claude, type "hello" into Message')
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_related_window_destination_cannot_replace_an_authored_outcome() -> None:
+    label = "Message 前往"
+    result_button = DesktopElement(
+        "7",
+        label,
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    message_text = DesktopElement("0", "Message", "Text", addressable=False)
+
+    def source(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=f'7 name="{label}" control_type="Button"',
+            window_title="Search",
+            elements=(result_button,),
+            local_window_id="window-a",
+        )
+
+    def wrong_destination(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="Message" control_type="Text"',
+            window_title="Claude",
+            elements=(message_text,),
+            local_window_id="window-b",
+        )
+
+    class RelatedWindowDriver(FakeDriver):
+        def execute(self, action, before, *, cancel_event=None):
+            self.calls.append(("execute", action.type.value, before.generation))
+            return ActionReceipt(
+                action,
+                True,
+                before.generation,
+                "accepted related transition",
+                after_local_window_id="window-b",
+            )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "open the exact result",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="7",
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.TEXT_ABSENT, label),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Message"),
+        ]
+    )
+    driver = RelatedWindowDriver(
+        [source(1), source(2), wrong_destination(3), wrong_destination(4)]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Message to show Settings")
+
+    assert result.success is False
+    assert result.error_code == "USER_STEPS_INCOMPLETE"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
+
+
+def test_failed_related_outcome_cannot_advance_before_a_later_text_step() -> None:
+    open_button = DesktopElement(
+        "0",
+        "Open",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def source(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="Open" control_type="Button"',
+            window_title="Search",
+            elements=(open_button,),
+            local_window_id="window-a",
+        )
+
+    def composer(generation: int, value: str) -> DesktopObservation:
+        editor = DesktopElement(
+            "0",
+            "Message",
+            "Edit",
+            value=value,
+            focused=True,
+            editable=True,
+            supported_actions=(DesktopElementAction.TYPE_TEXT,),
+        )
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=(
+                f'0 name="Message" control_type="Edit" focused=true value="{value}"'
+            ),
+            window_title="Claude",
+            elements=(editor,),
+            local_window_id="window-b",
+        )
+
+    class RelatedWindowDriver(FakeDriver):
+        def execute(self, action, before, *, cancel_event=None):
+            self.calls.append(("execute", action.type.value, before.generation))
+            return ActionReceipt(
+                action,
+                True,
+                before.generation,
+                "accepted",
+                after_local_window_id=(
+                    "window-b" if action.type == DesktopActionType.CLICK else None
+                ),
+            )
+
+    click = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click the requested source target",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "Target"),
+    )
+    type_text = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "type the later exact payload",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.TYPE_TEXT,
+            app="claude",
+            generation=3,
+            element_index="0",
+            text="hello",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            "hello",
+        ),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            click,
+            type_text,
+            _done_decision(DesktopExpectationKind.FOCUSED_CONTAINS, "hello"),
+        ]
+    )
+    driver = RelatedWindowDriver(
+        [
+            source(1),
+            source(2),
+            composer(3, ""),
+            composer(4, ""),
+            composer(5, "hello"),
+            composer(6, "hello"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        'In Claude, click Open to show Target, then type "hello" into Message'
+    )
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
+
+
+def test_future_enter_step_cannot_dispatch_before_the_current_click_step() -> None:
+    open_button = DesktopElement(
+        "0",
+        "Open",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    confirm_button = DesktopElement(
+        "1",
+        "Confirm",
+        "Button",
+        enabled=True,
+        addressable=True,
+        focused=True,
+        supported_actions=(DesktopElementAction.PRESS_KEY,),
+    )
+    initial = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text=(
+            '0 name="Open" control_type="Button"\n'
+            '1 name="Confirm" control_type="Button" focused=true'
+        ),
+        window_title="Claude",
+        elements=(open_button, confirm_button),
+        local_window_id="window-a",
+    )
+    future_enter = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "incorrectly skip to the later key step",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.PRESS_KEY,
+            app="claude",
+            generation=1,
+            element_index="1",
+            key="enter",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            "Confirm",
+        ),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([_observe_decision(), future_enter]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Open, then press Enter on Confirm")
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_future_click_step_cannot_dispatch_before_the_current_click_step() -> None:
+    future_click = _selection_action("Beta", 1)
+    driver = FakeDriver([_selection_observation(1)])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([_observe_decision(), future_click]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Alpha, then click Beta")
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_decorated_future_click_label_cannot_bypass_step_order() -> None:
+    menu = DesktopElement(
+        "0",
+        "Menu button",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    initial = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text='0 name="Menu button" control_type="Button"',
+        window_title="Claude",
+        elements=(menu,),
+        local_window_id="window-a",
+    )
+    click_menu = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "incorrectly skip to the decorated later target",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            "Menu button",
+        ),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([_observe_decision(), click_menu]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Open, then click Menu")
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+@pytest.mark.parametrize(
+    ("task", "target_label", "expected_error"),
+    [
+        ("In Claude, do not click Menu", "Menu", "NO_POSITIVE_USER_ACTION"),
+        (
+            "In Claude, click Open, but do not click Menu",
+            "Menu",
+            "ACTION_NOT_BOUND_TO_TASK",
+        ),
+        (
+            "In Claude, click Open, but do not click Menu",
+            "Menu button",
+            "ACTION_NOT_BOUND_TO_TASK",
+        ),
+    ],
+)
+def test_generic_navigation_bridge_never_uses_a_negated_target(
+    task: str,
+    target_label: str,
+    expected_error: str,
+) -> None:
+    menu = DesktopElement(
+        "0",
+        target_label,
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    initial = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text=f'0 name="{target_label}" control_type="Button"',
+        window_title="Claude",
+        elements=(menu,),
+        local_window_id="window-a",
+    )
+    click_menu = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "an inferred bridge must not come from a negated clause",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            target_label,
+        ),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([_observe_decision(), click_menu]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == expected_error
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_direct_click_never_overrides_a_same_target_click_negation() -> None:
+    alpha = DesktopElement(
+        "0",
+        "Alpha",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    initial = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text='0 name="Alpha" control_type="Button"',
+        window_title="Claude",
+        elements=(alpha,),
+        local_window_id="window-a",
+    )
+    click_alpha = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "the positive open target cannot override a later click prohibition",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            "Alpha",
+        ),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([_observe_decision(), click_alpha]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        "In Claude, open Alpha, but do not click Alpha"
+    )
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_direct_text_step_never_overrides_a_same_payload_text_negation() -> None:
+    message = DesktopElement(
+        "0",
+        "Message",
+        "Edit",
+        value="",
+        focused=True,
+        editable=True,
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.TYPE_TEXT,),
+    )
+    initial = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text=(
+            '0 name="Message" control_type="Edit" focused=true value=""'
+        ),
+        window_title="Claude",
+        elements=(message,),
+        local_window_id="window-a",
+    )
+    type_alpha = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "the positive input cannot override a later payload prohibition",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.TYPE_TEXT,
+            app="claude",
+            generation=1,
+            element_index="0",
+            text="Alpha",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            "Alpha",
+        ),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner([_observe_decision(), type_alpha]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        "In Claude, type Alpha into Message, but do not type Alpha"
+    )
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
 def test_visual_reviews_cannot_complete_multiple_steps_without_an_action():
     viewport = DesktopElement(
         "2",
@@ -2026,10 +3712,8 @@ def test_one_visual_transition_cannot_complete_a_second_spoken_step():
     result = controller.run("In Claude, click Alpha, then click Beta")
 
     assert result.success is False
-    assert result.error_code == "INSTRUMENTAL_REVEAL_CANNOT_COMPLETE"
-    assert [call for call in driver.calls if call[0] == "execute"] == [
-        ("execute", "click", 2)
-    ]
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert not any(call[0] == "execute" for call in driver.calls)
 
 
 def test_private_visual_binding_alone_is_not_completion_evidence():
@@ -2243,6 +3927,18 @@ def test_local_unrestricted_cannot_finish_after_only_the_first_spoken_action():
 
 def test_local_unrestricted_done_uses_a_fresh_completion_observation():
     destination = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, "最终页面")
+
+    def terminal(generation: int, *, selected: bool) -> DesktopObservation:
+        target = DesktopElement("2", "最终页面", "Button", selected=selected)
+        return _observation(
+            generation,
+            (
+                '2 name="最终页面" control_type="Button" '
+                f"selected={str(selected).lower()}"
+            ),
+            elements=(target,),
+            local_window_id="window-a",
+        )
     planner = SequencePlanner(
         [
             _observe_decision(),
@@ -2258,15 +3954,32 @@ def test_local_unrestricted_done_uses_a_fresh_completion_observation():
                 ),
                 expectation=destination,
             ),
-            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "最终页面"),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "activate the exact revealed user target",
+                app="claude",
+                action=DesktopAction(
+                    DesktopActionType.CLICK,
+                    app="claude",
+                    generation=3,
+                    element_index="2",
+                ),
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.ELEMENT_SELECTED,
+                    "最终页面",
+                ),
+            ),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "最终页面"),
         ]
     )
     driver = FakeDriver(
         [
             _selection_observation(1),
             _selection_observation(2),
-            _selection_observation(3, marker="最终页面"),
-            _selection_observation(4),
+            terminal(3, selected=False),
+            terminal(4, selected=False),
+            terminal(5, selected=True),
+            terminal(6, selected=False),
         ]
     )
     controller = DesktopAgentLoopController(
@@ -2933,6 +4646,89 @@ def test_local_unrestricted_executes_stable_semantic_target_across_unrelated_ani
     assert [call for call in driver.calls if call[0] == "execute"] == [
         ("execute", "click", 2)
     ]
+
+
+def test_semantic_target_label_drift_replans_before_outcome_click_dispatch():
+    identity = "b" * 64
+
+    def observation(
+        generation: int,
+        target_name: str,
+        *,
+        settings_visible: bool = False,
+    ) -> DesktopObservation:
+        elements = [
+            DesktopElement(
+                "0",
+                target_name,
+                "Button",
+                enabled=True,
+                addressable=True,
+                local_identity=identity,
+                supported_actions=(DesktopElementAction.CLICK,),
+            )
+        ]
+        if settings_visible:
+            elements.append(DesktopElement("1", "Settings", "Text", addressable=False))
+        return _observation(
+            generation,
+            "\n".join(
+                f'{element.index} name="{element.name}" control_type="{element.control_type}"'
+                for element in elements
+            ),
+            elements=tuple(elements),
+            local_window_id="window-a",
+        )
+
+    outcome_action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click Alpha to reveal the authored outcome",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_PRESENT,
+            "Settings",
+        ),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            outcome_action,
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Settings"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            observation(1, "Alpha"),
+            # A virtualized UIA node reused the same local identity for Beta
+            # between planner frame A and dispatch frame B.
+            observation(2, "Beta"),
+            observation(3, "Beta", settings_visible=True),
+            observation(4, "Beta", settings_visible=True),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Alpha to show Settings")
+
+    assert result.success is False
+    assert result.error_code == "NO_VERIFIED_ACTIONS"
+    assert planner.calls[2][1] == 2
+    assert (
+        "refreshed changed UI in the same local window; previous action was not executed"
+        in planner.calls[2][2]
+    )
+    assert [call for call in driver.calls if call[0] == "execute"] == []
 
 
 def test_repeated_pre_action_changes_fail_as_unstable_without_executing():
@@ -4256,7 +6052,8 @@ def test_explicit_app_terminal_condition_cannot_finish_in_another_app():
     result = controller.run("在 Claude 打开 Chat")
 
     assert not result.success
-    assert result.error_code == "COMPLETION_EXPLICIT_WINDOW_MISMATCH"
+    assert result.error_code == "EXPLICIT_STEP_WINDOW_MISMATCH"
+    assert not any(call[0] == "observe" for call in driver.calls)
 
 
 def test_volatile_window_png_does_not_prevent_a_semantically_stable_action():
@@ -4467,3 +6264,843 @@ def test_chinese_cross_app_search_then_exact_field_input_completes_in_order():
         "press_key",
         "type_text",
     ]
+
+
+def _guard_button_observation(*labels: str) -> DesktopObservation:
+    elements = tuple(
+        DesktopElement(
+            str(index),
+            label,
+            "Button",
+            selected=False,
+            enabled=True,
+            addressable=True,
+            supported_actions=(DesktopElementAction.CLICK,),
+        )
+        for index, label in enumerate(labels)
+    )
+    return _dynamic_observation(
+        "claude",
+        1,
+        "Claude",
+        elements,
+        local_window_id="window-a",
+    )
+
+
+def _guard_button_click(label: str) -> DesktopDecision:
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        f"attempt to click {label}",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            label,
+        ),
+    )
+
+
+def test_current_claude_step_blocks_observing_a_future_chrome_step() -> None:
+    inventory = [
+        {
+            "app": "claude-id",
+            "display_name": "Claude",
+            "process_name": "claude.exe",
+        },
+        {
+            "app": "chrome-id",
+            "display_name": "Google Chrome",
+            "process_name": "chrome.exe",
+        },
+    ]
+    planner = SequencePlanner(
+        [
+            DesktopDecision(
+                DesktopDecisionKind.OBSERVE,
+                "incorrectly skip to the future browser step",
+                app="chrome-id",
+            )
+        ]
+    )
+    driver = InventoryDriver([], inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        "In Claude, click Alpha, then in Chrome click Beta"
+    )
+
+    assert result.success is False
+    assert result.error_code == "EXPLICIT_STEP_WINDOW_MISMATCH"
+    assert not any(call[0] == "observe" for call in driver.calls)
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_negated_chrome_is_removed_before_resuming_trusted_context() -> None:
+    inventory = [
+        {
+            "app": "claude-id",
+            "display_name": "Claude",
+            "process_name": "claude.exe",
+        },
+        {
+            "app": "chrome-id",
+            "display_name": "Google Chrome",
+            "process_name": "chrome.exe",
+        },
+    ]
+    planner = AppsRecordingPlanner(
+        [DesktopDecision(DesktopDecisionKind.FAIL, "no action needed for this guard")]
+    )
+    driver = InventoryDriver([], inventory)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+    controller._trusted_app_context = "chrome-id"
+    controller._trusted_window_id = "hwnd:chrome"
+
+    result = controller.run("click Alpha, but do not operate Chrome")
+
+    assert result.success is False
+    assert result.error_code == "PLANNER_NO_SAFE_STEP"
+    assert "chrome-id" not in planner.app_payloads[0]
+    assert controller._trusted_context() is None
+    assert not any(call[0] == "observe" for call in driver.calls)
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "do not click Alpha",
+        "不要点击 Alpha",
+    ],
+)
+def test_pure_negation_fails_before_any_observation(task: str) -> None:
+    planner = SequencePlanner([])
+    driver = FakeDriver([])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "NO_POSITIVE_USER_ACTION"
+    assert planner.calls == []
+    assert not any(call[0] == "observe" for call in driver.calls)
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_generic_bridge_is_blocked_when_every_other_mutation_is_negated() -> None:
+    initial = _guard_button_observation("Menu")
+    planner = SequencePlanner(
+        [_observe_decision(), _guard_button_click("Menu")]
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        "click Open, but do not scroll/expand/click anything else"
+    )
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude")
+    ]
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "In Claude, open Beta, but do not click Alpha",
+        "In Claude, click Alpha, then open Beta",
+    ],
+)
+def test_visual_point_click_requires_one_unnegated_current_target(task: str) -> None:
+    initial = _loop_visual_observation(1, "guarded-point")
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(
+            [_observe_decision(), _loop_visual_click_decision(1, 20, 30)]
+        ),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude")
+    ]
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+@pytest.mark.parametrize(
+    "extra_action_type",
+    [DesktopActionType.CLICK, DesktopActionType.SCROLL],
+)
+def test_extra_visual_mutation_is_blocked_after_all_spoken_steps(
+    extra_action_type: DesktopActionType,
+) -> None:
+    def observation(generation: int, *, selected: bool) -> DesktopObservation:
+        alpha = DesktopElement(
+            "0",
+            "Alpha",
+            "Button",
+            selected=selected,
+            enabled=True,
+            addressable=True,
+            supported_actions=(DesktopElementAction.CLICK,),
+        )
+        viewport = DesktopElement(
+            "2",
+            "Visual screenshot viewport",
+            "VisualViewport",
+            plane=ElementPlane.CONTROL,
+            visual_ocr=True,
+            supported_actions=(
+                DesktopElementAction.CLICK,
+                DesktopElementAction.SCROLL,
+            ),
+            scroll_axes=("vertical",),
+        )
+        return _dynamic_observation(
+            "claude",
+            generation,
+            "Claude",
+            (alpha, viewport),
+            local_window_id="window-a",
+            screenshot_png=f"completed:{generation}:{selected}".encode(),
+        )
+
+    if extra_action_type == DesktopActionType.CLICK:
+        extra_action = DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=3,
+            element_index="2",
+            x=20,
+            y=30,
+        )
+    else:
+        extra_action = DesktopAction(
+            DesktopActionType.SCROLL,
+            app="claude",
+            generation=3,
+            element_index="2",
+            direction="down",
+            pages=1.0,
+        )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            DesktopDecision(
+                DesktopDecisionKind.ACTION,
+                "attempt one extra visual mutation",
+                app="claude",
+                action=extra_action,
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.LAST_ACTION_VERIFIED
+                ),
+            ),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            observation(1, selected=False),
+            observation(2, selected=False),
+            observation(3, selected=True),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, select Alpha")
+
+    assert result.success is False
+    assert result.error_code == "ACTION_AFTER_USER_STEPS_COMPLETE"
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("task", "expected_error"),
+    [
+        ("if Alpha is visible, click Open", "CONDITIONAL_ACTION_UNSUPPORTED"),
+        ("click Open unless Alpha is visible", "CONDITIONAL_ACTION_UNSUPPORTED"),
+        ("the page says click Open", "REPORTED_ACTION_UNSUPPORTED"),
+        ("he said click Open", "REPORTED_ACTION_UNSUPPORTED"),
+        ("他说点击 Open", "REPORTED_ACTION_UNSUPPORTED"),
+        ("do not, click Open", "NEGATED_ACTION_UNSUPPORTED"),
+        ("do not; click Open", "NEGATED_ACTION_UNSUPPORTED"),
+        ("do not… click Open", "NEGATED_ACTION_UNSUPPORTED"),
+    ],
+)
+def test_unsupported_control_context_fails_before_driver_start(
+    task: str,
+    expected_error: str,
+) -> None:
+    router = _miss_router()
+    planner = SequencePlanner([])
+    driver = FakeDriver([])
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == expected_error
+    assert router.calls == []
+    assert planner.calls == []
+    assert driver.calls == []
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "Open Claude, after that click Chat",
+        "打开 Claude，之后点击 Chat",
+        "打开 Claude 并进入 Chat",
+        "打开 Claude 再进入 Chat",
+        "打开 Claude 接着进入 Chat",
+        "打开 Claude进入 Chat",
+    ],
+)
+def test_spoken_sequential_connectors_reach_desktop_routing(task: str) -> None:
+    router = _miss_router()
+    driver = FakeDriver([])
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=SequencePlanner([_observe_decision()]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.error_code != "CONDITIONAL_ACTION_UNSUPPORTED"
+    assert router.calls == [task]
+    assert ("start",) in driver.calls
+
+
+@pytest.mark.parametrize(
+    ("task", "expected_error", "expected_observes"),
+    [
+        ('In Claude, type "click Menu" into Message', "ACTION_NOT_BOUND_TO_TASK", 1),
+        ("In Claude, click Alpha next to Menu", "ACTION_NOT_BOUND_TO_TASK", 1),
+        ("In Claude, click Alpha to show Menu", "ACTION_NOT_BOUND_TO_TASK", 1),
+        ("In Claude, click Alpha except Menu", "ACTION_NOT_BOUND_TO_TASK", 1),
+        ("In Claude, click Alpha rather than Menu", "ACTION_NOT_BOUND_TO_TASK", 1),
+        (
+            "In Claude, click Alpha; later click Menu",
+            "UNPARSED_ACTION_UNSUPPORTED",
+            0,
+        ),
+        (
+            "In Claude, click Alpha, afterwards click Menu",
+            "UNPARSED_ACTION_UNSUPPORTED",
+            0,
+        ),
+    ],
+)
+def test_generic_bridge_rejects_non_authorizing_target_mentions(
+    task: str,
+    expected_error: str,
+    expected_observes: int,
+) -> None:
+    initial = _guard_button_observation("Menu")
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(
+            [_observe_decision(), _guard_button_click("Menu")]
+        ),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == expected_error
+    assert len([call for call in driver.calls if call[0] == "observe"]) == (
+        expected_observes
+    )
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def test_visual_type_with_authored_outcome_cannot_use_last_action_verified() -> None:
+    initial = _visual_input_observation(
+        1,
+        "outcome-guard",
+        (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(
+            [_observe_decision(), _visual_type_decision(1, "Alpha")]
+        ),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(
+        'In Claude, type "Alpha", which should show Results'
+    )
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude")
+    ]
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def _unmentioned_target_observation(
+    label: str,
+    action_type: DesktopActionType,
+) -> DesktopObservation:
+    if action_type == DesktopActionType.CLICK:
+        element = DesktopElement(
+            "0",
+            label,
+            "Button",
+            selected=False,
+            enabled=True,
+            addressable=True,
+            supported_actions=(DesktopElementAction.CLICK,),
+        )
+    elif action_type == DesktopActionType.PERFORM_SECONDARY_ACTION:
+        element = DesktopElement(
+            "0",
+            label,
+            "TreeItem",
+            enabled=True,
+            addressable=True,
+            supported_actions=(DesktopElementAction.EXPAND,),
+            expand_collapse_state="collapsed",
+        )
+    else:
+        assert action_type == DesktopActionType.SCROLL
+        element = DesktopElement(
+            "0",
+            label,
+            "ScrollBar",
+            enabled=True,
+            addressable=True,
+            supported_actions=(DesktopElementAction.SCROLL,),
+            scroll_axes=("vertical",),
+        )
+    return _dynamic_observation(
+        "claude",
+        1,
+        "Claude",
+        (element,),
+        local_window_id="window-a",
+    )
+
+
+def _unmentioned_mutation_decision(
+    label: str,
+    action_type: DesktopActionType,
+) -> DesktopDecision:
+    if action_type == DesktopActionType.CLICK:
+        action = DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        )
+        expectation = DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            label,
+        )
+    elif action_type == DesktopActionType.PERFORM_SECONDARY_ACTION:
+        action = DesktopAction(
+            DesktopActionType.PERFORM_SECONDARY_ACTION,
+            app="claude",
+            generation=1,
+            element_index="0",
+            action_name="expand",
+        )
+        expectation = DesktopExpectation(
+            DesktopExpectationKind.LAST_ACTION_VERIFIED
+        )
+    else:
+        assert action_type == DesktopActionType.SCROLL
+        action = DesktopAction(
+            DesktopActionType.SCROLL,
+            app="claude",
+            generation=1,
+            element_index="0",
+            direction="down",
+            pages=1.0,
+        )
+        expectation = DesktopExpectation(
+            DesktopExpectationKind.LAST_ACTION_VERIFIED
+        )
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        f"attempt an unmentioned {action_type.value} on {label}",
+        app="claude",
+        action=action,
+        expectation=expectation,
+    )
+
+
+@pytest.mark.parametrize(
+    ("task", "action_type", "label"),
+    [
+        (
+            "click Alpha; afterwards click it",
+            DesktopActionType.CLICK,
+            "Beta",
+        ),
+        (
+            "click Alpha; afterwards scroll down",
+            DesktopActionType.SCROLL,
+            "Results",
+        ),
+        (
+            "click Alpha; later expand it",
+            DesktopActionType.PERFORM_SECONDARY_ACTION,
+            "Beta",
+        ),
+    ],
+)
+def test_deferred_pronoun_clause_blocks_unmentioned_first_planner_action(
+    task: str,
+    action_type: DesktopActionType,
+    label: str,
+) -> None:
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _unmentioned_mutation_decision(label, action_type),
+        ]
+    )
+    driver = FakeDriver(
+        [_unmentioned_target_observation(label, action_type)]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "UNPARSED_ACTION_UNSUPPORTED"
+    assert planner.calls == []
+    assert driver.calls == []
+
+
+@pytest.mark.parametrize(
+    ("task", "action_type", "label"),
+    [
+        (
+            "click Alpha, but there is no need to click it",
+            DesktopActionType.CLICK,
+            "Beta",
+        ),
+        (
+            "click Alpha, but there is no need to click it",
+            DesktopActionType.PERFORM_SECONDARY_ACTION,
+            "Results",
+        ),
+        (
+            "点击 Alpha，但不必点击它",
+            DesktopActionType.CLICK,
+            "Results",
+        ),
+        (
+            "点击 Alpha，但不必滚动它",
+            DesktopActionType.SCROLL,
+            "Beta",
+        ),
+        (
+            "click Alpha, but skip clicking it",
+            DesktopActionType.CLICK,
+            "Results",
+        ),
+        (
+            "click Alpha, but skip clicking it",
+            DesktopActionType.PERFORM_SECONDARY_ACTION,
+            "Beta",
+        ),
+    ],
+)
+def test_pronoun_negation_blocks_unmentioned_planner_mutation(
+    task: str,
+    action_type: DesktopActionType,
+    label: str,
+) -> None:
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _unmentioned_mutation_decision(label, action_type),
+        ]
+    )
+    driver = FakeDriver(
+        [_unmentioned_target_observation(label, action_type)]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude")
+    ]
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+def _semantic_search_observation(
+    generation: int,
+    *,
+    value: str = "",
+) -> DesktopObservation:
+    search = DesktopElement(
+        "0",
+        "Search",
+        "Edit",
+        value=value,
+        value_observed=True,
+        focused=True,
+        editable=True,
+        enabled=True,
+        addressable=True,
+        automation_id="SearchBox",
+        supported_actions=(
+            DesktopElementAction.TYPE_TEXT,
+            DesktopElementAction.PRESS_KEY,
+        ),
+    )
+    return _dynamic_observation(
+        "claude",
+        generation,
+        "Claude",
+        (search,),
+        local_window_id="window-a",
+    )
+
+
+def _semantic_query_decision(
+    action_type: DesktopActionType,
+    *,
+    generation: int = 1,
+) -> DesktopDecision:
+    assert action_type in {
+        DesktopActionType.TYPE_TEXT,
+        DesktopActionType.SET_VALUE,
+    }
+    action = (
+        DesktopAction(
+            DesktopActionType.TYPE_TEXT,
+            app="claude",
+            generation=generation,
+            element_index="0",
+            text="Alpha",
+        )
+        if action_type == DesktopActionType.TYPE_TEXT
+        else DesktopAction(
+            DesktopActionType.SET_VALUE,
+            app="claude",
+            generation=generation,
+            element_index="0",
+            value="Alpha",
+        )
+    )
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "put the exact query in the semantic SearchBox",
+        app="claude",
+        action=action,
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            "Alpha",
+        ),
+    )
+
+
+def _semantic_search_enter_decision(generation: int = 3) -> DesktopDecision:
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "submit the exact semantic search query",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.PRESS_KEY,
+            app="claude",
+            generation=generation,
+            element_index="0",
+            key="enter",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.SEARCH_SUBMITTED,
+            "Alpha",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "search Alpha but do not submit",
+        "search Alpha but skip pressing Enter",
+        "search Alpha but do not hit Enter",
+        "search Alpha but avoid pressing Enter",
+    ],
+)
+def test_semantic_search_key_negation_allows_fill_but_blocks_enter(
+    task: str,
+) -> None:
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _semantic_query_decision(DesktopActionType.SET_VALUE),
+            _semantic_search_enter_decision(),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _semantic_search_observation(1),
+            _semantic_search_observation(2),
+            _semantic_search_observation(3, value="Alpha"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "set_value"
+    ]
+
+
+@pytest.mark.parametrize(
+    "action_type",
+    [DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE],
+)
+@pytest.mark.parametrize(
+    "task",
+    [
+        "search Alpha but don't type anything",
+        "search Alpha but do not enter it",
+        "search Alpha but leave field empty",
+        "open Alpha but do not search",
+        "打开 Alpha，但不要用搜索框",
+    ],
+)
+def test_semantic_search_mutation_negation_blocks_type_and_set_value(
+    task: str,
+    action_type: DesktopActionType,
+) -> None:
+    driver = FakeDriver([_semantic_search_observation(1)])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(
+            [_observe_decision(), _semantic_query_decision(action_type)]
+        ),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude")
+    ]
+    assert not any(call[0] == "execute" for call in driver.calls)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "search Alpha but don't type anything",
+        "search Alpha but do not enter it",
+        "search Alpha but leave field empty",
+        "open Alpha but do not search",
+        "打开 Alpha，但不要用搜索框",
+    ],
+)
+def test_rendered_search_mutation_negation_blocks_armed_viewport_type(
+    task: str,
+) -> None:
+    initial = _visual_input_observation(
+        1,
+        "negated-rendered-query",
+        (DesktopElementAction.CLICK, DesktopElementAction.TYPE_TEXT),
+    )
+    driver = FakeDriver([initial])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(
+            [_observe_decision(), _visual_type_decision(1, "Alpha")]
+        ),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(task)
+
+    assert result.success is False
+    assert result.error_code == "ACTION_NOT_BOUND_TO_TASK"
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", "claude")
+    ]
+    assert not any(call[0] == "execute" for call in driver.calls)
