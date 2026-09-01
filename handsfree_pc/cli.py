@@ -27,6 +27,7 @@ from .diagnostics import (
     tail_events,
 )
 from .downloads import download_models
+from .executables import resolve_executable
 from .feedback import FeedbackController
 from .intents import DeterministicIntentParser
 from .models import FeedbackMode, RuntimeState
@@ -147,7 +148,7 @@ def _check_command(
     *,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    executable = shutil.which(name)
+    executable = resolve_executable(name)
     result: dict[str, Any] = {"found": bool(executable), "path": executable}
     if executable and status_args:
         completed = subprocess.run(

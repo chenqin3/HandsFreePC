@@ -125,7 +125,7 @@ def test_codex_planner_invocation_disables_host_capabilities(monkeypatch) -> Non
         model=None,
     )
     captured: dict[str, object] = {}
-    monkeypatch.setattr(planner_module.shutil, "which", lambda _name: "planner.exe")
+    monkeypatch.setattr(planner_module, "resolve_executable", lambda _name: "planner.exe")
     monkeypatch.setattr(planner_module, "_sanitized_env", lambda: {"PATH": "safe-path"})
 
     def complete(args, **kwargs):
@@ -165,7 +165,7 @@ def test_claude_planner_invocation_uses_system_policy_and_json_only_stdin(monkey
         model=None,
     )
     captured: dict[str, object] = {}
-    monkeypatch.setattr(planner_module.shutil, "which", lambda _name: "planner.exe")
+    monkeypatch.setattr(planner_module, "resolve_executable", lambda _name: "planner.exe")
     monkeypatch.setattr(planner_module, "_sanitized_env", lambda: {"PATH": "safe-path"})
 
     def complete(args, **kwargs):
@@ -230,7 +230,7 @@ def test_planner_process_failures_are_wrapped(
         timeout_seconds=1,
         model=None,
     )
-    monkeypatch.setattr(planner_module.shutil, "which", lambda _name: "planner.exe")
+    monkeypatch.setattr(planner_module, "resolve_executable", lambda _name: "planner.exe")
 
     def fail(*_args, **kwargs):
         assert Path(kwargs["cwd"]).is_dir()

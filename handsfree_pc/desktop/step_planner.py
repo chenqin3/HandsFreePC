@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -12,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from ..executables import resolve_executable
 from .mcp_client import _stop_process_tree
 from .protocol import DesktopDecision, DesktopObservation, redact_credential_like_text
 
@@ -340,7 +340,7 @@ class _CliDesktopStepPlanner:
         self._popen_factory = popen_factory or subprocess.Popen
 
     def _resolve_executable(self) -> str:
-        executable = shutil.which(self.executable)
+        executable = resolve_executable(self.executable)
         if executable is None:
             raise DesktopPlannerUnavailable(f"planner executable was not found: {self.executable}")
         return executable

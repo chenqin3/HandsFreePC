@@ -320,6 +320,8 @@ computer_control:
 
 Claude 是默认 planner。Codex 与 Claude 登录互不替代。`codex -p` 是 profile；Codex 非交互入口是 `codex exec`。Claude 的 prompt 模式才是 `claude -p`。
 
+若从 Codex App 内置终端可以运行、但普通 PowerShell 的 `run.ps1` 报 `HandsFreePC is not ready to run (1)`，先查看 doctor JSON 中 `commands.codex_computer_control.found`。Codex Desktop 可能只把当前版本的 CLI 目录临时加入自身进程的 `PATH`，没有写入用户或系统 `PATH`。HandsFreePC 会先尊重正常 `PATH`；仅当配置仍使用裸 `codex`/`codex.exe` 且运行在 Windows 时，才从 `%LOCALAPPDATA%\OpenAI\Codex\bin` 自动选择最新的版本目录，doctor、桌面 step planner、旧 planner 和 legacy controller 共用同一解析器。显式路径或自定义命令名不会被替换。不要手工固定根目录的 `bin\codex.exe`：它可能落后于当前 Codex Desktop 版本。
+
 若明确要排查 Codex 备选，配置名必须是 `codex_cli_best_effort`，并单独同意主机读取边界：
 
 ```yaml

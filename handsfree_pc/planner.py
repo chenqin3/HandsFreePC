@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 from abc import ABC, abstractmethod
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import PlannerSettings
+from .executables import resolve_executable
 from .models import Plan
 
 
@@ -165,7 +165,7 @@ class CodexPlanner(Planner):
         self.settings = settings
 
     def plan(self, command: str, *, context: dict[str, Any] | None = None) -> Plan:
-        executable = shutil.which(self.settings.codex_executable)
+        executable = resolve_executable(self.settings.codex_executable)
         if executable is None:
             raise PlannerUnavailable(
                 f"Codex executable not found: {self.settings.codex_executable}"
@@ -241,7 +241,7 @@ class ClaudePlanner(Planner):
         self.settings = settings
 
     def plan(self, command: str, *, context: dict[str, Any] | None = None) -> Plan:
-        executable = shutil.which(self.settings.claude_executable)
+        executable = resolve_executable(self.settings.claude_executable)
         if executable is None:
             raise PlannerUnavailable(
                 f"Claude executable not found: {self.settings.claude_executable}"

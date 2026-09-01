@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -16,6 +15,8 @@ from pathlib import Path
 from typing import IO, Any, Protocol, runtime_checkable
 
 import psutil
+
+from .executables import resolve_executable
 
 _ENV_ALLOWLIST = {
     "APPDATA",
@@ -279,7 +280,7 @@ class CodexComputerController:
         return self._session_id
 
     def _resolve_executable(self) -> str | None:
-        return shutil.which(self.executable)
+        return resolve_executable(self.executable)
 
     def _command(self, executable: str, output_path: Path) -> list[str]:
         common = [

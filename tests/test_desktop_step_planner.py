@@ -120,7 +120,7 @@ def test_parser_enforces_planner_action_subset_even_without_cli_schema_validatio
 
 def test_codex_command_is_ephemeral_config_free_read_only_and_returns_one_step(monkeypatch):
     popen = RecordingPopen(_decision_payload())
-    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "codex-test.exe")
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "codex-test.exe")
     planner = CodexDesktopStepPlanner(
         executable="codex",
         model="test-model",
@@ -156,7 +156,7 @@ def test_codex_command_is_ephemeral_config_free_read_only_and_returns_one_step(m
 
 def test_codex_planner_receives_the_fresh_local_window_screenshot(monkeypatch):
     popen = RecordingPopen(_decision_payload())
-    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "codex-test.exe")
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "codex-test.exe")
     planner = CodexDesktopStepPlanner(
         executable="codex",
         model=None,
@@ -195,7 +195,7 @@ def test_local_unrestricted_policy_supports_unscoped_cross_app_search():
 
 def test_claude_command_explicitly_disables_all_tools_and_session_persistence(monkeypatch):
     popen = RecordingPopen(_decision_payload(), claude=True)
-    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "claude-test.exe")
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "claude-test.exe")
     planner = ClaudeDesktopStepPlanner(
         executable="claude",
         model=None,
@@ -240,7 +240,7 @@ def test_claude_command_explicitly_disables_all_tools_and_session_persistence(mo
 
 def test_claude_text_only_prompt_does_not_claim_a_local_screenshot_was_supplied(monkeypatch):
     popen = RecordingPopen(_decision_payload(), claude=True)
-    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "claude-test.exe")
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "claude-test.exe")
     planner = ClaudeDesktopStepPlanner(
         executable="claude",
         model=None,
@@ -269,7 +269,7 @@ def test_claude_text_only_prompt_does_not_claim_a_local_screenshot_was_supplied(
 
 def test_personal_trusted_planner_policy_allows_only_safe_navigation_bridges(monkeypatch):
     popen = RecordingPopen(_decision_payload(), claude=True)
-    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "claude-test.exe")
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "claude-test.exe")
     planner = ClaudeDesktopStepPlanner(
         executable="claude",
         model=None,
@@ -350,7 +350,7 @@ class NeverCompletesProcess:
 def test_cancel_event_stops_cli_planner_process(monkeypatch):
     stopped: list[NeverCompletesProcess] = []
     process = NeverCompletesProcess()
-    monkeypatch.setattr(step_planner.shutil, "which", lambda _value: "codex-test.exe")
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "codex-test.exe")
     monkeypatch.setattr(step_planner, "_stop_process_tree", stopped.append)
     planner = CodexDesktopStepPlanner(
         executable="codex",

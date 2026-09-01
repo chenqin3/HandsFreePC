@@ -105,7 +105,11 @@ class FakePopenFactory:
 
 @pytest.fixture
 def fake_executable(monkeypatch):
-    monkeypatch.setattr(computer_control.shutil, "which", lambda _value: "C:\\fake\\codex.exe")
+    monkeypatch.setattr(
+        computer_control,
+        "resolve_executable",
+        lambda _value: "C:\\fake\\codex.exe",
+    )
 
 
 def test_first_run_preserves_user_config_and_builds_safe_computer_use_prompt(
@@ -585,7 +589,7 @@ def test_close_returns_promptly_while_process_creation_is_blocked(fake_executabl
 
 
 def test_missing_executable_empty_input_and_close_are_bounded(monkeypatch, tmp_path):
-    monkeypatch.setattr(computer_control.shutil, "which", lambda _value: None)
+    monkeypatch.setattr(computer_control, "resolve_executable", lambda _value: None)
     controller = CodexComputerController(working_directory=tmp_path)
 
     assert controller.run(" ").success is False

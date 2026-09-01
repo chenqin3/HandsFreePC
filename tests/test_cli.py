@@ -198,6 +198,20 @@ def test_json_fallback_remains_valid_on_legacy_console(monkeypatch) -> None:
     assert parsed == {"device": "麦克风 👶"}
 
 
+def test_command_check_uses_shared_executable_resolver(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "resolve_executable",
+        lambda name: "C:/resolved/codex.exe" if name == "codex" else None,
+    )
+
+    assert cli._check_command("codex") == {
+        "found": True,
+        "path": "C:/resolved/codex.exe",
+    }
+    assert cli._check_command("missing") == {"found": False, "path": None}
+
+
 def test_doctor_never_claims_live_control_from_static_checks(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
     monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")

@@ -180,6 +180,8 @@ computer_control:
 ./scripts/run.ps1
 ```
 
+普通 PowerShell 不必额外继承 Codex App 的临时 `PATH`。当配置使用裸 `codex`/`codex.exe` 时，项目会在 Windows 上自动回退到 `%LOCALAPPDATA%\OpenAI\Codex\bin` 下最新的版本目录；doctor 与真实 planner 使用同一个解析结果。显式配置的路径或自定义命令名仍完全按原值解析。
+
 Claude CLI 是默认规划器，使用独立 system policy、safe/restricted 模式、空工具列表、严格 MCP 配置和非持久会话。它仍是联网 CLI，不是本地模型。
 
 若明确要用订阅版 Codex CLI，只能写 `planner_backend: codex_cli_best_effort`，并额外设置 `allow_codex_cli_host_read: true`。项目会尽量禁用已知工具并使用临时目录、结构化单步输出和 read-only sandbox，但 Codex CLI 没有可由本项目证明的完整 no-tools 模式；这个开关表示你接受它仍可能读取当前 Windows 账户可见的其他主机文件。两条路径都不获得 HandsFreePC 的桌面驱动。参考 [OpenAI Computer Use 自定义 harness 指南](https://developers.openai.com/api/docs/guides/tools-computer-use)、[Codex SDK](https://learn.chatgpt.com/docs/codex-sdk) 和 [Responses API tool choice](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)。
