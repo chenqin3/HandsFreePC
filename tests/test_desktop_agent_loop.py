@@ -9,10 +9,14 @@ from dataclasses import dataclass
 import pytest
 
 from handsfree_pc.desktop.agent_loop import (
+    _MAX_IDENTICAL_VISUAL_POINT_REGIONS,
+    _MAX_VISUAL_POINT_CLICKS,
     DesktopAgentLoopController,
     _explicit_step_window_scope,
     _explicitly_named_apps,
+    _TaskState,
     _unsupported_explicit_app_scopes,
+    _visual_point_click_signature,
 )
 from handsfree_pc.desktop.native_skills import (
     NativeRouteStatus,
@@ -26,9 +30,12 @@ from handsfree_pc.desktop.protocol import (
     DesktopDecision,
     DesktopDecisionKind,
     DesktopElement,
+    DesktopElementAction,
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
+    ElementPlane,
+    visual_state_binding_token,
 )
 from handsfree_pc.desktop.safety import DesktopSafetyPolicy, user_action_step_count
 from handsfree_pc.models import Action, ActionType, ExecutionResult, Plan, RiskLevel
@@ -107,6 +114,21 @@ class InventoryDriver(FakeDriver):
         return json.dumps(self.inventory, ensure_ascii=False)
 
 
+class AppObservationDriver(InventoryDriver):
+    def __init__(self, inventory, observations_by_app):
+        super().__init__([], inventory)
+        self.observations_by_app = {
+            app: list(observations) for app, observations in observations_by_app.items()
+        }
+
+    def observe(self, app, *, cancel_event=None):
+        self.calls.append(("observe", app))
+        value = self.observations_by_app[app].pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
 class ContextRecordingDriver(FakeDriver):
     def __init__(self, observations):
         super().__init__(observations)
@@ -133,6 +155,33 @@ class SequencePlanner:
         return self.decisions.pop(0)
 
 
+class AppsRecordingPlanner(SequencePlanner):
+    def __init__(self, decisions):
+        super().__init__(decisions)
+        self.app_payloads = []
+
+    def decide(self, task, *, apps, observation, history, cancel_event=None):
+        self.app_payloads.append(apps)
+        return super().decide(
+            task,
+            apps=apps,
+            observation=observation,
+            history=history,
+            cancel_event=cancel_event,
+        )
+
+
+class TextRecordingDriver(FakeDriver):
+    def __init__(self, observations):
+        super().__init__(observations)
+        self.text_payloads = []
+
+    def execute(self, action, before, *, cancel_event=None):
+        if action.type == DesktopActionType.TYPE_TEXT:
+            self.text_payloads.append(action.text)
+        return super().execute(action, before, cancel_event=cancel_event)
+
+
 def _miss_router():
     return FakeNativeRouter(NativeSkillResult(NativeRouteStatus.MISS, "miss"))
 
@@ -153,6 +202,100 @@ def _observation(
         elements=tuple(elements),
         local_window_id=local_window_id,
     )
+
+
+_COMPOSER_IDENTITY = "a" * 64
+
+
+def _app_observation(
+    app,
+    generation,
+    *,
+    elements,
+    local_window_id,
+    title=None,
+):
+    text = "\n".join(
+        f'{element.index} name="{element.name}" '
+        f'control_type="{element.control_type}" '
+        f'focused={str(bool(element.focused)).lower()} '
+        f'value="{element.value or ""}"'
+        for element in elements
+    )
+    return DesktopObservation(
+        app=app,
+        generation=generation,
+        accessibility_text=text,
+        window_title=title or app,
+        elements=tuple(elements),
+        local_window_id=local_window_id,
+    )
+
+
+def _composer_observation(
+    generation,
+    value="",
+    *,
+    app="claude",
+    focused=True,
+    composer=True,
+    local_window_id="window-a",
+    local_identity=_COMPOSER_IDENTITY,
+):
+    return _app_observation(
+        app,
+        generation,
+        elements=(
+            DesktopElement(
+                "0",
+                "Message",
+                "Edit",
+                value=value,
+                value_observed=True,
+                focused=focused,
+                enabled=True,
+                addressable=True,
+                composer=composer,
+                editable=True,
+                local_identity=local_identity,
+            ),
+        ),
+        local_window_id=local_window_id,
+        title="Claude" if app == "claude" else "Google Chrome",
+    )
+
+
+def _native_dictation_plan(app="claude"):
+    return Plan(
+        "enter local dictation",
+        [
+            Action(ActionType.ACTIVATE_APP, app=app),
+            Action(ActionType.ENTER_DICTATION, app=app),
+        ],
+    )
+
+
+def _native_bound_controller(observations, *, control_prefixes=("电脑操作",)):
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.SUCCEEDED,
+            "verified",
+            plan=_native_dictation_plan(),
+        )
+    )
+    driver = TextRecordingDriver(observations)
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+        control_prefixes=control_prefixes,
+    )
+    result = controller.run("打开 Claude 并开始语音输入")
+    assert result.success
+    assert controller._dictation_context() is not None
+    router.result = NativeSkillResult(NativeRouteStatus.MISS, "miss")
+    return controller, driver, router
 
 
 def _observe_decision():
@@ -221,6 +364,112 @@ def _selection_action(name, generation):
     )
 
 
+def _dynamic_window_entry(app, *, foreground=False):
+    return {
+        "app": app,
+        "display_name": "Claude",
+        "foreground": foreground,
+        "process_name": "claude.exe",
+        "visible_window_count": 1,
+        "window_title": "Claude",
+    }
+
+
+def _dynamic_selection_observation(app, generation, *, selected=()):
+    selected_names = frozenset(selected)
+    elements = tuple(
+        DesktopElement(index, name, "Button", selected=name in selected_names)
+        for index, name in (("0", "Alpha"), ("1", "Beta"))
+    )
+    return _app_observation(
+        app,
+        generation,
+        elements=elements,
+        local_window_id=f"window-{app}",
+    )
+
+
+def _dynamic_selection_action(app, name, generation):
+    index = "0" if name == "Alpha" else "1"
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        f"select {name}",
+        app=app,
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app=app,
+            generation=generation,
+            element_index=index,
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            text=name,
+        ),
+    )
+
+
+def _reveal_observation(
+    generation,
+    marker,
+    *,
+    target_visible=False,
+    target_selected=False,
+):
+    elements = [DesktopElement("0", "Conversation list", "ScrollBar")]
+    if target_visible:
+        elements.append(
+            DesktopElement("1", "Target", "Button", selected=target_selected)
+        )
+    elements.append(DesktopElement("9", marker, "Text", addressable=False))
+    return _observation(
+        generation,
+        "\n".join(
+            f'{element.index} name="{element.name}" '
+            f'control_type="{element.control_type}"'
+            for element in elements
+        ),
+        elements=tuple(elements),
+        local_window_id="window-a",
+    )
+
+
+def _scroll_reveal_decision(generation, *, direction="down"):
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "scroll once to reveal more of the current window",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.SCROLL,
+            app="claude",
+            generation=generation,
+            element_index="0",
+            direction=direction,
+            pages=1.0,
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.LAST_ACTION_VERIFIED,
+        ),
+    )
+
+
+def _target_click_decision(generation):
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click the now-visible target",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=generation,
+            element_index="1",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.ELEMENT_SELECTED,
+            text="Target",
+        ),
+    )
+
+
 def _run_verified_alpha_session(*, profile, later_observations=(), later_decisions=()):
     planner = SequencePlanner(
         [
@@ -247,6 +496,470 @@ def _run_verified_alpha_session(*, profile, later_observations=(), later_decisio
     first = controller.run("In Claude, select Alpha")
     assert first.success
     return controller, driver, planner
+
+
+def test_continuous_dictation_types_two_over_segments_exactly_into_same_composer():
+    controller, driver, router = _native_bound_controller(
+        [
+            _composer_observation(1, ""),
+            _composer_observation(2, ""),
+            _composer_observation(3, " 第一段原文 "),
+            _composer_observation(4, " 第一段原文 "),
+            _composer_observation(5, " 第一段原文 ，第二段也保留。"),
+        ]
+    )
+
+    first = controller.run(" 第一段原文 ")
+    second = controller.run("，第二段也保留。")
+
+    assert first.success
+    assert second.success
+    assert driver.text_payloads == [" 第一段原文 ", "，第二段也保留。"]
+    assert router.calls == ["打开 Claude 并开始语音输入"]
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == [
+        "type_text",
+        "type_text",
+    ]
+    assert controller._dictation_context() is not None
+
+
+def test_control_prefix_is_stripped_and_never_typed_as_dictation_payload():
+    controller, driver, router = _native_bound_controller(
+        [_composer_observation(1, "")]
+    )
+    router.result = NativeSkillResult(
+        NativeRouteStatus.SUCCEEDED,
+        "verified",
+        plan=Plan("local control", []),
+    )
+
+    result = controller.run("电脑操作，切换反馈模式")
+
+    assert result.success
+    assert router.calls[-1] == "切换反馈模式"
+    assert driver.text_payloads == []
+    assert controller._dictation_context() is None
+
+
+def test_direct_dictation_exit_clears_binding_without_typing_or_planning():
+    controller, driver, router = _native_bound_controller(
+        [_composer_observation(1, "")]
+    )
+    calls_before = tuple(driver.calls)
+
+    exited = controller.run("结束听写")
+
+    assert exited.success
+    assert controller._dictation_context() is None
+    assert tuple(driver.calls) == calls_before
+    assert router.calls == ["打开 Claude 并开始语音输入"]
+
+
+@pytest.mark.parametrize(
+    "changed_observation",
+    [
+        _composer_observation(2, "", focused=False),
+        _composer_observation(2, "", local_window_id="window-b"),
+        _composer_observation(2, "", local_identity="b" * 64),
+    ],
+    ids=("focus", "window", "identity"),
+)
+def test_dictation_focus_window_or_identity_change_fails_closed(changed_observation):
+    controller, driver, _router = _native_bound_controller(
+        [_composer_observation(1, ""), changed_observation]
+    )
+
+    result = controller.run("不得误输的文字")
+
+    assert not result.success
+    assert result.error_code == "DICTATION_BINDING_CHANGED"
+    assert driver.text_payloads == []
+    assert controller._dictation_context() is None
+
+
+def test_cancel_and_close_each_clear_continuous_dictation_binding():
+    controller, _driver, _router = _native_bound_controller(
+        [_composer_observation(1, "")]
+    )
+
+    assert controller.cancel()
+    assert controller._dictation_context() is None
+
+    second, driver, _router = _native_bound_controller(
+        [_composer_observation(1, "")]
+    )
+    second.close()
+    assert second._dictation_context() is None
+    assert driver.closed is True
+
+
+def test_focused_chrome_search_input_does_not_create_dictation_binding():
+    search_observation = _composer_observation(
+        1,
+        "OpenAI",
+        app="chrome",
+        composer=False,
+        local_window_id="chrome-window",
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.SUCCEEDED,
+            "verified",
+            plan=Plan(
+                "activate Chrome",
+                [Action(ActionType.ACTIVATE_APP, app="chrome")],
+            ),
+        )
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=TextRecordingDriver([search_observation]),
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开 Chrome 搜索 OpenAI")
+
+    assert result.success
+    assert controller._dictation_context() is None
+
+
+def test_standalone_start_dictation_binds_composer_from_previous_verified_window():
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.SUCCEEDED,
+            "verified",
+            plan=Plan(
+                "activate Claude",
+                [Action(ActionType.ACTIVATE_APP, app="claude")],
+            ),
+        )
+    )
+    driver = TextRecordingDriver(
+        [
+            _composer_observation(1, ""),
+            _composer_observation(2, ""),
+            _composer_observation(3, ""),
+            _composer_observation(4, "后续原文"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+    assert controller.run("打开 Claude").success
+    router.result = NativeSkillResult(NativeRouteStatus.MISS, "miss")
+
+    started = controller.run("开始听写")
+    dictated = controller.run("后续原文")
+
+    assert started.success
+    assert dictated.success
+    assert driver.text_payloads == ["后续原文"]
+    assert router.calls == ["打开 Claude"]
+
+
+def test_local_unrestricted_next_control_gets_previous_fresh_window_and_full_inventory():
+    router = FakeNativeRouter(
+        NativeSkillResult(
+            NativeRouteStatus.SUCCEEDED,
+            "verified",
+            plan=Plan(
+                "activate Claude",
+                [Action(ActionType.ACTIVATE_APP, app="claude")],
+            ),
+        )
+    )
+    inventory = [
+        {"app": "claude", "visible_window_count": 1},
+        {"app": "chrome", "visible_window_count": 1},
+    ]
+    driver = InventoryDriver(
+        [
+            _selection_observation(1),
+            _selection_observation(2),
+            _selection_observation(3),
+            _selection_observation(4, selected={"Beta"}),
+            _selection_observation(5, selected={"Beta"}),
+        ],
+        inventory,
+    )
+    planner = AppsRecordingPlanner(
+        [
+            _selection_action("Beta", 2),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Beta"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+    assert controller.run("open Claude").success
+    router.result = NativeSkillResult(NativeRouteStatus.MISS, "miss")
+
+    second = controller.run("select Beta")
+
+    assert second.success
+    assert planner.calls[0][1] == 2
+    assert any(
+        "fresh initial planner context" in item for item in planner.calls[0][2]
+    )
+    assert json.loads(planner.app_payloads[0]) == inventory
+
+
+def test_failed_native_app_workflow_falls_back_to_generic_uia_and_succeeds():
+    failed_plan = Plan(
+        "open Claude mode",
+        [
+            Action(ActionType.ACTIVATE_APP, app="claude"),
+            Action(ActionType.OPEN_MODE, app="claude", mode="chat"),
+        ],
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(NativeRouteStatus.FAILED, "ambiguous", plan=failed_plan)
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _selection_observation(1),
+            _selection_observation(2),
+            _selection_observation(3, selected={"Alpha"}),
+            _selection_observation(4, selected={"Alpha"}),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, select Alpha")
+
+    assert result.success
+    assert [call[1] for call in driver.calls if call[0] == "execute"] == ["click"]
+
+
+def test_failed_native_path_never_falls_back_to_generic_uia():
+    failed_plan = Plan(
+        "open path",
+        [Action(ActionType.OPEN_PATH, path=r"G:\deep\file.txt")],
+    )
+    router = FakeNativeRouter(
+        NativeSkillResult(NativeRouteStatus.FAILED, "failed", plan=failed_plan)
+    )
+    driver = FakeDriver([])
+    planner = SequencePlanner([])
+    controller = DesktopAgentLoopController(
+        native_router=router,
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run(r"打开 G:\deep\file.txt")
+
+    assert not result.success
+    assert result.error_code == "NATIVE_ROUTE_FAILED"
+    assert driver.calls == []
+    assert planner.calls == []
+
+
+def test_unrestricted_observe_quarantines_one_bad_dynamic_window_then_uses_another():
+    bad_app = "claude-1111111111111111"
+    good_app = "claude-2222222222222222"
+    inventory = [
+        _dynamic_window_entry(bad_app, foreground=True),
+        _dynamic_window_entry(good_app),
+    ]
+    planner = AppsRecordingPlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "first", app=bad_app),
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "second", app=good_app),
+            _dynamic_selection_action(good_app, "Alpha", 1),
+            DesktopDecision(
+                DesktopDecisionKind.DONE,
+                "verified",
+                app=good_app,
+                expectation=DesktopExpectation(
+                    DesktopExpectationKind.ELEMENT_SELECTED,
+                    "Alpha",
+                ),
+            ),
+        ]
+    )
+    driver = AppObservationDriver(
+        inventory,
+        {
+            bad_app: [RuntimeError("private attachment detail")],
+            good_app: [
+                _dynamic_selection_observation(good_app, 1),
+                _dynamic_selection_observation(good_app, 2),
+                _dynamic_selection_observation(good_app, 3, selected={"Alpha"}),
+                _dynamic_selection_observation(good_app, 4, selected={"Alpha"}),
+            ],
+        },
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("在 Claude 里选择 Alpha")
+
+    assert result.success
+    assert [call for call in driver.calls if call == ("observe", bad_app)] == [
+        ("observe", bad_app)
+    ]
+    assert bad_app in {item["app"] for item in json.loads(planner.app_payloads[0])}
+    assert bad_app not in {
+        item["app"] for item in json.loads(planner.app_payloads[1])
+    }
+    assert good_app in {
+        item["app"] for item in json.loads(planner.app_payloads[1])
+    }
+    second_history = " ".join(planner.calls[1][2])
+    assert "window candidate was unavailable" in second_history
+    assert bad_app not in second_history
+    assert "private attachment detail" not in second_history
+
+
+def test_unrestricted_observe_never_retries_a_quarantined_dynamic_window():
+    bad_app = "claude-3333333333333333"
+    other_app = "claude-4444444444444444"
+    planner = AppsRecordingPlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "first", app=bad_app),
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "repeat", app=bad_app),
+        ]
+    )
+    driver = AppObservationDriver(
+        [_dynamic_window_entry(bad_app), _dynamic_window_entry(other_app)],
+        {
+            bad_app: [RuntimeError("private first failure")],
+            other_app: [_dynamic_selection_observation(other_app, 1)],
+        },
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("在 Claude 里选择 Alpha")
+
+    assert not result.success
+    assert result.stage == "observe_driver"
+    assert result.error_code == "OBSERVE_DRIVER_FAILED"
+    assert [call for call in driver.calls if call == ("observe", bad_app)] == [
+        ("observe", bad_app)
+    ]
+    assert ("observe", other_app) not in driver.calls
+    assert bad_app not in " ".join(planner.calls[1][2])
+
+
+def test_unrestricted_observe_stops_after_three_distinct_bad_dynamic_windows():
+    apps = [f"claude-{digit * 16}" for digit in ("5", "6", "7")]
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "candidate", app=app)
+            for app in apps
+        ]
+    )
+    driver = AppObservationDriver(
+        [_dynamic_window_entry(app) for app in apps],
+        {app: [RuntimeError(f"private failure {index}")] for index, app in enumerate(apps)},
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("在 Claude 里选择 Alpha")
+
+    assert not result.success
+    assert result.stage == "observe_driver"
+    assert result.error_code == "OBSERVE_DRIVER_FAILED"
+    assert len(planner.calls) == 3
+    assert [call for call in driver.calls if call[0] == "observe"] == [
+        ("observe", app) for app in apps
+    ]
+
+
+def test_unrestricted_observe_failure_after_action_never_switches_windows():
+    good_app = "claude-8888888888888888"
+    bad_app = "claude-9999999999999999"
+    planner = SequencePlanner(
+        [
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "good", app=good_app),
+            _dynamic_selection_action(good_app, "Alpha", 1),
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "bad", app=bad_app),
+            DesktopDecision(DesktopDecisionKind.OBSERVE, "switch", app=good_app),
+        ]
+    )
+    driver = AppObservationDriver(
+        [_dynamic_window_entry(good_app), _dynamic_window_entry(bad_app)],
+        {
+            good_app: [
+                _dynamic_selection_observation(good_app, 1),
+                _dynamic_selection_observation(good_app, 2),
+                _dynamic_selection_observation(good_app, 3, selected={"Alpha"}),
+            ],
+            bad_app: [RuntimeError("private post-action attachment detail")],
+        },
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("在 Claude 里选择 Alpha")
+
+    assert not result.success
+    assert result.stage == "observe_driver"
+    assert result.error_code == "OBSERVE_DRIVER_FAILED"
+    assert len(planner.calls) == 3
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+    assert [call for call in driver.calls if call == ("observe", bad_app)] == [
+        ("observe", bad_app)
+    ]
+
+
+@pytest.mark.parametrize("spoken", ["ChatGPT", "chat gpt", "聊天GPT"])
+def test_chatgpt_spoken_alias_resolves_to_existing_codex_profile(spoken):
+    task = f"打开 {spoken}，然后点击 Projects"
+
+    assert _explicitly_named_apps(task, ("codex", "claude")) == frozenset(
+        {"codex"}
+    )
+
+
+@pytest.mark.parametrize("spoken", ["ChatGPT", "chat gpt", "聊天GPT"])
+def test_dedicated_chatgpt_profile_wins_over_codex_compatibility_alias(spoken):
+    task = f"打开 {spoken}，然后点击 Projects"
+
+    assert _explicitly_named_apps(task, ("codex", "chatgpt", "claude")) == frozenset(
+        {"chatgpt"}
+    )
 
 
 def test_local_unrestricted_never_requires_an_explicit_app_scope_for_visible_window():
@@ -334,6 +1047,1073 @@ def test_local_unrestricted_accepts_verified_intermediate_navigation_not_named_b
     assert "PLANNER_DECISION_ACTION" in codes
     assert "ACTION_DISPATCHED" in codes
     assert "ACTION_VERIFIED" in codes
+
+
+def test_local_unrestricted_reveals_target_with_two_scrolls_then_clicks_it():
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _scroll_reveal_decision(1),
+            _scroll_reveal_decision(3),
+            _target_click_decision(5),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Target"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _reveal_observation(1, "page-zero"),
+            _reveal_observation(2, "page-zero"),
+            _reveal_observation(3, "page-one"),
+            _reveal_observation(4, "page-one"),
+            _reveal_observation(5, "page-two", target_visible=True),
+            _reveal_observation(6, "page-two", target_visible=True),
+            _reveal_observation(
+                7,
+                "target-selected",
+                target_visible=True,
+                target_selected=True,
+            ),
+            _reveal_observation(
+                8,
+                "target-selected",
+                target_visible=True,
+                target_selected=True,
+            ),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Target")
+
+    assert result.success is True
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "scroll", 2),
+        ("execute", "scroll", 4),
+        ("execute", "click", 6),
+    ]
+    assert any(
+        "did not complete a user step" in item for item in planner.calls[2][2]
+    )
+    assert any(
+        "did not complete a user step" in item for item in planner.calls[3][2]
+    )
+
+
+def test_local_unrestricted_stops_a_reveal_scroll_that_makes_no_progress():
+    planner = SequencePlanner([_observe_decision(), _scroll_reveal_decision(1)])
+    driver = FakeDriver(
+        [
+            _reveal_observation(1, "same-page"),
+            _reveal_observation(2, "same-page"),
+            _reveal_observation(3, "same-page"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Target")
+
+    assert result.success is False
+    assert result.error_code == "INSTRUMENTAL_REVEAL_NO_PROGRESS"
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "scroll", 2)
+    ]
+
+
+def test_local_unrestricted_stops_a_reveal_fingerprint_toggle_loop():
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _scroll_reveal_decision(1),
+            _scroll_reveal_decision(3),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            _reveal_observation(1, "page-a"),
+            _reveal_observation(2, "page-a"),
+            _reveal_observation(3, "page-b"),
+            _reveal_observation(4, "page-b"),
+            _reveal_observation(5, "page-a"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Target")
+
+    assert result.success is False
+    assert result.error_code == "INSTRUMENTAL_REVEAL_LOOP_DETECTED"
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "scroll", 2),
+        ("execute", "scroll", 4),
+    ]
+
+
+def test_local_unrestricted_bounds_repeating_the_same_reveal_action():
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            *[
+                _scroll_reveal_decision(1 + index * 2)
+                for index in range(5)
+            ],
+        ]
+    )
+    observations = [_reveal_observation(1, "page-0")]
+    for index in range(4):
+        observations.extend(
+            [
+                _reveal_observation(2 + index * 2, f"page-{index}"),
+                _reveal_observation(3 + index * 2, f"page-{index + 1}"),
+            ]
+        )
+    observations.append(_reveal_observation(10, "page-4"))
+    driver = FakeDriver(observations)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Target")
+
+    assert result.success is False
+    assert result.error_code == "INSTRUMENTAL_REVEAL_REPEAT_LIMIT_REACHED"
+    assert len([call for call in driver.calls if call[0] == "execute"]) == 4
+
+
+def test_local_unrestricted_bounds_total_reveal_actions_across_signatures():
+    directions = ("down", "up", "left", "right") * 3
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            *[
+                _scroll_reveal_decision(
+                    1 + index * 2,
+                    direction=directions[index],
+                )
+                for index in range(9)
+            ],
+        ]
+    )
+    observations = [_reveal_observation(1, "page-0")]
+    for index in range(8):
+        observations.extend(
+            [
+                _reveal_observation(2 + index * 2, f"page-{index}"),
+                _reveal_observation(3 + index * 2, f"page-{index + 1}"),
+            ]
+        )
+    observations.append(_reveal_observation(18, "page-8"))
+    driver = FakeDriver(observations)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Target")
+
+    assert result.success is False
+    assert result.error_code == "INSTRUMENTAL_REVEAL_LIMIT_REACHED"
+    assert len([call for call in driver.calls if call[0] == "execute"]) == 8
+
+
+def test_last_action_verified_cannot_be_used_as_done_condition():
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _done_decision(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=FakeDriver([_reveal_observation(1, "page-zero")]),
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Target")
+
+    assert result.success is False
+    assert result.error_code == "INSTRUMENTAL_REVEAL_CANNOT_COMPLETE"
+    assert not any(call[0] == "execute" for call in controller.driver.calls)
+
+
+def _loop_visual_observation(
+    generation,
+    marker,
+    *,
+    app="claude",
+    local_window_id="window-a",
+):
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    return DesktopObservation(
+        app=app,
+        generation=generation,
+        accessibility_text=(
+            '2 name="Visual screenshot viewport" '
+            f'control_type="VisualViewport" visual-frame={marker}'
+        ),
+        screenshot_png=b"visual-loop:" + marker.encode(),
+        window_title=app,
+        elements=(viewport,),
+        local_window_id=local_window_id,
+    )
+
+
+def _loop_visual_click_decision(generation, x, y, *, app="claude"):
+    return DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click one frame-bound rendered point",
+        app=app,
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app=app,
+            generation=generation,
+            element_index="2",
+            x=x,
+            y=y,
+            click_count=1,
+            mouse_button="left",
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+
+def _run_visual_click_limit(coordinates):
+    successful_clicks = len(coordinates) - 1
+    decisions = [_observe_decision()]
+    decisions.extend(
+        _loop_visual_click_decision(1 + index * 2, x, y)
+        for index, (x, y) in enumerate(coordinates)
+    )
+    observations = [_loop_visual_observation(1, "frame-0")]
+    for index in range(successful_clicks):
+        observations.extend(
+            (
+                _loop_visual_observation(2 + index * 2, f"frame-{index}"),
+                _loop_visual_observation(3 + index * 2, f"frame-{index + 1}"),
+            )
+        )
+    observations.append(
+        _loop_visual_observation(
+            2 + successful_clicks * 2,
+            f"frame-{successful_clicks}",
+        )
+    )
+    driver = FakeDriver(observations)
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=SequencePlanner(decisions),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+        max_steps=len(decisions) + 1,
+    )
+    result = controller.run("In Claude, open the rendered Target conversation")
+    return result, driver
+
+
+def test_visual_point_click_stops_after_repeating_one_64px_region_limit():
+    coordinates = [
+        (65 + offset, 65 + offset)
+        for offset in range(_MAX_IDENTICAL_VISUAL_POINT_REGIONS + 1)
+    ]
+
+    result, driver = _run_visual_click_limit(coordinates)
+
+    assert result.success is False
+    assert result.error_code == "VISUAL_POINT_REGION_REPEAT_LIMIT_REACHED"
+    assert len([call for call in driver.calls if call[0] == "execute"]) == (
+        _MAX_IDENTICAL_VISUAL_POINT_REGIONS
+    )
+    assert not driver.observations
+
+
+def test_visual_point_click_stops_at_total_limit_across_distinct_regions():
+    coordinates = [
+        (32 + 64 * index, 32)
+        for index in range(_MAX_VISUAL_POINT_CLICKS + 1)
+    ]
+
+    result, driver = _run_visual_click_limit(coordinates)
+
+    assert result.success is False
+    assert result.error_code == "VISUAL_POINT_CLICK_LIMIT_REACHED"
+    assert len([call for call in driver.calls if call[0] == "execute"]) == (
+        _MAX_VISUAL_POINT_CLICKS
+    )
+    assert not driver.observations
+
+
+def _visual_click_task_state(observation):
+    return _TaskState(
+        task="In Claude, open the rendered Target conversation",
+        apps='[{"app":"claude","visible_window_count":1}]',
+        allowed_apps=frozenset({"claude"}),
+        observation=observation,
+        history=[],
+        last_verification=None,
+        last_action_expectation=None,
+        last_action=None,
+        last_action_target=None,
+        steps=1,
+        verified_action_count=0,
+        verified_user_step_count=0,
+        remaining_seconds=30.0,
+    )
+
+
+def test_visual_point_click_counts_only_after_successful_local_verification():
+    initial = _loop_visual_observation(1, "before")
+    decision = _loop_visual_click_decision(1, 20, 30)
+
+    failed_state = _visual_click_task_state(initial)
+    failed_driver = FakeDriver(
+        [
+            _loop_visual_observation(2, "before"),
+            _loop_visual_observation(3, "before"),
+        ]
+    )
+    failed_controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=failed_driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    failed = failed_controller._perform_action(
+        failed_state,
+        decision.action,
+        expectation=decision.expectation,
+        counts_as_user_step=False,
+        cancel_event=None,
+    )
+
+    assert failed is not None
+    assert failed.error_code == "ACTION_NOT_VERIFIED"
+    assert failed_state.visual_point_click_count == 0
+    assert failed_state.visual_point_region_counts == {}
+
+    successful_state = _visual_click_task_state(initial)
+    successful_driver = FakeDriver(
+        [
+            _loop_visual_observation(2, "before"),
+            _loop_visual_observation(3, "after"),
+        ]
+    )
+    successful_controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=successful_driver,
+        planner=SequencePlanner([]),
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    succeeded = successful_controller._perform_action(
+        successful_state,
+        decision.action,
+        expectation=decision.expectation,
+        counts_as_user_step=False,
+        cancel_event=None,
+    )
+
+    assert succeeded is None
+    assert successful_state.visual_point_click_count == 1
+    assert sum(successful_state.visual_point_region_counts.values()) == 1
+
+
+def test_visual_point_region_signature_separates_app_and_exact_window():
+    base_observation = _loop_visual_observation(1, "base")
+    same_region_action = _loop_visual_click_decision(1, 127, 127).action
+    base_action = _loop_visual_click_decision(1, 64, 64).action
+    same_signature = _visual_point_click_signature(base_action, base_observation)
+
+    assert same_signature == _visual_point_click_signature(
+        same_region_action,
+        base_observation,
+    )
+    assert same_signature != _visual_point_click_signature(
+        base_action,
+        _loop_visual_observation(
+            1,
+            "base",
+            local_window_id="window-b",
+        ),
+    )
+    assert same_signature != _visual_point_click_signature(
+        _loop_visual_click_decision(1, 64, 64, app="wechat").action,
+        _loop_visual_observation(
+            1,
+            "base",
+            app="wechat",
+            local_window_id="window-a",
+        ),
+    )
+
+
+def test_frame_bound_visual_click_replans_from_fresh_screenshot_and_can_complete():
+    def visual_observation(generation, marker):
+        viewport = DesktopElement(
+            "2",
+            "Visual screenshot viewport",
+            "VisualViewport",
+            plane=ElementPlane.CONTROL,
+            visual_ocr=True,
+            supported_actions=(DesktopElementAction.CLICK, DesktopElementAction.SCROLL),
+            scroll_axes=("vertical",),
+        )
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=(
+                '2 name="Visual screenshot viewport" '
+                f'control_type="VisualViewport" visual-frame={marker}'
+            ),
+            screenshot_png=b"\x89PNG\r\n\x1a\n" + marker.encode(),
+            window_title="Claude",
+            elements=(viewport,),
+            local_window_id="window-a",
+        )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click the rendered target in the exact frame",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="2",
+            x=20,
+            y=30,
+            click_count=1,
+            mouse_button="left",
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+    initial = visual_observation(1, "before")
+    pre_action = visual_observation(2, "before")
+    after_action = visual_observation(3, "after")
+    confirmation = visual_observation(4, "after-confirmation")
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_action),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver([initial, pre_action, after_action, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, open the rendered Target conversation")
+
+    assert result.success is True
+    assert len([call for call in driver.calls if call[0] == "execute"]) == 1
+    assert not driver.observations
+
+
+def test_task_specific_semantic_click_can_finish_with_visual_review():
+    button = DesktopElement(
+        "0",
+        "Open",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def observation(
+        generation: int,
+        screenshot: bytes,
+        *,
+        terminal: bool,
+    ) -> DesktopObservation:
+        elements = (
+            (viewport, DesktopElement("3", "Target", "Text", addressable=False))
+            if terminal
+            else (button, viewport)
+        )
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=(
+                '2 name="Visual screenshot viewport" control_type="VisualViewport"\n'
+                + (
+                    '3 name="Target" control_type="Text"'
+                    if terminal
+                    else '0 name="Open" control_type="Button"'
+                )
+            ),
+            screenshot_png=screenshot,
+            window_title="Claude",
+            elements=elements,
+            local_window_id="window-a",
+        )
+
+    initial = observation(1, b"before", terminal=False)
+    pre_action = observation(2, b"before", terminal=False)
+    after_action = observation(3, b"after", terminal=True)
+    confirmation = observation(4, b"after-confirmation", terminal=True)
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click the exact semantic control",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_PRESENT,
+            "Target",
+        ),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after_action),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver([initial, pre_action, after_action, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Open to show Target")
+
+    assert result.success is True
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
+def test_visual_click_can_upgrade_transition_proof_to_fresh_structured_terminal_state():
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def before_observation(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text="2 visual viewport",
+            screenshot_png=b"before-rendered-target",
+            window_title="Claude",
+            elements=(viewport,),
+            local_window_id="window-a",
+        )
+
+    def terminal_observation(generation: int, marker: bytes) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="Target" control_type="Text"',
+            screenshot_png=marker,
+            window_title="Target",
+            elements=(DesktopElement("0", "Target", "Text", addressable=False),),
+            local_window_id="window-a",
+        )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click the rendered target in the exact frame",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="2",
+            x=20,
+            y=30,
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Target"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            before_observation(1),
+            before_observation(2),
+            terminal_observation(3, b"after-rendered-target"),
+            terminal_observation(4, b"fresh-terminal-target"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开 Target")
+
+    assert result.success is True
+    assert len([call for call in driver.calls if call[0] == "execute"]) == 1
+
+
+def test_related_semantic_window_transition_replans_rendered_destination_before_done():
+    button = DesktopElement(
+        "0",
+        "前往",
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def source(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="前往" control_type="Button"',
+            screenshot_png=b"source-window",
+            window_title="Search",
+            elements=(button,),
+            local_window_id="window-a",
+        )
+
+    def destination(generation: int, marker: bytes) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text="2 visual viewport",
+            screenshot_png=marker,
+            window_title="Claude",
+            elements=(viewport,),
+            local_window_id="window-b",
+        )
+
+    after = destination(3, b"rendered-destination")
+    confirmation = destination(4, b"fresh-rendered-destination")
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "open the exact semantic result",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="0",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_PRESENT,
+            "文件传输助手",
+        ),
+    )
+
+    class RelatedWindowDriver(FakeDriver):
+        def execute(self, action, before, *, cancel_event=None):
+            self.calls.append(("execute", action.type.value, before.generation))
+            return ActionReceipt(
+                action,
+                True,
+                before.generation,
+                "accepted related transition",
+                after_local_window_id="window-b",
+            )
+
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(after),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = RelatedWindowDriver([source(1), source(2), after, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开文件传输助手")
+
+    assert result.success is True
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
+def test_related_result_disappearance_is_a_bridge_to_fresh_child_terminal_state():
+    label = "文件传输助手 在手机和电脑之间传输各类文件 前往"
+    result_button = DesktopElement(
+        "7",
+        label,
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def source(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=f'7 name="{label}" control_type="Button"',
+            window_title="Search",
+            elements=(result_button,),
+            local_window_id="window-a",
+        )
+
+    def destination(generation: int) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text='0 name="文件传输助手" control_type="Text"',
+            window_title="文件传输助手",
+            elements=(DesktopElement("0", "文件传输助手", "Text", addressable=False),),
+            local_window_id="window-b",
+        )
+
+    class RelatedWindowDriver(FakeDriver):
+        def execute(self, action, before, *, cancel_event=None):
+            self.calls.append(("execute", action.type.value, before.generation))
+            return ActionReceipt(
+                action,
+                True,
+                before.generation,
+                "accepted related transition",
+                after_local_window_id="window-b",
+            )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "open the unique exact result",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="7",
+        ),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_ABSENT,
+            label,
+        ),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(
+                DesktopExpectationKind.TEXT_PRESENT,
+                "文件传输助手",
+            ),
+        ]
+    )
+    driver = RelatedWindowDriver(
+        [source(1), source(2), destination(3), destination(4)]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开文件传输助手")
+
+    assert result.success is True
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+    assert not driver.observations
+
+
+def test_visual_reviews_cannot_complete_multiple_steps_without_an_action():
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    def visual_observation(generation: int, screenshot: bytes) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text="2 visual viewport",
+            screenshot_png=screenshot,
+            window_title="Claude",
+            elements=(viewport,),
+            local_window_id="window-a",
+        )
+
+    initial = visual_observation(1, b"already-at-rendered-target")
+    confirmation = visual_observation(2, b"fresh-confirmation-of-rendered-target")
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(initial),
+            ),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(confirmation),
+            ),
+        ]
+    )
+    driver = FakeDriver([initial, confirmation])
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Alpha, then click Beta")
+
+    assert result.success is False
+    assert result.error_code == "NO_VERIFIED_ACTIONS"
+    assert not any(call[0] == "execute" for call in driver.calls)
+    assert not driver.observations
+
+
+def test_one_visual_transition_cannot_complete_a_second_spoken_step():
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def observation(
+        generation: int,
+        marker: str,
+        *,
+        with_viewport: bool,
+    ) -> DesktopObservation:
+        elements = (
+            (viewport,)
+            if with_viewport
+            else (DesktopElement("0", "Intermediate", "Text", addressable=False),)
+        )
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text=(
+                '2 name="Visual screenshot viewport" control_type="VisualViewport" '
+                if with_viewport
+                else '0 name="Intermediate" control_type="Text" '
+            )
+            + marker,
+            screenshot_png=marker.encode(),
+            window_title="Claude",
+            elements=elements,
+            local_window_id="window-a",
+        )
+
+    action = DesktopDecision(
+        DesktopDecisionKind.ACTION,
+        "click one rendered point",
+        app="claude",
+        action=DesktopAction(
+            DesktopActionType.CLICK,
+            app="claude",
+            generation=1,
+            element_index="2",
+            x=20,
+            y=30,
+        ),
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            action,
+            _done_decision(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            observation(1, "before", with_viewport=True),
+            observation(2, "before", with_viewport=True),
+            observation(3, "changed", with_viewport=False),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, click Alpha, then click Beta")
+
+    assert result.success is False
+    assert result.error_code == "INSTRUMENTAL_REVEAL_CANNOT_COMPLETE"
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
+
+
+def test_private_visual_binding_alone_is_not_completion_evidence():
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+
+    def visual_observation(generation: int, screenshot: bytes) -> DesktopObservation:
+        return DesktopObservation(
+            app="claude",
+            generation=generation,
+            accessibility_text="2 visual viewport",
+            screenshot_png=screenshot,
+            window_title="Claude",
+            elements=(viewport,),
+            local_window_id="private-window-a",
+        )
+
+    initial = visual_observation(1, b"rendered-target")
+    confirmation = visual_observation(2, b"fresh-rendered-target")
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Target"),
+            _done_decision(DesktopExpectationKind.TEXT_PRESENT, "Target"),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=FakeDriver([initial, confirmation]),
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("打开 Target")
+
+    assert result.success is False
+    assert result.error_code == "NO_VERIFIED_ACTIONS"
+    assert planner.calls[1][1] == 1
+    assert planner.calls[2][1] == 2
+
+
+@pytest.mark.parametrize("profile", ["strict", "personal_trusted"])
+def test_visual_zero_action_completion_is_local_unrestricted_only(profile):
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+    )
+    observation = DesktopObservation(
+        app="claude",
+        generation=1,
+        accessibility_text="2 visual viewport",
+        screenshot_png=b"rendered-target",
+        elements=(viewport,),
+        local_window_id="window-a",
+    )
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _done_decision(
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+                visual_state_binding_token(observation),
+            ),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=FakeDriver([observation]),
+        planner=planner,
+        safety=DesktopSafetyPolicy(profile),
+    )
+
+    result = controller.run("In Claude, open the rendered Target conversation")
+
+    assert result.success is False
+    assert result.error_code == "NO_VERIFIED_ACTIONS"
 
 
 def test_local_unrestricted_refreshes_inventory_for_a_window_opened_mid_task():
@@ -1098,6 +2878,61 @@ def test_changed_same_window_is_refreshed_and_replanned_without_executing_stale_
         in planner.calls[2][2]
     )
     assert [call for call in driver.calls if call[0] == "execute"] == [("execute", "click", 3)]
+
+
+def test_local_unrestricted_executes_stable_semantic_target_across_unrelated_animation():
+    identity = "a" * 64
+
+    def animated_observation(generation: int, marker: str, *, selected: bool = False):
+        elements = (
+            DesktopElement(
+                "0",
+                "Alpha",
+                "Button",
+                selected=selected,
+                enabled=True,
+                addressable=True,
+                local_identity=identity,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+            DesktopElement("1", marker, "Text", addressable=False),
+        )
+        return _observation(
+            generation,
+            f'0 name="Alpha" control_type="Button" selected={str(selected).lower()}\n'
+            f'1 name="{marker}" control_type="Text"',
+            elements=elements,
+            local_window_id="window-a",
+        )
+
+    planner = SequencePlanner(
+        [
+            _observe_decision(),
+            _selection_action("Alpha", 1),
+            _done_decision(DesktopExpectationKind.ELEMENT_SELECTED, "Alpha"),
+        ]
+    )
+    driver = FakeDriver(
+        [
+            animated_observation(1, "animation-a"),
+            animated_observation(2, "animation-b"),
+            animated_observation(3, "animation-c", selected=True),
+            animated_observation(4, "animation-d", selected=True),
+        ]
+    )
+    controller = DesktopAgentLoopController(
+        native_router=_miss_router(),
+        driver=driver,
+        planner=planner,
+        safety=DesktopSafetyPolicy("local_unrestricted"),
+    )
+
+    result = controller.run("In Claude, select Alpha")
+
+    assert result.success is True
+    assert [call for call in driver.calls if call[0] == "execute"] == [
+        ("execute", "click", 2)
+    ]
 
 
 def test_repeated_pre_action_changes_fail_as_unstable_without_executing():
@@ -2059,6 +3894,31 @@ def test_explicit_scope_prefers_trusted_app_identity_over_spoofed_window_title()
         inventory=inventory,
         completed_steps=0,
     ) == (True, frozenset({"claude-id"}))
+
+
+def test_scope_scan_treats_backslashes_in_unrelated_window_title_as_literal_text():
+    inventory = json.dumps(
+        [
+            {
+                "app": "notes-id",
+                "display_name": "Notepad",
+                "process_name": "notepad.exe",
+                "window_title": r"C:\maps\notes.txt - Notepad",
+            },
+            {
+                "app": "chrome-id",
+                "display_name": "Google Chrome",
+                "process_name": "chrome.exe",
+                "window_title": "Google Chrome",
+            },
+        ]
+    )
+
+    assert _explicit_step_window_scope(
+        "切换到 Chrome，打开 Google",
+        inventory=inventory,
+        completed_steps=0,
+    ) == (True, frozenset({"chrome-id"}))
 
 
 def test_known_app_name_cannot_be_satisfied_only_by_an_untrusted_window_title():

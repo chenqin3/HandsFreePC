@@ -80,8 +80,8 @@ speech:
     device: auto
     compute_type: auto
     beam_size: 5
-    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
-    hotwords: "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
+    initial_prompt: "语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
+    hotwords: "Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
   fallback:
     backend: none
     model: large-v3-turbo
@@ -89,8 +89,8 @@ speech:
     compute_type: auto
     language: zh
     beam_size: 5
-    initial_prompt: "语音控制命令可能包含 Claude、Codex、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
-    hotwords: "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
+    initial_prompt: "语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
+    hotwords: "Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
 
 planner:
   # Legacy one-shot VoiceRuntime fallback only. Cloud output is locally restricted
@@ -148,6 +148,23 @@ computer_control:
   allow_experimental_driver: false
   allow_coordinate_actions: false
 
+# Optional exact-window visual fallback for apps whose accessibility tree exposes
+# no usable controls. The complete screenshot is the primary planner input.
+# PaddleOCR text regions are a separate, optional enhancement and never need to
+# be enabled for screenshot planning or frame-bound point clicks.
+visual_ocr:
+  enabled: false
+  ocr_regions_enabled: false
+  endpoint: http://127.0.0.1:8766/layout-parsing
+  allow_remote_screen_ocr: false
+  apps: [codex, wechat]
+  timeout_seconds: 60
+  max_image_bytes: 8388608
+  max_response_bytes: 2097152
+  max_items: 160
+  max_text_chars: 256
+  bbox_tolerance_pixels: 8
+
 # Optional read-only grounding over a local WorkMap export. Keep machine paths
 # and personal aliases in config.local.yaml; they are intentionally not public.
 workmap:
@@ -187,6 +204,7 @@ apps:
     process_names: ["ChatGPT.exe", "codex.exe"]
     executable: null
     title_patterns: ["ChatGPT", "Codex"]
+    activation_hotkey: null
     search_hotkey: null
     native_voice_hotkey: null
     voice_button_names: []
@@ -223,6 +241,7 @@ apps:
     process_names: ["claude.exe"]
     executable: null
     title_patterns: ["Claude"]
+    activation_hotkey: null
     search_hotkey: null
     native_voice_hotkey: null
     voice_button_names: []
@@ -259,6 +278,7 @@ apps:
     process_names: ["chrome.exe"]
     executable: null
     title_patterns: ["Chrome"]
+    activation_hotkey: null
     search_hotkey: null
     native_voice_hotkey: null
     voice_button_names: []
@@ -273,6 +293,7 @@ apps:
       - "ComboBox"
       - "CheckBox"
       - "RadioButton"
+      - "Hyperlink"
       - "Dialog"
       - "Window"
     content_control_types: ["Text", "Document", "Pane", "Group"]
@@ -285,6 +306,7 @@ apps:
     process_names: ["explorer.exe"]
     executable: null
     title_patterns: ["File Explorer", "资源管理器", "此电脑"]
+    activation_hotkey: null
     search_hotkey: null
     native_voice_hotkey: null
     voice_button_names: []
@@ -312,6 +334,8 @@ apps:
     process_names: ["Weixin.exe", "WeChat.exe"]
     executable: null
     title_patterns: ["微信", "WeChat"]
+    # WeChat's standard global shortcut restores a hidden/minimized main window.
+    activation_hotkey: "ctrl+alt+w"
     search_hotkey: null
     native_voice_hotkey: null
     voice_button_names: []

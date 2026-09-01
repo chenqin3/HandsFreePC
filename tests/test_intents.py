@@ -11,6 +11,29 @@ def test_parse_spoken_drive_path() -> None:
     assert plan.actions[0].path == "D:\\项目\\说明.txt"
 
 
+def test_parse_deep_spoken_path_and_spoken_extension() -> None:
+    parser = DeterministicIntentParser()
+    command = "打开G盘下面的年度资料文件夹下面的已处理数据文件夹里面的最终报告点txt"
+
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert plan.actions[0].path == "G:\\年度资料\\已处理数据\\最终报告.txt"
+    assert parser.covers_full_text(command, plan) is True
+
+
+@pytest.mark.parametrize("误识别", ["锯盘", "居盘", "句盘", "鸡盘", "据盘", "局盘"])
+def test_scoped_mandarin_asr_drive_aliases_resolve_to_g_drive(误识别: str) -> None:
+    parser = DeterministicIntentParser()
+    command = f"打开{误识别}下面的研究资料库文件夹"
+
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert plan.actions[0].path == "G:\\研究资料库"
+    assert parser.covers_full_text(command, plan) is True
+
+
 @pytest.mark.parametrize("alias", ["桌面", "文档", "下载"])
 def test_parse_nested_alias_path(alias: str) -> None:
     plan = DeterministicIntentParser().parse(f"打开{alias}上的项目文件夹里的说明.txt")
@@ -38,6 +61,25 @@ def test_parse_codex_project_conversation_and_dictation() -> None:
     ]
     assert plan.actions[1].project == "演示"
     assert plan.actions[1].conversation == "语音设计"
+
+
+@pytest.mark.parametrize("alias", ["ChatGPT", "chat gpt", "聊天GPT"])
+def test_chatgpt_voice_alias_uses_existing_codex_profile(alias: str) -> None:
+    parser = DeterministicIntentParser()
+    command = f"打开 {alias}"
+
+    plan = parser.parse(command)
+
+    assert plan is not None
+    assert [action.type for action in plan.actions] == [ActionType.ACTIVATE_APP]
+    assert plan.actions[0].app == "codex"
+    assert parser.covers_full_text(command, plan) is True
+
+
+def test_chatgpt_alias_is_scoped_to_an_app_request_not_dictated_content() -> None:
+    parser = DeterministicIntentParser()
+
+    assert parser.parse("输入 ChatGPT 到普通字段") is None
 
 
 def test_parse_claude_mode_and_dictation() -> None:

@@ -22,6 +22,7 @@ from handsfree_pc.windows import (
     UIAPostconditionError,
     WindowActivationError,
     WindowInfo,
+    WindowNotFoundError,
     WindowsExecutor,
     parse_hotkey,
 )
@@ -337,6 +338,125 @@ def test_activate_app_uses_configured_identity_and_verifies_foreground(settings)
     assert result.evidence["foreground_verified"] is True
     assert ("activate_window", 101) in native.calls
     assert ("assert_foreground", 101) in native.calls
+
+
+class InitiallyHiddenNative(FakeNative):
+    def __init__(self, *, restore_after_hotkey: bool) -> None:
+        super().__init__()
+        self.restore_after_hotkey = restore_after_hotkey
+        self.visible = False
+        self.foreground = 999
+
+    def find_windows(self, *, title_patterns, process_names):
+        self.calls.append(("find_windows", tuple(title_patterns), tuple(process_names)))
+        return [self.window] if self.visible else []
+
+    def wait_for_windows(self, *, title_patterns, process_names):
+        self.calls.append(("wait_for_windows", tuple(title_patterns), tuple(process_names)))
+        return self.find_windows(
+            title_patterns=title_patterns,
+            process_names=process_names,
+        )
+
+    def send_hotkey(self, specification):
+        self.calls.append(("send_hotkey", specification))
+        keys = parse_hotkey(specification)
+        if self.restore_after_hotkey:
+            self.visible = True
+        return keys
+
+
+def test_activate_app_restores_hidden_window_with_configured_global_hotkey(settings):
+    settings.apps["codex"].activation_hotkey = "ctrl+alt+w"
+    native = InitiallyHiddenNative(restore_after_hotkey=True)
+    executor = WindowsExecutor(settings, native=native, uia=FakeUIA())
+
+    result = executor.execute(Action(ActionType.ACTIVATE_APP, app="codex"))
+
+    assert result.success
+    assert result.evidence["activation_hotkey_attempted"] is True
+    assert result.evidence["activation_hotkey_restored"] is True
+    assert result.evidence["foreground_verified"] is True
+    assert ("send_hotkey", "ctrl+alt+w") in native.calls
+    assert ("activate_window", 101) in native.calls
+    assert native.calls.index(("send_hotkey", "ctrl+alt+w")) < native.calls.index(
+        ("activate_window", 101)
+    )
+
+
+def test_activate_app_fails_closed_when_hotkey_does_not_restore_window(settings):
+    settings.apps["codex"].activation_hotkey = "ctrl+alt+w"
+    native = InitiallyHiddenNative(restore_after_hotkey=False)
+    executor = WindowsExecutor(settings, native=native, uia=FakeUIA())
+
+    result = executor.execute(Action(ActionType.ACTIVATE_APP, app="codex"))
+
+    assert not result.success
+    assert result.evidence["error_type"] == WindowNotFoundError.__name__
+    assert ("send_hotkey", "ctrl+alt+w") in native.calls
+    assert "activate_window" not in {call[0] for call in native.calls}
+
+
+def test_activate_app_without_hotkey_keeps_existing_no_window_behavior(settings):
+    settings.apps["codex"].activation_hotkey = None
+    native = InitiallyHiddenNative(restore_after_hotkey=True)
+    executor = WindowsExecutor(settings, native=native, uia=FakeUIA())
+
+    result = executor.execute(Action(ActionType.ACTIVATE_APP, app="codex"))
+
+    assert not result.success
+    assert result.evidence["error_type"] == WindowNotFoundError.__name__
+    assert "send_hotkey" not in {call[0] for call in native.calls}
+    assert "wait_for_windows" not in {call[0] for call in native.calls}
+
+
+def test_activate_app_rejects_invalid_activation_hotkey_before_os_input(settings):
+    settings.apps["codex"].activation_hotkey = "ctrl+w;calc"
+    native = InitiallyHiddenNative(restore_after_hotkey=True)
+    executor = WindowsExecutor(settings, native=native, uia=FakeUIA())
+
+    result = executor.execute(Action(ActionType.ACTIVATE_APP, app="codex"))
+
+    assert not result.success
+    assert result.evidence["error_type"] == InvalidHotkeyError.__name__
+    assert "send_hotkey" not in {call[0] for call in native.calls}
+    assert "activate_window" not in {call[0] for call in native.calls}
+
+
+def test_activation_hotkey_failure_can_continue_to_executable_fallback(settings, tmp_path):
+    executable = tmp_path / "codex.exe"
+    executable.write_bytes(b"fixture")
+    settings.apps["codex"].activation_hotkey = "ctrl+alt+w"
+    settings.apps["codex"].executable = executable
+
+    class LaunchableHiddenNative(InitiallyHiddenNative):
+        def open_path(self, path):
+            result = super().open_path(path)
+            self.visible = True
+            return result
+
+    native = LaunchableHiddenNative(restore_after_hotkey=False)
+    executor = WindowsExecutor(settings, native=native, uia=FakeUIA())
+
+    result = executor.execute(Action(ActionType.ACTIVATE_APP, app="codex"))
+
+    assert result.success
+    assert result.evidence["activation_hotkey_attempted"] is True
+    assert result.evidence["activation_hotkey_restored"] is False
+    assert result.evidence["launched"] is True
+    assert ("open_path", str(executable)) in native.calls
+
+
+def test_dry_activation_reports_hotkey_attempt_without_exposing_shortcut(settings):
+    settings.execution.dry_run = True
+    executor = WindowsExecutor(settings)
+
+    result = executor.execute(Action(ActionType.ACTIVATE_APP, app="wechat"))
+
+    assert result.success
+    assert result.evidence["would_try_activation_hotkey_if_no_visible_window"] is True
+    assert "ctrl+alt+w" not in repr(result.evidence)
+    assert executor._native is None
 
 
 def test_activate_app_fails_closed_for_multiple_nonforeground_windows(settings):

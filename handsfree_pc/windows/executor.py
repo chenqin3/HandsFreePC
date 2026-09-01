@@ -186,6 +186,9 @@ class WindowsExecutor:
             "app": app,
             "title_patterns": list(profile.title_patterns),
             "process_names": list(profile.process_names),
+            "would_try_activation_hotkey_if_no_visible_window": bool(
+                profile.activation_hotkey
+            ),
             "would_launch": str(profile.executable) if profile.executable else None,
             "foreground_verified": False,
         }
@@ -197,6 +200,8 @@ class WindowsExecutor:
 
         profile = self._profile(normalized)
         if self.dry_run:
+            if profile.activation_hotkey:
+                parse_hotkey(profile.activation_hotkey)
             return None, self._dry_activation_evidence(normalized, profile)
 
         native = self._native_backend()
@@ -204,6 +209,20 @@ class WindowsExecutor:
             title_patterns=profile.title_patterns,
             process_names=profile.process_names,
         )
+        activation_hotkey_attempted = False
+        activation_hotkey_restored = False
+        if not windows and profile.activation_hotkey:
+            # Validate the entire allow-listed shortcut before emitting any OS
+            # input. The shortcut is global because there is no visible target
+            # window to bind input to yet.
+            parse_hotkey(profile.activation_hotkey)
+            native.send_hotkey(profile.activation_hotkey)
+            activation_hotkey_attempted = True
+            windows = native.wait_for_windows(
+                title_patterns=profile.title_patterns,
+                process_names=profile.process_names,
+            )
+            activation_hotkey_restored = bool(windows)
         launched = False
         if not windows and profile.executable is not None:
             executable = Path(profile.executable)
@@ -235,6 +254,8 @@ class WindowsExecutor:
             {
                 "app": normalized,
                 "launched": launched,
+                "activation_hotkey_attempted": activation_hotkey_attempted,
+                "activation_hotkey_restored": activation_hotkey_restored,
                 "foreground_verified": True,
                 "candidate_count": len(windows),
             }

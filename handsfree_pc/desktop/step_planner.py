@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -13,7 +14,14 @@ from typing import Any, Protocol, runtime_checkable
 
 from ..executables import resolve_executable
 from .mcp_client import _stop_process_tree
-from .protocol import DesktopDecision, DesktopObservation, redact_credential_like_text
+from .protocol import (
+    DesktopDecision,
+    DesktopElement,
+    DesktopElementAction,
+    DesktopObservation,
+    redact_credential_like_text,
+    visual_state_binding_token,
+)
 
 
 class DesktopPlannerError(RuntimeError):
@@ -26,6 +34,7 @@ class DesktopPlannerUnavailable(DesktopPlannerError):
 
 _SECRET_ENV_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
 _WINDOWS_PATH_RE = re.compile(r"(?i)(?<![\w])(?:[a-z]:[\\/]|\\\\|//)[^\s\"'<>|]+")
+_MAX_PLANNER_IMAGE_DIMENSION = 2048
 _ENV_ALLOWLIST = {
     "APPDATA",
     "COMSPEC",
@@ -70,7 +79,8 @@ Mandatory rules:
 - Never use coordinates, arbitrary commands, clipboard operations, scripts, or hidden shortcuts.
 - Element indexes are valid for the current observation only. Use no index from history.
 - Every action requires an element_index. For type_text and press_key it must be the one focused
-  element in the current observation.
+  element in the current observation, except for the single-use armed VisualViewport text-search
+  flow described below.
 - press_key may only be tab, shift+tab, enter, return, escape, space, pageup, pagedown, home, end,
   left, up, right, or down.
 - One action means one click, one semantic action, one text insertion, or one allow-listed key.
@@ -81,17 +91,64 @@ Mandatory rules:
 - An action postcondition may be text_present, text_absent, focused_contains, element_selected, or
   search_submitted. search_submitted is only for Enter/Return on a focused search/address input and
   its text must be the exact user-authored query already present in that input.
-  Never use app_visible or last_action_verified as an action postcondition, and never reuse a
-  condition that is already true before the action. A click/secondary action may not use
-  text_absent or focused_contains. Focus alone proves only that a click reached a control; it never
-  proves that the requested navigation completed. Use element_selected only when the observed
-  target exposes a non-null selected state. Text entry may prove the exact payload only when the
-  user did not state a separate outcome; when the task says the entry should make another result
-  appear, prove that authored result instead. Tab navigation must prove the requested focused
+  Never use app_visible as an action postcondition, and never reuse a condition that is already
+  true before the action. A click/secondary action may not use
+  text_absent or focused_contains. The sole text_absent exception is a unique structured result
+  Button whose exact full name contains the requested destination and ends in an explicit
+  transition affordance such as 前往 or Go to: click that Button and require its exact full name
+  to be absent, then inspect the fresh related application window. Its disappearance verifies only
+  the navigation bridge, never completion. Focus alone proves only that a click reached a control;
+  it never proves that the requested navigation completed. Use element_selected only when the
+  observed target exposes a non-null selected state. Text entry may prove the exact payload only
+  when the user did not state a separate outcome; when the task says the entry should make another
+  result appear, prove that authored result instead. Tab navigation must prove the requested focused
   target.
 - Do not mark done merely because an action API returned. Require a visible task-specific condition.
 - Preserve user-provided names and text exactly. Do not invent projects, files, conversations, tabs,
   or input payloads.
+- Treat each element's non-null supported_actions as its local UIA capability allow-list. Use
+  perform_secondary_action only when its exact action_name is listed. Use scroll only when
+  "scroll" is listed and the requested direction matches scroll_axes (vertical for up/down,
+  horizontal for left/right). Never infer expand, collapse, scrollintoview, or scroll support from
+  a control label, screenshot appearance, or control_type alone.
+- Prefer a unique enabled/addressable structured UIA control whose current name contains the exact
+  requested destination and whose supported_actions declares click/invoke/select. If such a
+  semantic target is present, use its element_index; do not guess the same target with a
+  VisualViewport coordinate. In particular, prefer a named Button over an unnamed container or a
+  screenshot point. On a rendered search-results helper window, prefer the unique result Button
+  ending in 前往 or Go to over similarly named search suggestions; use the exact full Button name
+  as the text_absent bridge postcondition described above.
+- A visual_ocr=true element is a local exact-window region, not a coordinate. The complete target
+  window screenshot contains a [element_index] set-of-marks overlay for these text regions. Select
+  it only by element_index and only for its declared supported_actions. Never invent an unmarked
+  non-text region or infer a credential field.
+- The sole exception to the coordinate prohibition above is the VisualViewport element. In
+  local-unrestricted visual mode,
+  you may click one visible benign point by setting its element_index plus integer
+  planner-image-local x/y (origin at the image top-left). Use the exact planner_image_dimensions
+  supplied in the
+  observation; the local parser maps that bounded point back to the exact captured-window pixels.
+  This remains bound to the exact HWND, rectangle,
+  generation, and unchanged click-point image patch before execution. Unrelated animated areas of
+  the same window may change. Never use x/y with any other element,
+  for text entry/authentication/payment/Send/Enter, or without a task-specific visible result.
+  For this frame-bound point click, use last_action_verified: the local driver will require an
+  unchanged pre-click target patch and a changed post-click frame, then you must inspect the fresh
+  screenshot before continuing or returning done. When the requested rendered state is visibly
+  true in the current screenshot, return done with a task-relevant visible expectation; the local
+  runtime will bind that decision to the exact screenshot you inspected.
+- A VisualViewport advertises type_text only for the one fresh observation immediately after a
+  verified point click in that same exact window. This capability means the local Win32 layer has
+  also proved a visible system caret near that exact click in the same foreground window. Do not
+  click that field again. When the requested destination is not already visible, the next action
+  must be type_text with the exact destination/search name copied as one contiguous span from
+  user_authored_task, with last_action_verified. Never use this exception for a message body,
+  prompt, authentication, personal/financial data, Send, or arbitrary prose.
+  After typing, inspect the fresh screenshot. A VisualViewport advertises press_key only when the
+  same native focus/caret remains in that top-of-window search field after exact text injection.
+  If no usable result is visible, press Enter/Return exactly once with last_action_verified; this
+  is a search transition, never a message Send. Inspect the fresh resulting window before clicking
+  the exact visible result or returning done.
 """
 
 _STRICT_NAVIGATION_POLICY = """
@@ -132,7 +189,16 @@ controls to decide the next atomic action. You may focus search/address fields, 
   search_submitted and the exact query as its postcondition. Never invent text to type. Continue
   until the user's requested
   observable result is true. An observe step may bring the selected application
-to the foreground; for a switch-only task, return done with app_visible after observing it.
+  to the foreground; for a switch-only task, return done with app_visible after observing it.
+  When a requested target is not currently visible, you may reveal more of the same authorized
+  window with scroll, or use perform_secondary_action with expand/scrollintoview on an enabled
+  semantic control, only when that exact operation is present in the target's supported_actions.
+  For those instrumental reveal actions, last_action_verified is allowed as the postcondition:
+  it proves a fresh local UI transition but does not complete a user step. After it succeeds,
+  observe again and continue searching. The only click/done exception is the exact-frame
+  VisualViewport flow described above. Never use last_action_verified for ordinary UIA/OCR clicks,
+  text entry, key presses, submission, or collapse outside that explicitly armed visual search
+  flow, and stop instead of cycling indefinitely.
 """
 
 
@@ -205,6 +271,23 @@ def _planner_data_prompt(
     )
     if observation_payload is not None and screenshot_available is not None:
         observation_payload["screenshot_available"] = screenshot_available
+    if (
+        observation_payload is not None
+        and screenshot_available is not False
+        and observation is not None
+        and observation.screenshot_png is not None
+    ):
+        dimensions = _planner_image_dimensions(observation.screenshot_png)
+        if dimensions is not None:
+            source_width, source_height, planner_width, planner_height = dimensions
+            observation_payload["captured_window_dimensions"] = {
+                "width": source_width,
+                "height": source_height,
+            }
+            observation_payload["planner_image_dimensions"] = {
+                "width": planner_width,
+                "height": planner_height,
+            }
     context = {
         "authorized_visible_apps": apps[:8000],
         "observation": observation_payload,
@@ -233,6 +316,104 @@ def _planner_prompt(
     return f"{_planner_policy(safety_profile)}\nUntrusted JSON data follows:\n{data}"
 
 
+def _planner_image_dimensions(
+    screenshot_png: bytes,
+) -> tuple[int, int, int, int] | None:
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(screenshot_png)) as image:
+            if image.format != "PNG":
+                return None
+            source_width, source_height = image.size
+    except Exception:
+        return None
+    if source_width < 1 or source_height < 1:
+        return None
+    scale = min(
+        1.0,
+        _MAX_PLANNER_IMAGE_DIMENSION / max(source_width, source_height),
+    )
+    planner_width = max(1, round(source_width * scale))
+    planner_height = max(1, round(source_height * scale))
+    return source_width, source_height, planner_width, planner_height
+
+
+def _planner_image_png(screenshot_png: bytes) -> bytes:
+    dimensions = _planner_image_dimensions(screenshot_png)
+    if dimensions is None:
+        return screenshot_png
+    source_width, source_height, planner_width, planner_height = dimensions
+    if (source_width, source_height) == (planner_width, planner_height):
+        return screenshot_png
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(screenshot_png)) as image:
+            resized = image.convert("RGB").resize(
+                (planner_width, planner_height),
+                Image.Resampling.LANCZOS,
+            )
+            stream = io.BytesIO()
+            resized.save(stream, format="PNG")
+            return stream.getvalue()
+    except Exception as exc:
+        raise DesktopPlannerError(
+            "desktop planner could not prepare the bounded window screenshot"
+        ) from exc
+
+
+def _planner_point_to_capture(
+    x: Any,
+    y: Any,
+    *,
+    observation: DesktopObservation | None,
+) -> tuple[Any, Any]:
+    if observation is None or observation.screenshot_png is None:
+        return x, y
+    dimensions = _planner_image_dimensions(observation.screenshot_png)
+    if dimensions is None:
+        return x, y
+    source_width, source_height, planner_width, planner_height = dimensions
+    if not all(isinstance(value, (int, float)) for value in (x, y)):
+        return x, y
+    if not (0 <= float(x) < planner_width and 0 <= float(y) < planner_height):
+        raise ValueError("visual point escapes the supplied planner image dimensions")
+    capture_x = min(source_width - 1, round(float(x) * source_width / planner_width))
+    capture_y = min(source_height - 1, round(float(y) * source_height / planner_height))
+    return capture_x, capture_y
+
+
+def _is_armed_visual_search_repeat_click(
+    raw_action: Mapping[str, Any],
+    *,
+    observation: DesktopObservation | None,
+    viewport: DesktopElement,
+) -> bool:
+    """Recognize only a fresh, frame-bound repeat click in the rendered search zone."""
+
+    if (
+        observation is None
+        or observation.screenshot_png is None
+        or raw_action.get("type") != "click"
+        or raw_action.get("element_index") != viewport.index
+        or raw_action.get("click_count") not in {None, 1}
+        or str(raw_action.get("mouse_button") or "left").strip().casefold()
+        != "left"
+    ):
+        return False
+    x = raw_action.get("x")
+    y = raw_action.get("y")
+    if not all(isinstance(value, (int, float)) for value in (x, y)):
+        return False
+    dimensions = _planner_image_dimensions(observation.screenshot_png)
+    if dimensions is None:
+        return False
+    _, source_height, _, _ = dimensions
+    _, capture_y = _planner_point_to_capture(x, y, observation=observation)
+    return bool(capture_y <= max(48, int(source_height * 0.30)))
+
+
 def _parse_decision_payload(
     payload: Any,
     *,
@@ -254,6 +435,8 @@ def _parse_decision_payload(
             allowed_fields = {
                 "type",
                 "element_index",
+                "x",
+                "y",
                 "click_count",
                 "mouse_button",
                 "direction",
@@ -275,7 +458,160 @@ def _parse_decision_payload(
                 "set_value",
             }
             if raw_action.get("type") not in allowed_types:
-                raise ValueError("planner action type is outside the 0.3 semantic allow-list")
+                raise ValueError("planner action type is outside the 0.4 semantic allow-list")
+            armed_search_viewports = (
+                tuple(
+                    element
+                    for element in observation.elements
+                    if element.visual_ocr
+                    and element.control_type == "VisualViewport"
+                    and element.supported_actions is not None
+                    and DesktopElementAction.PRESS_KEY in element.supported_actions
+                )
+                if observation is not None
+                else ()
+            )
+            if (
+                len(armed_search_viewports) == 1
+                and _is_armed_visual_search_repeat_click(
+                    raw_action,
+                    observation=observation,
+                    viewport=armed_search_viewports[0],
+                )
+            ):
+                # Once the exact top-of-window rendered search field has a
+                # single-use native focus/caret submission binding, a second
+                # frame-bound point click in that same search zone is never
+                # progress. Deterministically advance the bounded state
+                # machine with one Enter. Semantic result buttons and visual
+                # points outside the proven search zone remain ordinary clicks.
+                raw_action.clear()
+                raw_action.update(
+                    {
+                        "type": "press_key",
+                        "element_index": armed_search_viewports[0].index,
+                        "key": "enter",
+                    }
+                )
+                payload["expectation"] = {
+                    "kind": "last_action_verified",
+                    "text": None,
+                }
+            has_visual_point = raw_action.get("x") is not None or raw_action.get("y") is not None
+            visual_point_click = False
+            if has_visual_point:
+                if raw_action.get("x") is None or raw_action.get("y") is None:
+                    raise ValueError("visual point click requires both x and y")
+                viewports = (
+                    tuple(
+                        element
+                        for element in observation.elements
+                        if element.visual_ocr
+                        and element.control_type == "VisualViewport"
+                    )
+                    if observation is not None
+                    else ()
+                )
+                # The coordinates are screenshot-local by construction. Models
+                # sometimes copy the index of a nearby UIA Pane while correctly
+                # supplying screenshot coordinates. When this observation has
+                # exactly one frame-bound viewport, deterministically bind that
+                # point to it instead of rejecting an otherwise unambiguous step.
+                if raw_action.get("type") == "click" and len(viewports) == 1:
+                    raw_action["element_index"] = viewports[0].index
+                target = (
+                    next(
+                        (
+                            element
+                            for element in observation.elements
+                            if element.index == raw_action.get("element_index")
+                        ),
+                        None,
+                    )
+                    if observation is not None
+                    else None
+                )
+                if (
+                    raw_action.get("type") != "click"
+                    or target is None
+                    or not target.visual_ocr
+                    or target.control_type != "VisualViewport"
+                ):
+                    raise ValueError(
+                        "x/y coordinates are allowed only for the current VisualViewport element"
+                    )
+                raw_action["x"], raw_action["y"] = _planner_point_to_capture(
+                    raw_action["x"],
+                    raw_action["y"],
+                    observation=observation,
+                )
+                visual_point_click = True
+            if visual_point_click:
+                payload["expectation"] = {
+                    "kind": "last_action_verified",
+                    "text": None,
+                }
+            if raw_action.get("type") == "type_text" and observation is not None:
+                armed_viewports = tuple(
+                    element
+                    for element in observation.elements
+                    if element.visual_ocr
+                    and element.control_type == "VisualViewport"
+                    and element.supported_actions is not None
+                    and DesktopElementAction.TYPE_TEXT in element.supported_actions
+                )
+                if len(armed_viewports) == 1:
+                    raw_action["element_index"] = armed_viewports[0].index
+                    payload["expectation"] = {
+                        "kind": "last_action_verified",
+                        "text": None,
+                    }
+            if (
+                raw_action.get("type") == "press_key"
+                and observation is not None
+                and len(armed_search_viewports) == 1
+                and str(raw_action.get("key") or "").strip().casefold()
+                in {"enter", "return"}
+            ):
+                raw_action["element_index"] = armed_search_viewports[0].index
+                payload["expectation"] = {
+                    "kind": "last_action_verified",
+                    "text": None,
+                }
+        raw_expectation = payload.get("expectation")
+        if (
+            payload.get("kind") == "done"
+            and isinstance(raw_expectation, dict)
+            and raw_expectation.get("kind") == "visual_state_verified"
+        ):
+            raise ValueError(
+                "visual_state_verified is reserved for local frame binding"
+            )
+        if (
+            payload.get("kind") == "done"
+            and observation is not None
+            and observation.screenshot_png is not None
+            and observation.local_window_id
+            and len(
+                tuple(
+                    element
+                    for element in observation.elements
+                    if element.visual_ocr
+                    and element.control_type == "VisualViewport"
+                    and element.enabled
+                    and element.addressable
+                )
+            )
+            == 1
+        ):
+            # A DONE decision here was made while the model inspected this
+            # exact fresh screenshot. Replace model-authored comparison text
+            # with a local frame digest so the decision cannot drift to a
+            # different capture between planning and verification.
+            payload["expectation"] = {
+                "kind": "visual_state_verified",
+                "text": visual_state_binding_token(observation),
+            }
         return DesktopDecision.from_dict(payload, observation=observation)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DesktopPlannerError(f"desktop planner output failed validation: {exc}") from exc
@@ -427,7 +763,9 @@ class CodexDesktopStepPlanner(_CliDesktopStepPlanner):
             if observation is not None and observation.screenshot_png:
                 image_path = Path(temp_dir) / "observation.png"
                 try:
-                    image_path.write_bytes(observation.screenshot_png)
+                    image_path.write_bytes(
+                        _planner_image_png(observation.screenshot_png)
+                    )
                 except OSError as exc:
                     raise DesktopPlannerError(
                         "desktop planner could not stage the local window screenshot"
@@ -525,6 +863,13 @@ class ClaudeDesktopStepPlanner(_CliDesktopStepPlanner):
         history: Sequence[str],
         cancel_event: threading.Event | None = None,
     ) -> DesktopDecision:
+        if observation is not None and any(
+            element.visual_ocr for element in observation.elements
+        ):
+            raise DesktopPlannerUnavailable(
+                "visual OCR regions require the Codex planner because Claude CLI receives no "
+                "complete target-window screenshot"
+            )
         args = [
             self._resolve_executable(),
             "--safe-mode",

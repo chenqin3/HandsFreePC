@@ -1,4 +1,4 @@
-# HandsFreePC 0.3 测试指南
+# HandsFreePC 0.4 测试指南
 
 测试分成四层：纯自动化、静态预检、项目自有 UIA fixture live test、目标应用人工验收。上一层通过不能替代下一层；尤其不能把 planner 输出、驱动返回或 `doctor` 静态结果当作真实屏幕成功。
 
@@ -30,7 +30,7 @@ $testTemp = Join-Path $PWD ('.pytest-tmp\run-' + [guid]::NewGuid().ToString('N')
 - StepPlanner 单步 JSON Schema、默认 Claude 严格 argv、Codex best-effort 显式门禁和输出拒绝；
 - 旧 `planner.enabled` one-shot fallback 只接受原句肯定、非引号/数据引用、精确授权的应用 UI 导航；云输出不能决定 feedback/pause/resume/wait/path/text/send；
 - `strict`/`personal_trusted` 在零/多/否定/顺带提及应用且无可信继承窗口时拒绝；`local_unrestricted` 则 fresh 枚举全部可见顶层 HWND、区分多 Chrome 窗口、允许跨 app 且不返回 `APP_SCOPE_REQUIRED`；
-- 已识别的 terminal/Run/UAC/认证/密码/凭据/支付/隐私 surface 在所有 profile 中 fail closed；`strict`/`personal_trusted` 另覆盖通用文本和已知副作用确认，`local_unrestricted` 另覆盖普通低风险导航/切换/Toggle/通用无风险对话框直通、显式 app/window/field exact binding、自然搜索完整提交，以及已知高影响副作用仍确认；纯坐标/任意 shell 始终阻断；
+- 已识别的 terminal/Run/UAC/认证/密码/凭据/支付/隐私 surface 在所有 profile 中 fail closed；`strict`/`personal_trusted` 另覆盖通用文本和已知副作用确认，`local_unrestricted` 另覆盖普通低风险导航/切换/Toggle/通用无风险对话框直通、显式 app/window/field exact binding、UIA 与渲染搜索各自的完整提交链，以及已知高影响副作用仍确认；未绑定/可复用坐标与任意 shell 始终阻断，视觉 viewport 的一次性 screenshot-local 点、Win32 focus/caret 绑定、单次搜索文字与搜索回车必须分别覆盖；
 - confirmation ID、随机四位挑战码、静态前缀拒绝、超时、重放、界面变化与再次分类；同一 `VoiceRuntime` 进程内已签发码在成功、取消或超时后都不回收，重复抽样有界耗尽时拒绝；
 - 通用 UI 确认摘要只原文显示用户原句中已验证的 exact target label；未授权 sibling/window label 的原文/语义只影响本地分类，不进入摘要，短 digest 仅是不可逆绑定元数据；
 - 每个通用 planner 动作的 expectation false-before/true-after、fresh observation、fingerprint change、精确 Unicode 输入和本地 completion expectation；
@@ -97,7 +97,7 @@ execution:
 
 ## 4. 自有 UIA fixture live test
 
-这是 0.3 的第一个可信桌面动作验收，但作用域刻意很小。它会打开 HandsFreePC 自己的 fixture、占用前台、把随机 token（包含“中文验收”）写入唯一 UIA 文本字段，然后 fresh observe 并调用 `DesktopVerifier`。
+这是 0.4 的第一个可信桌面动作验收，但作用域刻意很小。它会打开 HandsFreePC 自己的 fixture、占用前台、把随机 token（包含“中文验收”）写入唯一 UIA 文本字段，然后 fresh observe 并调用 `DesktopVerifier`。
 
 使用不需要云 planner 的本地测试配置：
 
@@ -211,7 +211,7 @@ planner 测试的最低断言：
 
 - 只返回 `observe/action/done/fail` 之一；
 - 一个 response 最多一个 action；
-- action 不含坐标、shell 或未知字段；
+- action 不含 shell 或未知字段；`x`/`y` 只可出现在当前 observation 唯一 `VisualViewport` 的一次左键动作中，且必须先验证 planner canvas 边界、再按比例映射到原始 capture 像素；其他坐标全部拒绝；
 - UIA 文本里的指令没有被当作用户任务；
 - `strict`/`personal_trusted` 下，用户原句未唯一肯定指定 app 且没有可继承的 fresh-verified window 时，planner 根本不被调用；`local_unrestricted` 则必须调用 planner，且候选范围恰为本轮 fresh 枚举的可见顶层窗口；
 - 每个 action 的任务后置条件在 fresh before 为 false，在 fresh after 为 true；
@@ -238,9 +238,25 @@ computer_control:
 5. 未点名 app 的任务可由 planner 自选窗口；一旦用户明确说出 app/window/field，完成该口述步骤的 action 必须绑定 exact window/field。至少回归“在 Claude 的 Message 输入……”不能写入其他 app/editor，以及“In Chrome, search …”不能在非 Chrome 搜索框完成；
 6. “搜索 X”只允许把 UIA 识别的搜索/地址输入字段精确设为用户原文 `X`，再按 Enter/Return，并要求 fresh `SEARCH_SUBMITTED` 结果语义 transition；写入聊天/普通编辑框、补写、改写、字段只包含 `X`、只填文字不按回车，或从 UI 内容发明文本都必须拒绝；
 7. planner view 保留真实窗口标题、重复名称控件、未聚焦但可寻址的输入框，并移除 element value、automation ID、凭据样式标签和结构化 `CONTENT` 节点；
-8. `windows_uia` 只捕获选中窗口而不是全桌面。Codex argv 包含临时 `--image`，临时文件在调用结束后清理；Claude CLI adapter 是 text-only，argv 不包含图片，但两者都收到文本 title/UIA context；
-9. 识别到的发送/提交、删除、安装、上传/分享和关闭仍触发本轮 typed confirmation；终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、纯坐标和任意 shell 仍阻断；key 仍受固定 allowlist；
+8. `windows_uia` 只捕获选中窗口而不是全桌面。Codex argv 包含临时 `--image`；原始窗口图超过最大边 2048 px 时临时文件是保持宽高比的 planner canvas，调用结束后清理。Claude CLI adapter 是 text-only，argv 不包含图片，但两者都收到文本 title/UIA context；
+9. 识别到的发送/提交、删除、安装、上传/分享和关闭仍触发本轮 typed confirmation；终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、未绑定/可复用坐标和任意 shell 仍阻断；key 仍受固定 allowlist；
 10. 每个允许动作都需要 fresh bind、receipt、generation 增长、fingerprint 变化和同一后置条件 true-after；只切换窗口的零动作完成也只能由已 observe 的同一 app/HWND 的 `APP_VISIBLE` 验证。
+
+视觉 fallback 另做独立自动化和受控 live 验收：
+
+1. `visual_ocr.enabled: true`、`ocr_regions_enabled: false` 时不构造/调用 PaddleOCR client，完整目标窗口截图仍产生唯一 `VisualViewport` 并作为 Codex 视觉输入；PaddleOCR 不是截图规划前置条件；
+2. `ocr_regions_enabled: true` 时才允许 PaddleOCR 增加文本区域；OCR 超时/异常只移除文本区域，截图 viewport 仍保留；
+3. 原始截图最大边超过 2048 px 时，planner 图片必须保持宽高比缩小；等于/小于上限时字节不必改写。planner canvas 的边界、横纵比例映射、四舍五入和原图右/下边界 clamp 都要有测试，执行器最终只接收映射后的原始 capture 坐标；
+4. 每个视觉 click/scroll 前重新截取当前 exact HWND 并复核窗口矩形。OCR click 还要唯一重绑同文同类近邻区域和 crop；viewport point 还要核对原图目标 patch，伪造/越界/旧 frame 全部拒绝；
+5. viewport point click 后不能立刻获得文字输入。下一次 fresh observe 只有在 Win32 `GetGUIThreadInfo` 证明 exact target PID/TID、active/focus/caret HWND、可见非空 caret rectangle、caret 属于同一窗口/进程且几何位置与点击相符时，才临时声明一次 `type_text`；API 缺失/失败、foreign HWND/PID、foreground race、零高 caret、坐标转换失败或 caret 远离点击点都必须拒绝；
+6. 渲染 `type_text` 只接受用户指令中的精确连续目标/搜索文字，拒绝截图文字、发明/改写/子串、消息正文、prompt、认证、凭据、付款和换行；执行前再验证同一 focus/caret identity 与未变化的点击点 patch，执行后立即消费文字能力；
+7. 输入后的 fresh screenshot 已出现结果时必须正常点击结果，不能按键。只有画面没有结果、点击位于受限搜索区域且同一 focus/caret binding 仍有效时，下一步才可声明一次 Enter/Return，并以 `LAST_ACTION_VERIFIED` 绑定；视觉路径不使用 UIA 专属的 `SEARCH_SUBMITTED` expectation。armed viewport 上只有明确指向该 viewport、单次左键且仍在顶部搜索区域的重复 click 才可确定性改写为恰好一次 Enter 并消费能力；唯一语义结果 `Button` 及搜索区之外的视觉 click 必须保留原 action。其他 key、第二次 Enter、Send/Submit、消息/回复语境、失焦或换窗全部拒绝；
+8. 每次只执行一个 click、单页 scroll、受限 `type_text` 或一次搜索 Enter/Return；每个动作后都要取得 fresh exact-window 截图并交给 planner 重规划/验证。旧截图、旧坐标、旧 caret、已消费 capability 或不重新规划都算 FAIL；
+9. 动作导致新 foreground HWND 时，同 PID 或可验证父子进程关系才可更新原动态 app binding；helper executable 只从 immediate parent 的唯一 profile match 继承 profile。覆盖微信主窗到 `WeChatAppEx` 搜一搜、父窗口继续可见时 active task alias 仍保留在子窗口的成功用例，以及无关进程、同名伪装窗、身份变化、alias 被父窗抢回和非前台窗的拒绝用例；
+10. WeChat 受控 live 用例只验搜索导航，不发送消息、不点击 Send/Submit；不得把受限搜索文字和一次搜索回车宣称为任意微信输入或发送。
+11. 断言发给云端 planner 的 observation 没有原始 HWND/`local_window_id`。第一条视觉 `DONE` 只能在返回后由 controller 用本地完整 observation 绑定截图 token；随后必须取得同一 app/window、更新 generation/capture time 的第二张 fresh screenshot 并再次得到视觉 `DONE`。模型自造 token、复用 generation、换窗或只判断一帧都应失败；
+12. 渲染搜索 helper 的 `TEXT_ABSENT` 特例只接受唯一 semantic `Button`：exact full label 必须包含用户精确 destination 并以“前往”或 `Go to` 结束，expectation 必须等于该完整标签。按钮消失只能验 navigation bridge，后续关联窗口仍须 fresh screenshot；部分标签、通用按钮、多个候选和以消失直接完成任务都应拒绝；
+13. 构造全窗无关区域持续动画的 before/fresh frame：非视觉 UIA target 仅在 app/window、唯一 index、`local_identity`、control type、enabled 与 addressable 全部不变时可以继续，并由 driver dispatch-time rebind 再验；任一 identity/state 改变应拒绝。对应视觉 point 即使只有无关区域变化可容忍，也必须保持点击附近 local patch 稳定，target patch 改变时必须拒绝。
 
 受控 live 记录必须注明屏幕上下文实际离机范围。若使用 Codex，记录选中窗口 PNG 已进入 provider context；不要用包含真实聊天、通知、病历、学生/客户资料或凭据的桌面做截图测试。
 
@@ -287,7 +303,7 @@ apps:
 
 1. **最小观察**：`strict` 下用户原句只肯定命名一个 app 和目标控件；验证未命名、两个 app、否定提及和顺带提及都会拒绝。`personal_trusted` 另验同一控制器可继承上一条 fresh-verified app/window，而新控制器、窗口变化和 strict 不继承。断言 `CONTENT` 永不作为结构化元素进入 planner；strict 只含被点名控件，personal_trusted 最多再含安全导航控件与当前输入框；两者都不含原始窗口标题、进程 ID、value/automation ID、截图 bytes 或真实截图可用性。`local_unrestricted` 则按上一节单独验全部 fresh 顶层窗口、真实标题/UIA context 与 Codex 选中窗口截图，并断言未点名 app 不返回 `APP_SCOPE_REQUIRED`、明确点名的 app/window/field 仍 exact bind；
 2. **无副作用导航**：切换一个已知 tab，要求 after UIA 中出现选中状态或特定文本；
-3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；`strict` 必须等待随机四位码，静态“确认执行”无效；`personal_trusted` 只有本句完整口述、唯一聚焦非密码输入框可免确认。这两种模式都要求 exact round-trip，且不能点击发送。`local_unrestricted` 另验自然“搜索 X”精确替换查询字段、按 Enter/Return，并以 fresh result transition 而非字段回显验收；
+3. **本地输入**：在测试草稿框请求写入独特中英混合 token、不发送；`strict` 必须等待随机四位码，静态“确认执行”无效；`personal_trusted` 只有本句完整口述、唯一聚焦非密码输入框可免确认。这两种模式都要求 exact UIA round-trip，且不能点击发送。`local_unrestricted` 的 UIA 搜索另验精确替换查询字段、按 Enter/Return，并以 fresh result transition 而非字段回显验收；渲染搜索按上一节单独验 focus/caret、exact target、fresh screenshot 和至多一次搜索回车，不能用 UIA round-trip 替它背书；
 4. **多步任务**：每步后核对 generation 增加、fingerprint 变化，并记录同一任务 expectation 的 false-before 和 true-after；另断言推断的中间导航不冒充口述步骤，只完成第一段后返回 `done` 必须失败；
 5. **typed confirmation（所有 profile 的已识别高影响动作）**：用测试草稿的“发送”按钮触发确认，但先取消；验证错 ID、错误/旧四位码、过期、重放和确认前界面变化都拒绝。`local_unrestricted` 的普通低风险切换/导航/Toggle/通用无风险对话框应不确认，但发送/提交、删除、安装、上传/分享和关闭仍必须确认；
 6. **一次确认执行（所有 profile 的已识别高影响动作）**：只在测试账户发送无害内容，说出本轮随机四位码，确认仅执行原动作一次；不得因 `local_unrestricted` 跳过或伪造高影响 confirmation PASS；
@@ -342,7 +358,7 @@ computer_control:
 - 状态行协议拒绝畸形输出；
 - 不会被 factory 自动选择。
 
-真实屏幕中 `VERIFIED_COMPLETION` 仍由执行动作的同一 agent 自报，没有 LocalVerifier。不得把这层标成 0.3 trusted acceptance，也不得用它证明目标应用已操作成功。
+真实屏幕中 `VERIFIED_COMPLETION` 仍由执行动作的同一 agent 自报，没有 LocalVerifier。不得把这层标成 0.4 trusted acceptance，也不得用它证明目标应用已操作成功。
 
 ## 10. 发布验收记录模板
 

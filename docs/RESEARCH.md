@@ -1,24 +1,24 @@
 # HandsFreePC 技术调研与选型
 
-> 外部调研快照：2026-08-30；0.3 实现对齐：2026-08-31。本文把厂商/上游项目公开资料中的**已核实事实**、HandsFreePC 0.3 的**当前工程选择**和早期版本的**历史验证记录**分开陈述。外部能力会变化，发布前应重新核对链接和本机版本；标成“历史”的结果不能替 0.3 背书。
+> 外部调研快照：2026-08-30；0.4 实现对齐：2026-09-01。本文把厂商/上游项目公开资料中的**已核实事实**、HandsFreePC 0.4 的**当前工程选择**和早期版本的**历史验证记录**分开陈述。外部能力会变化，发布前应重新核对链接和本机版本；标成“历史”的结果不能替 0.4 背书。
 >
-> 当前实现的规范性说明以 [0.3 架构](ARCHITECTURE.md)、[安全模型](SECURITY_MODEL.md) 和 [测试指南](TESTING.md) 为准。
+> 当前实现的规范性说明以 [0.4 架构](ARCHITECTURE.md)、[安全模型](SECURITY_MODEL.md) 和 [测试指南](TESTING.md) 为准。
 
 ## 结论先行
 
-HandsFreePC 不应把“常开麦克风、理解命令、操控桌面、判断成功”全部交给一个云端 Agent。0.3 采用的组合是：
+HandsFreePC 不应把“常开麦克风、理解命令、操控桌面、判断成功”全部交给一个云端 Agent。0.4 采用的组合是：
 
 1. 单一麦克风采集留在本机，由 Vosk 识别控制词，Silero VAD 与可配置的本地正文 ASR 处理命令；
 2. “开始语音操作”进入连续会话，正文中的独立 `over` 完成一条 prompt，并进入有界 FIFO；
 3. 完整命中的常见命令先走 `NativeSkillRouter`、确定性解析和本地白名单执行器；
 4. 只有确定性 miss 且显式允许转写与屏幕上下文离机时，默认 Claude CLI 才规划**下一步**；`strict` 要求原句肯定且只指定一个应用，`personal_trusted` 可继承同一控制器刚刚 fresh-verified 的窗口，显式本机 `local_unrestricted` 则无 `APP_SCOPE_REQUIRED` 并可在全部 fresh 可见普通顶层窗口间动态规划；Codex CLI 只作额外同意主机读取风险后的 best-effort 备选；
-5. planner 每次只能返回一个结构化决定，不持有鼠标键盘，也不能通过动作 Schema 请求 shell、坐标点击或任意脚本；
+5. planner 每次只能返回一个结构化决定，不持有鼠标键盘，也不能通过动作 Schema 请求 shell、可复用裸坐标或任意脚本；唯一坐标能力是当前 exact-window planner canvas 上的一次 viewport 点，必须映射回原始截图并重新绑定；
 6. 项目自有 `DesktopDriver` 对每个通用 planner 动作强制任务后置条件 false-before、执行一次、fresh observe 后 true-after，再由本地策略和 `DesktopVerifier` 验收；确定性 native skill 使用动作特定证据，并允许精确状态已成立时幂等成功；
 7. `strict` 的通用文本输入使用绑定到确切动作与界面快照的随机四位一次性确认，`personal_trusted` 可豁免唯一聚焦非密码输入框中的未发送完整口述草稿；`local_unrestricted` 的普通低风险导航/切换/Toggle/通用无风险对话框不确认，但所有 profile 中被本地词形识别为发送、删除、安装、上传/分享、关闭等高影响副作用时仍确认。词表不是完整语义证明，重要任务仍需监督；静态“确认执行”无效；
 8. 只有本地验收通过才返回 `LOCAL_VERIFIED_COMPLETION`；planner 的 `done` 和 driver 的 `accepted` 都不是成功证据；
 9. 默认用不抢焦点的大字遮罩反馈，可切换为本机语音、两者同时或静默。
 
-这意味着 Codex/Claude 是可替换的单步“规划器”，不是常驻麦克风、权限管理器、桌面执行器或成功裁判。准确性主要来自确定性路径解析、可访问性树定位、歧义拒绝、observation generation 绑定和动作后的本地验证，而不是单纯换一个更大的模型。旧 `legacy_codex_cli` 仍可显式选择，但同一 agent 自报的 `VERIFIED_COMPLETION` 不属于 0.3 的可信验收路径。
+这意味着 Codex/Claude 是可替换的单步“规划器”，不是常驻麦克风、权限管理器、桌面执行器或成功裁判。准确性主要来自确定性路径解析、可访问性树/截图定位、歧义拒绝、observation generation 绑定、Win32 focus/caret 证据和动作后的本地验证，而不是单纯换一个更大的模型。旧 `legacy_codex_cli` 仍可显式选择，但同一 agent 自报的 `VERIFIED_COMPLETION` 不属于 0.4 的可信验收路径。
 
 ## 1. Windows 自带能力是否够用
 
@@ -56,7 +56,7 @@ Voice Access 很适合作为系统级故障后备，但不作为本项目核心�
 
 ### 工程选择
 
-0.3.1 仍使用 16 kHz、单声道 PCM，但会话协议已经不是“唤醒后只转写一条命令”。“开始语音操作”进入持续 `ACTIVE` 会话；同一个采集 block 同时送给中文控制词 Vosk、英文 `over` Vosk 和 Silero VAD。英文 detector 请求词级及 partial 词级时间并保存单调样本区间，没有可用词时间时退回到命中 block 的近似区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入正文 ASR，其余片段先做低门槛分窗能量检查，明显静音直接返回空串，真实有声段再转写。每个 marker 依次完成前一条 prompt，末段保留给下一条。若 KWS 漏掉而正文 ASR 含独立 `over`，仍按正文切分。执行线程与采集线程分离，因此前一条执行时仍可继续接收下一条，普通任务由一个 worker 串行执行。
+0.4.0 仍使用 16 kHz、单声道 PCM，但会话协议已经不是“唤醒后只转写一条命令”。“开始语音操作”进入持续 `ACTIVE` 会话；同一个采集 block 同时送给中文控制词 Vosk、英文 `over` Vosk 和 Silero VAD。英文 detector 请求词级及 partial 词级时间并保存单调样本区间，没有可用词时间时退回到命中 block 的近似区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入正文 ASR，其余片段先做低门槛分窗能量检查，明显静音直接返回空串，真实有声段再转写。每个 marker 依次完成前一条 prompt，末段保留给下一条。若 KWS 漏掉而正文 ASR 含独立 `over`，仍按正文切分。执行线程与采集线程分离，因此前一条执行时仍可继续接收下一条，普通任务由一个 worker 串行执行。
 
 默认由 sherpa-onnx 加载固定为 v6.2.1 的 Silero ONNX 做话语起止点检测；若用户明确把 `speech.vad.backend` 配成 `energy`，则使用可校准的自适应能量门限后备。这一分层比“让大模型一直听”更省资源，也让原始音频默认不必离开机器。公开默认仍为 SenseVoice 且 `speech.fallback.backend: none`；普通安装只装 `audio` 与 `windows` extras，`-WithWhisper` 才安装 faster-whisper。现在可直接把 `speech.command.backend` 设为 `faster-whisper`，并配置模型、设备、精度、语言、beam、`initial_prompt` 和 `hotwords`。模型权重首次使用会产生 GB 级下载/缓存。兼容 fallback 仍只在主转写器抛异常时调用，不把低置信度自动切换伪装成已经可靠完成的候选融合。
 
@@ -66,7 +66,7 @@ Voice Access 很适合作为系统级故障后备，但不作为本项目核心�
 
 ### 历史验证记录（2026-08-30，早期运行时）
 
-当时的发布机曾通过 SenseVoice 官方样例（转写为“开饭时间早上9点至下午5点。”）、Vosk 合成唤醒/停止、Silero 官方样例、16 kHz 真实麦克风读取和早期本地运行时启动/停止。这些结果只证明当时那台机器的组件链路可运行；它们没有覆盖 0.3 的持续会话、`over`/FIFO、项目自有桌面 agent，也不等于远场、家庭噪声、婴儿声、方言或其他音频设备已经验证。
+当时的发布机曾通过 SenseVoice 官方样例（转写为“开饭时间早上9点至下午5点。”）、Vosk 合成唤醒/停止、Silero 官方样例、16 kHz 真实麦克风读取和早期本地运行时启动/停止。这些结果只证明当时那台机器的组件链路可运行；它们没有覆盖 0.4 的持续会话、`over`/FIFO、项目自有桌面 agent，也不等于远场、家庭噪声、婴儿声、方言或其他音频设备已经验证。
 
 ### 模型许可提醒
 
@@ -93,41 +93,42 @@ HandsFreePC 是登录用户会话中的普通常驻进程，不是系统服务�
 
 ### 历史实现说明（0.1.0）
 
-早期实现以 `ARMED`、`AWAKE`、`DICTATION`、`CONFIRMING`、`PAUSED` 描述单轮唤醒、听写和应用内语音流程，并记录过停止词无法抢占同步执行/TTS、锁屏没有会话事件自动暂停等限制。这些细节仍可用于理解兼容的确定性听写路径，但不能用来描述 0.3 的主入口；0.3 的公开主流程是持续会话、`over` 分段、有界 FIFO 和 `DesktopAgentLoopController`。
+早期实现以 `ARMED`、`AWAKE`、`DICTATION`、`CONFIRMING`、`PAUSED` 描述单轮唤醒、听写和应用内语音流程，并记录过停止词无法抢占同步执行/TTS、锁屏没有会话事件自动暂停等限制。这些细节仍可用于理解兼容的确定性听写路径，但不能用来描述 0.4 的主入口；0.4 的公开主流程是持续会话、`over` 分段、有界 FIFO 和 `DesktopAgentLoopController`。
 
 ## 4. Windows 操作技术路线
 
 | 层级 | 已核实事实 | 本项目用法 |
 |---|---|---|
 | 原生 Windows handler | ShellExecute 可按系统文件关联打开文档和目录。[Microsoft Shell launch](https://learn.microsoft.com/en-us/windows/win32/shell/launch) | `NativeSkillRouter` 完整命中后，先做路径存在性、唯一性和最终扩展名风险校验，再交给本地白名单执行器；不拼接 shell 命令 |
-| UI Automation | UIA 可按语义读取元素并调用控件模式 | 0.3 默认 `windows_uia` driver 读取不可变 observation、绑定元素 index、执行一个语义动作并 fresh observe |
+| UI Automation | UIA 可按语义读取元素并调用控件模式 | 0.4 默认 `windows_uia` driver 读取不可变 observation、绑定元素 index 或 exact-window screenshot target、执行一个动作并 fresh observe |
 | pywinauto | Python 的 Win32/UIA 自动化库，支持 `uia` 与 `win32` 后端。[pywinauto 文档](https://pywinauto.readthedocs.io/en/latest/) | 项目自有 Win32/UIA driver 的基础库；动作仍受本地 safety 和 verifier 约束 |
-| WinApp CLI | 微软工具可搜索、调用、设值、等待、截图并输出 JSON；官方页面仍标为 Public Preview，Electron 支持有限。[WinApp UI Automation](https://learn.microsoft.com/en-us/windows/apps/dev-tools/winapp-cli/ui-automation) | 调研中的后续候选；0.3 不把它作为默认或唯一依赖 |
+| WinApp CLI | 微软工具可搜索、调用、设值、等待、截图并输出 JSON；官方页面仍标为 Public Preview，Electron 支持有限。[WinApp UI Automation](https://learn.microsoft.com/en-us/windows/apps/dev-tools/winapp-cli/ui-automation) | 调研中的后续候选；0.4 不把它作为默认或唯一依赖 |
 | 局部视觉 | Windows 可捕获单个窗口画面。[Windows Graphics Capture](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture) | `strict`/`personal_trusted` 不向 planner 发送截图；显式本机 `local_unrestricted/windows_uia` 会捕获 planner 选中的单个窗口，Codex 可通过临时 `--image` 接收 PNG。它仍不允许纯坐标点击，也不是全桌面截图 |
 
 `SetForegroundWindow` 受 Windows 防抢焦点规则限制，所以“请求激活”失败必须是正常错误分支；不能激活后仍盲目发按键。[SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow) `SendInput` 还受 UIPI 完整性级别限制；普通权限进程不能可靠地向更高权限窗口注入输入。[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)
 
 Qwen open-computer-use 0.2.3 虽暴露多种 MCP 动作，但当前 `get_app_state` 结果没有被适配成可安全绑定的结构化 element list。严格 Schema 要求动作引用 element index，因此 planner 驱动的点击/导航能力受限；通用 `type_text`/`set_value` 也会因找不到可验证的焦点元素而失败关闭。它只能作为实验兼容层，不能替代默认 `windows_uia` 的语义元素证据。
 
-Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openinputdesktop) 和 [`GetUserObjectInformation`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getuserobjectinformationw) 查询当前输入桌面。项目从 0.1.0 起把名称严格等于 `Default` 作为真实 OS/UI 动作的前置条件，0.3 默认 driver 继续保留这项门禁；这不代表 Windows 会替任意应用自动采用同一策略。
+Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openinputdesktop) 和 [`GetUserObjectInformation`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getuserobjectinformationw) 查询当前输入桌面。项目从 0.1.0 起把名称严格等于 `Default` 作为真实 OS/UI 动作的前置条件，0.4 默认 driver 继续保留这项门禁；这不代表 Windows 会替任意应用自动采用同一策略。
 
 ### 工程选择
 
-0.3 的执行顺序固定为：
+0.4 的执行顺序固定为：
 
 1. 路径、已配置应用或固定听写能被确定性 parser 完整覆盖时，由 `NativeSkillRouter` 先解析全部目标、完成风险分类并执行；parser 只匹配前半句时视为 miss，不能静默丢掉后半句；
 2. UNC / `//server`、URI 和 Win32 device namespace 在任何文件系统访问前阻断，只接受本地路径合同；模糊路径解析到最终目标后按最终扩展名重新判级；
 3. 确定性 miss 才进入通用 agent loop。`strict` 要求用户原句肯定且只明确指定一个已配置应用，`personal_trusted` 只可继承刚刚 fresh-verified 的窗口；显式本机 `local_unrestricted` 则把本轮所有 fresh 可见普通顶层窗口交给 planner，允许动态跨 app，不产生 `APP_SCOPE_REQUIRED`。没有点名 app 时 planner 可自选；一旦原句明确说出 app/window/field，完成对应用户步骤的 action 仍必须 exact bind。planner 每轮仍只能选择一个 `observe`、`action`、`done` 或 `fail` 决定；
-4. `strict`/`personal_trusted` driver 只接受配置过的应用 profile，按进程名和标题寻找唯一窗口；`local_unrestricted` 将每个可见 HWND/PID/process/title 绑定为独立候选，多 Chrome 窗口分别列出，observe 时激活并复核确切 HWND，并在后续规划步骤刷新 inventory；
+4. `strict`/`personal_trusted` driver 只接受配置过的应用 profile，按进程名和标题寻找唯一窗口；`local_unrestricted` 将每个可见 HWND/PID/process/title 绑定为独立候选，多 Chrome 窗口分别列出，observe 时激活并复核确切 HWND，并在后续规划步骤刷新 inventory；动作若打开新 foreground HWND，只在同 PID 或可验证父子进程关系时把动态 app 精确重绑到新窗口，例如微信主窗到 `WeChatAppEx` 搜一搜；
 5. observation 的元素 index 绑定 `app + HWND + generation`。一次动作后旧 index 立即失效，必须 fresh observe；
-6. 动作只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。已被本地词形/属性识别的认证、密码、terminal/shell、UAC/Windows Security、付款、隐私/公开链接 surface，以及剪贴板和无语义目标的坐标操作 fail closed；
+6. 动作只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。已被本地词形/属性识别的认证、密码、terminal/shell、UAC/Windows Security、付款、隐私/公开链接 surface，以及剪贴板和未绑定/可复用坐标操作 fail closed；截图 fallback 只允许当前 planner canvas 的一次点并映射回原图；
 7. `strict` 的通用 `type_text`/`set_value` 需要确认，`personal_trusted` 仅豁免未发送的完整口述草稿；`local_unrestricted` 的普通切换/菜单/选项卡/Toggle/未命中风险分类的通用 OK/Continue 对话框不确认。所有 profile 的点击/按键上下文一旦命中已知发送/提交、删除、安装/卸载、上传/共享、关闭词形，仍先生成绑定参数、expectation 和 observation fingerprint 的 confirmation。副作用词表不是完整语义证明，未知词形可能漏分；确认前 fresh observe 并重绑定新 generation，再由 runtime 加上随机四位一次性码；
-8. 每个通用动作先 fresh observe，确认任务相关 expectation 此时为 false，再执行一次；driver `accepted` 只说明动作已发出。随后 `DesktopVerifier` 要求更高 generation、同一应用、状态 fingerprint 变化且同一 expectation 为 true；`type_text`/`set_value` 还必须在新 UIA 状态中看到精确文本。自然“搜索 X”进一步要求搜索/地址字段精确等于 `X`、按 Enter/Return，并出现 fresh `SEARCH_SUBMITTED` 结果语义 transition；
-9. planner 的 `done` 只能给出本地可检查的有限 expectation。只有 `DesktopVerifier` 通过才终止为 `LOCAL_VERIFIED_COMPLETION`。
+8. 每个通用动作先 fresh observe，确认任务相关 expectation 此时为 false，再执行一次；driver `accepted` 只说明动作已发出。随后 `DesktopVerifier` 要求更高 generation、同一应用、状态 fingerprint 变化且同一 expectation 为 true；UIA `type_text`/`set_value` 还必须在新 UIA 状态中看到精确文本。UIA 自然“搜索 X”进一步要求搜索/地址字段精确等于 `X`、按 Enter/Return，并出现 fresh `SEARCH_SUBMITTED` 结果语义 transition；
+9. UIA 贫乏窗口以完整 exact-window screenshot 为视觉主信号，PaddleOCR 只是可选文字区域。原图过大时等比缩到最大边 2048 px 的 planner canvas，point 再映射回原图。渲染搜索输入只有在 viewport 点击后的 fresh `GetGUIThreadInfo` 证明 exact process/thread、active/focus/caret HWND、可见 system caret 与点击点一致时开放一次，并只可输入用户指令中的精确目标文字；输入后画面没有结果且同一绑定仍成立时才允许一次 Enter/Return，绝不扩展为消息 Send 或任意 Submit；
+10. planner 的 `done` 只能给出本地可检查的有限 expectation。每次视觉 click/scroll/type/search-enter 后也必须 fresh screenshot、重规划和验证；只有 `DesktopVerifier` 通过才终止为 `LOCAL_VERIFIED_COMPLETION`。
 
 另有一个仅为兼容旧 `VoiceRuntime` 保留的顶层 `planner.enabled` one-shot fallback，不属于上述逐步 desktop planner。其云输出只可提出原句肯定、非引号/数据引用且精确授权的应用内导航（激活、项目/对话/tab/mode、听写、应用内语音）；反馈、暂停/恢复/等待、路径、文本和发送动作即使出现在云 plan 中也会被本地 safety 阻断。需要确认时，运行时绑定完整 plan/source、规范路径、stat 身份和普通文件 SHA-256，并在确认后重新 prepare、重新 safety、重新 binding；任何变化都取消。
 
-早期 0.1.0 的 UIA 研究已经识别出“唯一匹配、前台 HWND、非密码输入、动作后检查”等正确方向，但当时 `SendInput` 接收、Enter 发送或 Shell dispatch 仍可能只是调度证据。0.3 的本地 verifier 提高了动作级证据强度；它仍不能把 UIA 文本变化等同于网络服务已经接受消息、文件已持久保存或其他外部业务后置条件。
+早期 0.1.0 的 UIA 研究已经识别出“唯一匹配、前台 HWND、非密码输入、动作后检查”等正确方向，但当时 `SendInput` 接收、Enter 发送或 Shell dispatch 仍可能只是调度证据。0.4 的本地 verifier 提高了动作级证据强度；它仍不能把 UIA 文本变化或截图变化等同于网络服务已经接受消息、文件已持久保存或其他外部业务后置条件。
 
 确定性 `OPEN_PATH` 当前也采用 false-before/true-after，并要求动作后的前台 HWND 与动作前不同：Explorer 目录再用 Shell.Application 返回的规范化路径做精确比较；普通文件则只检查新前台窗口标题是否包含精确文件名，仍是 best-effort。复用同一 HWND 的查看器会保守失败；同名文件和不显示文件名的查看器仍需人工核对，这不是 exact-path 或 exact-content 证明。
 
@@ -150,9 +151,9 @@ Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/wi
 
 ### 工程选择
 
-- 0.3 默认 desktop planner 为 Claude `-p`，因为当前 CLI 能显式使用空 tools、restricted/safe mode 与严格 MCP 配置。Codex `exec` 保留为 `codex_cli_best_effort`，只有 `allow_codex_cli_host_read: true` 后才启用；项目不承诺任一订阅覆盖所有调用、固定模型或额度。
+- 0.4 默认 desktop planner 为 Claude `-p`，因为当前 CLI 能显式使用空 tools、restricted/safe mode 与严格 MCP 配置。Codex `exec` 保留为 `codex_cli_best_effort`，只有 `allow_codex_cli_host_read: true` 后才启用；截图视觉步骤需要 Codex，项目不承诺任一订阅覆盖所有调用、固定模型或额度。
 - 两个 planner 每次调用只能返回一个严格的 `observe`、`action`、`done` 或 `fail` 决定。一次 response 最多一个动作；多步任务由本地 agent loop 逐轮执行，并受 `max_steps` 与总 timeout 限制。最近最多 8 条**本地已验收历史**可进入上下文，这不是“一次返回 8 步计划”。
-- 0.3 桌面动作 Schema 只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。`strict` 的通用文本输入需要本轮随机四位一次性确认，`personal_trusted` 只豁免未发送的完整口述草稿；`local_unrestricted` 允许普通低风险语义动作直通，但被识别的发送/删除/安装/上传/分享/关闭仍确认。执行前还必须通过当前 observation 绑定、本地界面/动作风险分类、false-before 和动作后 exact true-after 验收。planner 不能请求 shell、坐标字段、密码读取、确认绕过或 UAC 同意。
+- 0.4 桌面动作 Schema 只允许 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。`strict` 的通用文本输入需要本轮随机四位一次性确认，`personal_trusted` 只豁免未发送的完整口述草稿；`local_unrestricted` 允许普通低风险语义动作和上文严格绑定的视觉搜索直通，但被识别的发送/删除/安装/上传/分享/关闭仍确认。执行前还必须通过当前 observation 绑定、本地界面/动作风险分类、false-before 和动作后 exact true-after 验收。planner 不能请求 shell、可复用坐标、密码读取、确认绕过或 UAC 同意。
 - Claude adapter 使用独立 system policy、空 tools、safe/restricted 模式、严格 MCP 配置、非交互权限模式和无会话持久化。Codex adapter 使用 ephemeral 空临时目录、结构化输出 Schema、忽略用户配置/规则、过滤环境变量、read-only sandbox 并尽量禁用当前已知工具。两者都没有 HandsFreePC 的 `DesktopDriver`。
 - 启动、非零退出、超时、取消或不合 Schema 的输出全部失败关闭，并返回泛化错误，不回显原始 prompt 或 provider stderr。失败不会自动切换到 `legacy_codex_cli`。
 - Codex CLI 自身仍是当前用户进程；read-only sandbox、deny list、空目录、环境过滤和 prompt 禁令都不是 no-tools 或主机级秘密隔离保证。Claude 空 tools 提供更窄工具面，但认证、遥测和服务端保留仍由提供商与账户设置决定。
@@ -164,28 +165,28 @@ Windows 提供 [`OpenInputDesktop`](https://learn.microsoft.com/en-us/windows/wi
 
 2026-08-31 重新登录 Claude CLI 后，发布候选分别用真实 Claude/Codex 订阅 CLI 调用了 0.3 的严格单步 adapter：在无 observation 时，两者都返回了 `observe claude`；在仅含合成 `Chat` 控件的最小 observation 中，两者都返回了一个绑定 index `0` 的 click 和 `element_selected Chat` 后置条件。该记录只验证认证、实际 argv、Schema 与一步规划链路，不包含鼠标键盘动作，也不证明真实 Claude/Codex 界面的 UIA selector 或跨应用控制成功。
 
-0.2 的 Codex Computer Use plugin/thread controller 仍以 `legacy_codex_cli` 名称显式保留。该路径由同一个 agent 观察、执行并输出 `VERIFIED_COMPLETION`，没有 0.3 的项目自有动作级 verifier；factory 不会自动选择或回退到它，新部署不应把它当成可信验收路径。
+0.2 的 Codex Computer Use plugin/thread controller 仍以 `legacy_codex_cli` 名称显式保留。该路径由同一个 agent 观察、执行并输出 `VERIFIED_COMPLETION`，没有 0.4 的项目自有动作级 verifier；factory 不会自动选择或回退到它，新部署不应把它当成可信验收路径。
 
 ## 6. 反馈模式
 
-0.3 保留四种模式，均可用语音切换：
+0.4 保留四种模式，均可用语音切换：
 
 - `overlay`：默认。屏幕顶层显示高对比大字，不抢输入焦点；适合看得到屏幕但不希望出声。
 - `voice`：用 Windows 已安装的本机语音合成引擎读出短反馈；实际离线性和中文声音取决于本机已安装语音，需要安装后实测。
 - `both`：同时显示并朗读。
 - `silent`：只保留必要状态，不主动打扰；风险确认仍必须有可感知提示。
 
-反馈可能显示或朗读识别内容、队列状态、错误和确认摘要，因此口述路径/项目名可能被旁观或旁听。TTS 是半双工的：播放期间暂停识别/命令处理，全部播完后丢弃同期麦克风缓冲；用户必须等提示结束再说下一句，否则可能被丢弃。0.3 会检测确认播报失败并强制显示可见错误；但本机是否有可用的中文 SAPI 声音仍需人工听测，默认 `overlay` 更稳妥。
+反馈可能显示或朗读识别内容、队列状态、错误和确认摘要，因此口述路径/项目名可能被旁观或旁听。TTS 是半双工的：播放期间暂停识别/命令处理，全部播完后丢弃同期麦克风缓冲；用户必须等提示结束再说下一句，否则可能被丢弃。0.4 会检测确认播报失败并强制显示可见错误；但本机是否有可用的中文 SAPI 声音仍需人工听测，默认 `overlay` 更稳妥。
 
 持续会话中的普通任务按 FIFO 进入 `DesktopAgentLoopController`；`strict` 通用文本、`personal_trusted` 中未获草稿豁免的文本，以及所有 profile 中被本地已知词形/上下文识别为发送、删除等高影响副作用的动作，会暂停队列等待与当前动作/界面绑定的随机四位一次性口令。`local_unrestricted` 的普通低风险切换/导航/Toggle/通用无风险对话框不会因此停队。词表不能穷举副作用语义，重要任务仍需人工看屏幕。用户必须说出提示中的完整“确认执行 + 四位码”；静态“确认执行”无效，runtime 也不会把确认作为新 prompt 交给模型重新解释。同一 `VoiceRuntime` 进程内，已签发码即使取消或超时也不回收，有界重抽耗尽时拒绝；该集合不跨重启持久化，所以随机码不是持久化防重放凭证或说话人认证，也无法阻止旁人、扬声器或实时转述/重放在本轮有效期内代说。急停可请求取消当前任务并清队列，但不能撤回已发生的点击、输入或外部副作用。
 
-兼容的确定性听写/应用内语音路径来自早期版本：HandsFreePC 可进入已核验输入框，“电脑发送提示”由本地 parser 识别；`start_native_voice` 在一个计划中只能出现一次、必须位于最后，且不能和反馈模式切换组合。公开 Codex/Claude profile 没有经验证的原生语音 selector，因此这不是 0.3 通用 desktop agent 的成功证明，也不能替通用任务的 fresh-observation/LocalVerifier 验收背书。
+兼容的确定性听写/应用内语音路径来自早期版本：HandsFreePC 可进入已核验输入框，“电脑发送提示”由本地 parser 识别；`start_native_voice` 在一个计划中只能出现一次、必须位于最后，且不能和反馈模式切换组合。公开 Codex/Claude profile 没有经验证的原生语音 selector，因此这不是 0.4 通用 desktop agent 的成功证明，也不能替通用任务的 fresh-observation/LocalVerifier 验收背书。
 
 HandsFreePC 的 blocked surface、动作 Schema、typed confirmation 和本地 verifier 只约束 HandsFreePC 自己的控制边界。一旦用户确认提交 composer 中已有 prompt，下游 Codex/Claude agent 的能力仍由它自己的 sandbox、approval 和 permissions 决定；部署时需要单独最小化。
 
 ## 7. 精确性验收边界
 
-公开版不能用“能打开一次”、planner `done`、driver `accepted` 或静态 `doctor` 代替可靠性。0.3 把证据分成四层，上一层不能替下一层：
+公开版不能用“能打开一次”、planner `done`、driver `accepted` 或静态 `doctor` 代替可靠性。0.4 把证据分成四层，上一层不能替下一层：
 
 1. 默认自动化：会话/`over`/FIFO、NativeSkillRouter、单步 Schema、generation binding、本地 safety、typed confirmation、fresh observation、verifier、MCP 协议和 fail-closed 分支；
 2. 静态 `doctor --strict`：只检查依赖、模型、音频设备、CLI 和配置线索，必须始终保持 `live_control_verified: false` 与 `ready_for_live_control: false`；

@@ -22,6 +22,10 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.computer_control.allow_codex_cli_host_read is False
     assert settings.computer_control.allow_legacy_codex_computer_use is False
     assert settings.computer_control.failure_policy == "pause"
+    assert settings.visual_ocr.enabled is False
+    assert settings.visual_ocr.endpoint == "http://127.0.0.1:8766/layout-parsing"
+    assert settings.visual_ocr.allow_remote_screen_ocr is False
+    assert settings.visual_ocr.apps == ["codex", "wechat"]
     assert settings.workmap.enabled is False
     assert settings.workmap.out_directory is None
     assert settings.workmap.aliases == {}
@@ -30,6 +34,7 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.speech.command["backend"] == "sensevoice"
     assert settings.speech.command["model"] == "large-v3-turbo"
     assert "Claude" in settings.speech.command["hotwords"]
+    assert "ChatGPT" in settings.speech.command["hotwords"]
     assert settings.app.feedback_mode == FeedbackMode.OVERLAY
     assert settings.speech.vad["backend"] == "silero"
     assert settings.speech.delimiter["backend"] == "vosk"
@@ -40,6 +45,10 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.apps["codex"].mode_names["chat"] == ["Chat"]
     assert settings.apps["claude"].mode_names["chat"] == ["Chat and Cowork", "Chat"]
     assert settings.apps["claude"].mode_names["design"] == ["Design"]
+    assert settings.apps["wechat"].activation_hotkey == "ctrl+alt+w"
+    assert settings.apps["codex"].activation_hotkey is None
+    assert settings.apps["chrome"].activation_hotkey is None
+    assert "Hyperlink" in settings.apps["chrome"].include_control_types
     assert settings.apps["codex"].include_control_types == [
         "Button",
         "TabItem",
@@ -65,6 +74,63 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.apps["claude"].max_content_nodes == 80
     assert "Prompt" in settings.apps["codex"].composer_names
     assert "Ask Claude" in settings.apps["claude"].composer_names
+
+
+def test_visual_ocr_rejects_remote_screen_endpoint_without_separate_consent(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "visual_ocr:\n"
+        "  endpoint: http://192.168.10.119:8089/layout-parsing\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="allow_remote_screen_ocr"):
+        load_settings(config)
+
+
+def test_enabled_visual_ocr_requires_local_unrestricted_codex_visual_planning(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "visual_ocr:\n"
+        "  enabled: true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="safety_profile=local_unrestricted"):
+        load_settings(config)
+
+    config.write_text(
+        "privacy:\n"
+        "  allow_cloud_planner: true\n"
+        "computer_control:\n"
+        "  enabled: true\n"
+        "  safety_profile: local_unrestricted\n"
+        "  allow_screen_context_to_cloud: true\n"
+        "execution:\n"
+        "  dry_run: false\n"
+        "visual_ocr:\n"
+        "  enabled: true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="planner_backend=codex_cli_best_effort"):
+        load_settings(config)
+
+
+def test_ocr_regions_require_the_screenshot_visual_layer(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "visual_ocr:\n"
+        "  ocr_regions_enabled: true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="requires visual_ocr.enabled=true"):
+        load_settings(config)
 
 
 def test_personal_runtime_can_continue_fifo_after_an_ordinary_failure(tmp_path: Path) -> None:
@@ -345,6 +411,10 @@ def test_phrase_fields_must_be_yaml_string_lists(tmp_path: Path, content: str) -
         (
             "apps:\n  codex:\n    include_control_types: Button\n",
             "include_control_types must be a YAML list",
+        ),
+        (
+            "apps:\n  wechat:\n    activation_hotkey: [ctrl, alt, w]\n",
+            "activation_hotkey must be a non-empty string or null",
         ),
         (
             "apps:\n  claude:\n    composer_names: ['']\n",

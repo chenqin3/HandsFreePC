@@ -7,6 +7,7 @@ from handsfree_pc.desktop.protocol import (
     DesktopAction,
     DesktopActionType,
     DesktopElement,
+    DesktopElementAction,
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
@@ -18,9 +19,52 @@ from handsfree_pc.desktop.safety import (
     DesktopSafetyPolicy,
     action_matches_next_user_step,
     expectation_matches_user_step,
+    local_dictation_user_text,
     observation_credential_summary,
     user_action_step_count,
 )
+
+
+def test_local_dictation_marker_allows_only_exact_punctuation_rich_composer_payload() -> None:
+    payload = "，第二段保留标点；不要改写。"
+    target = DesktopElement(
+        "2",
+        "Message",
+        "Edit",
+        value="第一段",
+        focused=True,
+        editable=True,
+        composer=True,
+        local_identity="a" * 64,
+    )
+    observation = _observation(
+        '2 name="Message" control_type="Edit" focused=true value="第一段"',
+        elements=(target,),
+    )
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.FOCUSED_CONTAINS,
+        text=payload,
+    )
+    policy = DesktopSafetyPolicy("local_unrestricted")
+
+    exact = policy.evaluate(
+        _action(DesktopActionType.TYPE_TEXT, text=payload),
+        observation,
+        user_text=local_dictation_user_text(payload),
+        expectation=expectation,
+    )
+    invented = policy.evaluate(
+        _action(DesktopActionType.TYPE_TEXT, text="被改写"),
+        observation,
+        user_text=local_dictation_user_text(payload),
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            text="被改写",
+        ),
+    )
+
+    assert exact.disposition == DesktopSafetyDisposition.ALLOW
+    assert invented.disposition == DesktopSafetyDisposition.BLOCK
 
 
 def _observation(
@@ -52,6 +96,249 @@ def _action(
     if index is not None:
         values["element_index"] = index
     return DesktopAction(type=action_type, app=app, generation=generation, **values)
+
+
+def test_visual_ocr_regions_are_click_scroll_only_and_local_unrestricted() -> None:
+    target = DesktopElement(
+        "2",
+        "Chat",
+        "VisualText",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    observation = _observation(elements=(target,))
+    expectation = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, text="对话")
+
+    allowed = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        _action(),
+        observation,
+        user_text="打开 Chat 对话",
+        expectation=expectation,
+    )
+    strict = DesktopSafetyPolicy("strict").evaluate(
+        _action(),
+        observation,
+        user_text="打开 Chat 对话",
+        expectation=expectation,
+    )
+    typing = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        _action(DesktopActionType.TYPE_TEXT, text="hello"),
+        observation,
+        user_text="输入 hello",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.FOCUSED_CONTAINS,
+            text="hello",
+        ),
+    )
+
+    assert allowed.disposition == DesktopSafetyDisposition.ALLOW
+    assert strict.disposition == DesktopSafetyDisposition.BLOCK
+    assert typing.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_only_visual_viewport_may_carry_a_frame_bound_point() -> None:
+    viewport = DesktopElement(
+        "2",
+        "Visual OCR viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK, DesktopElementAction.SCROLL),
+    )
+    ordinary = DesktopElement("2", "Open", "Button")
+    expectation = DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, text="菜单")
+    point = _action(x=20, y=30)
+
+    visual_result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        point,
+        _observation(elements=(viewport,)),
+        user_text="打开屏幕上的菜单",
+        expectation=expectation,
+    )
+    ordinary_result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        point,
+        _observation(elements=(ordinary,)),
+        user_text="打开屏幕上的菜单",
+        expectation=expectation,
+    )
+
+    assert visual_result.disposition == DesktopSafetyDisposition.ALLOW
+    assert ordinary_result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_armed_visual_viewport_accepts_only_an_exact_navigation_search_name() -> None:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(
+            DesktopElementAction.CLICK,
+            DesktopElementAction.SCROLL,
+            DesktopElementAction.TYPE_TEXT,
+        ),
+    )
+    observation = _observation(elements=(viewport,))
+    expectation = DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED)
+    policy = DesktopSafetyPolicy("local_unrestricted")
+
+    allowed = policy.evaluate(
+        _action(
+            DesktopActionType.TYPE_TEXT,
+            index="2",
+            text="文件传输助手",
+        ),
+        observation,
+        user_text="打开微信中的文件传输助手，只打开这个对话，不要输入或发送任何内容",
+        expectation=expectation,
+    )
+    invented = policy.evaluate(
+        _action(
+            DesktopActionType.TYPE_TEXT,
+            index="2",
+            text="不是用户说的目标",
+        ),
+        observation,
+        user_text="打开微信中的文件传输助手",
+        expectation=expectation,
+    )
+    unarmed = policy.evaluate(
+        _action(
+            DesktopActionType.TYPE_TEXT,
+            index="2",
+            text="文件传输助手",
+        ),
+        _observation(
+            elements=(
+                DesktopElement(
+                    "2",
+                    "Visual screenshot viewport",
+                    "VisualViewport",
+                    plane=ElementPlane.CONTROL,
+                    visual_ocr=True,
+                    supported_actions=(DesktopElementAction.CLICK,),
+                ),
+            )
+        ),
+        user_text="打开微信中的文件传输助手",
+        expectation=expectation,
+    )
+
+    assert allowed.disposition == DesktopSafetyDisposition.ALLOW
+    assert invented.disposition == DesktopSafetyDisposition.BLOCK
+    assert unarmed.disposition == DesktopSafetyDisposition.BLOCK
+
+
+@pytest.mark.parametrize("key", ["enter", "return"])
+def test_armed_visual_search_submit_allows_only_enter_or_return_with_null_receipt_expectation(
+    key: str,
+) -> None:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(
+            DesktopElementAction.CLICK,
+            DesktopElementAction.SCROLL,
+            DesktopElementAction.PRESS_KEY,
+        ),
+    )
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        _action(DesktopActionType.PRESS_KEY, app="wechat", index="2", key=key),
+        _observation(app="wechat", elements=(viewport,)),
+        user_text="打开微信中的文件传输助手，只打开这个对话，不发送任何消息",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.LAST_ACTION_VERIFIED,
+            text=None,
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    ("profile", "supported_actions", "key", "expectation"),
+    [
+        (
+            "strict",
+            (DesktopElementAction.PRESS_KEY,),
+            "enter",
+            DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+        ),
+        (
+            "local_unrestricted",
+            (DesktopElementAction.CLICK,),
+            "enter",
+            DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+        ),
+        (
+            "local_unrestricted",
+            (DesktopElementAction.PRESS_KEY,),
+            "tab",
+            DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+        ),
+        (
+            "local_unrestricted",
+            (DesktopElementAction.PRESS_KEY,),
+            "return",
+            DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED, text=""),
+        ),
+        (
+            "local_unrestricted",
+            (DesktopElementAction.PRESS_KEY,),
+            "enter",
+            DesktopExpectation(DesktopExpectationKind.TEXT_PRESENT, text="文件传输助手"),
+        ),
+    ],
+)
+def test_visual_search_submit_rejects_unarmed_strict_wrong_key_or_non_null_expectation(
+    profile: str,
+    supported_actions: tuple[DesktopElementAction, ...],
+    key: str,
+    expectation: DesktopExpectation,
+) -> None:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=supported_actions,
+    )
+
+    result = DesktopSafetyPolicy(profile).evaluate(
+        _action(DesktopActionType.PRESS_KEY, app="wechat", index="2", key=key),
+        _observation(app="wechat", elements=(viewport,)),
+        user_text="打开微信中的文件传输助手，只打开这个对话，不发送任何消息",
+        expectation=expectation,
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_planner_observation_preserves_visual_viewport_source_marker() -> None:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK, DesktopElementAction.SCROLL),
+    )
+    observation = _observation(elements=(viewport,))
+
+    planner_view = DesktopSafetyPolicy("local_unrestricted").planner_observation(
+        observation,
+        user_text="打开屏幕上的对话",
+    )
+
+    assert len(planner_view.elements) == 1
+    assert planner_view.elements[0].control_type == "VisualViewport"
+    assert planner_view.elements[0].visual_ocr is True
 
 
 def test_raw_high_credential_flag_blocks_focused_input_after_display_bounding() -> None:
@@ -740,9 +1027,9 @@ def test_content_identifier_styles_do_not_define_the_surface(identifier: str) ->
         "ghp_" + "DUMMYTOKEN1234567890abcdef123456",
         "AKIA" + "DUMMYTOKEN123456",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.DUMMYSIGNATURE123",
-        "Bearer DUMMYmixedToken1234567890_abcdef-XYZ",
+        "Bearer " + "DUMMYmixedToken1234567890_abcdef-XYZ",
         "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_TOKEN",
-        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN " + "PRIVATE KEY-----",
     ],
 )
 def test_credentials_in_content_are_detected_but_do_not_block_navigation(
@@ -2052,6 +2339,71 @@ def test_click_target_disappearance_cannot_prove_navigation_success() -> None:
     assert result.disposition == DesktopSafetyDisposition.BLOCK
 
 
+def test_unique_related_result_button_can_use_exact_disappearance_bridge_locally() -> None:
+    label = "文件传输助手 在手机和电脑之间传输各类文件 前往"
+    target = DesktopElement(
+        "7",
+        label,
+        "Button",
+        enabled=True,
+        addressable=True,
+        supported_actions=(DesktopElementAction.CLICK,),
+    )
+    observation = _observation(
+        f'7 name="{label}" control_type="Button"',
+        elements=(target,),
+    )
+    action = _action(DesktopActionType.CLICK, index="7")
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.TEXT_ABSENT,
+        text=label,
+    )
+
+    allowed = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="打开文件传输助手",
+        expectation=expectation,
+    )
+    strict = DesktopSafetyPolicy("strict").evaluate(
+        action,
+        observation,
+        user_text="打开文件传输助手",
+        expectation=expectation,
+    )
+
+    assert allowed.disposition == DesktopSafetyDisposition.ALLOW
+    assert strict.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_related_result_disappearance_bridge_requires_one_unique_exact_button() -> None:
+    label = "文件传输助手 在手机和电脑之间传输各类文件 前往"
+    elements = tuple(
+        DesktopElement(
+            str(index),
+            label if index == 7 else "文件传输助手 另一个结果 前往",
+            "Button",
+            enabled=True,
+            addressable=True,
+            supported_actions=(DesktopElementAction.CLICK,),
+        )
+        for index in (7, 8)
+    )
+    observation = _observation(elements=elements)
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        _action(DesktopActionType.CLICK, index="7"),
+        observation,
+        user_text="打开文件传输助手",
+        expectation=DesktopExpectation(
+            DesktopExpectationKind.TEXT_ABSENT,
+            text=label,
+        ),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
 def test_arrow_key_on_named_control_requires_confirmation() -> None:
     observation = _observation(
         '7 name="Visibility" control_type="ComboBox" focused=true',
@@ -3254,6 +3606,223 @@ def test_local_unrestricted_allows_an_ordinary_toggle_without_confirmation() -> 
     )
 
     assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    ("action", "element"),
+    [
+        (
+            _action(
+                DesktopActionType.SCROLL,
+                index="2",
+                direction="down",
+                pages=1,
+            ),
+            DesktopElement(
+                "2",
+                "Conversation list",
+                "ScrollBar",
+                supported_actions=("scroll",),
+                scroll_axes=("vertical",),
+            ),
+        ),
+        (
+            _action(
+                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                index="2",
+                action_name="expand",
+            ),
+            DesktopElement(
+                "2",
+                "Older conversations",
+                "TreeItem",
+                supported_actions=("expand",),
+                expand_collapse_state="collapsed",
+            ),
+        ),
+    ],
+)
+def test_local_unrestricted_allows_verified_instrumental_reveal(
+    action: DesktopAction,
+    element: DesktopElement,
+) -> None:
+    observation = _observation(elements=(element,))
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="打开季度复盘对话",
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    ("action", "element", "reason"),
+    [
+        (
+            _action(
+                DesktopActionType.SCROLL,
+                index="2",
+                direction="down",
+                pages=1,
+            ),
+            DesktopElement(
+                "2",
+                "Conversation list",
+                "Pane",
+                supported_actions=(),
+            ),
+            "did not declare UIA scrolling",
+        ),
+        (
+            _action(
+                DesktopActionType.SCROLL,
+                index="2",
+                direction="right",
+                pages=1,
+            ),
+            DesktopElement(
+                "2",
+                "Conversation list",
+                "Pane",
+                supported_actions=("scroll",),
+                scroll_axes=("vertical",),
+            ),
+            "outside the target's observed UIA axes",
+        ),
+        (
+            _action(
+                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                index="2",
+                action_name="expand",
+            ),
+            DesktopElement(
+                "2",
+                "Older conversations",
+                "TreeItem",
+                supported_actions=("scrollintoview",),
+            ),
+            "did not declare the requested UIA capability",
+        ),
+    ],
+)
+def test_observed_capability_metadata_fail_closes_secondary_and_scroll_actions(
+    action: DesktopAction,
+    element: DesktopElement,
+    reason: str,
+) -> None:
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        _observation(elements=(element,)),
+        user_text="打开季度复盘对话",
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+    assert reason in result.reason
+
+
+def test_legacy_element_without_capability_metadata_remains_compatible() -> None:
+    action = _action(
+        DesktopActionType.SCROLL,
+        index="2",
+        direction="down",
+        pages=1,
+    )
+    observation = _observation(
+        elements=(DesktopElement("2", "Conversation list", "ScrollBar"),)
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="打开季度复盘对话",
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        _action(DesktopActionType.CLICK, index="2"),
+        _action(
+            DesktopActionType.PERFORM_SECONDARY_ACTION,
+            index="2",
+            action_name="collapse",
+        ),
+    ],
+)
+def test_last_action_verified_cannot_justify_non_reveal_actions(action: DesktopAction) -> None:
+    element = DesktopElement(
+        "2",
+        "Older conversations",
+        "TreeItem",
+    )
+    observation = _observation(elements=(element,))
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        observation,
+        user_text="打开季度复盘对话",
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+
+
+def test_last_action_verified_allows_one_exact_frame_visual_point_click() -> None:
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        plane=ElementPlane.CONTROL,
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.CLICK, DesktopElementAction.SCROLL),
+    )
+    action = _action(
+        DesktopActionType.CLICK,
+        index="2",
+        x=20,
+        y=30,
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        _observation(elements=(viewport,)),
+        user_text="打开屏幕上的目标对话",
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.ALLOW
+
+
+def test_collapse_capability_is_never_an_instrumental_reveal_bridge() -> None:
+    element = DesktopElement(
+        "2",
+        "Older conversations",
+        "TreeItem",
+        supported_actions=("collapse",),
+        expand_collapse_state="expanded",
+    )
+    action = _action(
+        DesktopActionType.PERFORM_SECONDARY_ACTION,
+        index="2",
+        action_name="collapse",
+    )
+
+    result = DesktopSafetyPolicy("local_unrestricted").evaluate(
+        action,
+        _observation(elements=(element,)),
+        user_text="打开季度复盘对话",
+        expectation=DesktopExpectation(DesktopExpectationKind.LAST_ACTION_VERIFIED),
+    )
+
+    assert result.disposition == DesktopSafetyDisposition.BLOCK
+    assert "last-action verification" in result.reason
 
 
 def test_local_unrestricted_keeps_high_impact_dialog_actions_confirmed() -> None:

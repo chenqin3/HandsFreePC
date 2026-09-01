@@ -12,6 +12,7 @@ config*.local.yml
 models/
 recordings/
 runtime/
+.runtime/
 *.wav
 *.mp3
 *.m4a
@@ -22,6 +23,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.pytest-*/
 .pytest-tmp/
 .pytest-tmp*/
 .pytest_tmp*/

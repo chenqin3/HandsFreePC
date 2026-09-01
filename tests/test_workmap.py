@@ -413,6 +413,54 @@ def test_candidate_search_is_ranked_but_never_opens_a_fuzzy_query(tmp_path: Path
     assert index.resolve_open_request("打开示例数据") is None
 
 
+def test_planner_hints_can_bound_the_shortlist_to_available_local_targets(tmp_path: Path) -> None:
+    index, _root, _processed = _build_index(tmp_path, second_project=True)
+    index.projects[0].root.rename(tmp_path / "primary-moved-away")
+
+    hints = index.planner_hints(
+        "示例数据",
+        limit=5,
+        minimum_score=0.0,
+        available_only=True,
+    )
+
+    assert len(hints) == 1
+    assert hints[0]["project_name"] == "另一示例数据项目"
+    assert hints[0]["target_available"] is True
+
+
+def test_unique_fuzzy_name_can_be_bound_locally_without_changing_exact_open_contract(
+    tmp_path: Path,
+) -> None:
+    index, _root, processed = _build_index(tmp_path)
+
+    assert index.resolve_open_request("打开示例数剧库") is None
+    assert index.resolve_unique_name("示例数剧库", minimum_score=0.70) == processed.resolve()
+    assert index.resolve_unique_name("数据", minimum_score=0.70) is None
+
+
+def test_fuzzy_workmap_name_stays_unresolved_when_two_targets_are_close(tmp_path: Path) -> None:
+    aliases = {
+        "招聘数据库甲": {"project": "示例数据项目-462365", "relative_path": "processed_data"},
+        "招聘数据库乙": "另一示例数据项目-e2902b",
+    }
+    index, _root, _processed = _build_index(
+        tmp_path,
+        aliases=aliases,
+        second_project=True,
+    )
+
+    assert index.resolve_unique_name("招聘数据库", minimum_score=0.70) is None
+
+
+def test_opaque_workmap_candidate_id_round_trips_only_through_local_index(tmp_path: Path) -> None:
+    index, _root, processed = _build_index(tmp_path)
+    candidate = index.search_candidates("示例数据库", limit=1)[0]
+
+    assert index.resolve_candidate_id(candidate.target_id) == processed.resolve()
+    assert index.resolve_candidate_id("wm-not-a-real-target") is None
+
+
 def test_unknown_alias_project_is_rejected_at_load(tmp_path: Path) -> None:
     with pytest.raises(WorkMapConfigurationError):
         _build_index(tmp_path, aliases={"未知项目": "not-present"})

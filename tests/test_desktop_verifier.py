@@ -9,9 +9,11 @@ from handsfree_pc.desktop.protocol import (
     DesktopDecision,
     DesktopDecisionKind,
     DesktopElement,
+    DesktopElementAction,
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
+    visual_state_binding_token,
 )
 from handsfree_pc.desktop.verifier import DesktopVerifier
 
@@ -42,11 +44,17 @@ def _click(*, app: str = "Notepad", generation: int = 1, index: str = "2") -> De
     )
 
 
-def _receipt(action: DesktopAction, *, accepted: bool = True) -> ActionReceipt:
+def _receipt(
+    action: DesktopAction,
+    *,
+    accepted: bool = True,
+    after_local_window_id: str | None = None,
+) -> ActionReceipt:
     return ActionReceipt(
         action=action,
         accepted=accepted,
         before_generation=action.generation,
+        after_local_window_id=after_local_window_id,
     )
 
 
@@ -61,6 +69,86 @@ def test_action_requires_fresh_same_app_observable_state() -> None:
     assert result.verified
     assert result.app == "Notepad"
     assert result.generation == 4
+
+
+def test_visual_viewport_action_uses_changed_screenshot_as_transition_evidence() -> None:
+    verifier = DesktopVerifier()
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        visual_ocr=True,
+    )
+    before = DesktopObservation(
+        app="wechat",
+        generation=1,
+        accessibility_text="stable visual viewport",
+        screenshot_png=b"before-frame",
+        elements=(viewport,),
+        local_window_id="window-a",
+        captured_at=1.0,
+    )
+    after = DesktopObservation(
+        app="wechat",
+        generation=2,
+        accessibility_text="stable visual viewport",
+        screenshot_png=b"after-frame",
+        elements=(viewport,),
+        local_window_id="window-a",
+        captured_at=2.0,
+    )
+    action = DesktopAction(
+        DesktopActionType.CLICK,
+        app="wechat",
+        generation=1,
+        element_index="2",
+        x=20,
+        y=30,
+    )
+
+    result = verifier.verify_action(action, _receipt(action), before, after)
+
+    assert result.verified is True
+
+
+def test_visual_viewport_text_uses_changed_screenshot_as_transition_evidence() -> None:
+    verifier = DesktopVerifier()
+    viewport = DesktopElement(
+        "2",
+        "Visual screenshot viewport",
+        "VisualViewport",
+        visual_ocr=True,
+        supported_actions=(DesktopElementAction.TYPE_TEXT,),
+    )
+    before = DesktopObservation(
+        app="wechat",
+        generation=1,
+        accessibility_text="stable visual viewport",
+        screenshot_png=b"focused-empty-search",
+        elements=(viewport,),
+        local_window_id="window-a",
+        captured_at=1.0,
+    )
+    after = DesktopObservation(
+        app="wechat",
+        generation=2,
+        accessibility_text="stable visual viewport",
+        screenshot_png=b"search-results-visible",
+        elements=(viewport,),
+        local_window_id="window-a",
+        captured_at=2.0,
+    )
+    action = DesktopAction(
+        DesktopActionType.TYPE_TEXT,
+        app="wechat",
+        generation=1,
+        element_index="2",
+        text="文件传输助手",
+    )
+
+    result = verifier.verify_action(action, _receipt(action), before, after)
+
+    assert result.verified is True
 
 
 @pytest.mark.parametrize(
@@ -87,6 +175,110 @@ def test_action_verification_fails_closed_on_stale_or_unbound_state(
 
     assert not result.verified
     assert reason_fragment in result.reason
+
+
+@pytest.mark.parametrize(
+    ("action_type", "action_fields"),
+    [
+        (DesktopActionType.CLICK, {}),
+        (DesktopActionType.PERFORM_SECONDARY_ACTION, {"action_name": "invoke"}),
+        (DesktopActionType.PRESS_KEY, {"key": "enter"}),
+    ],
+)
+def test_driver_receipt_binds_fresh_related_local_window_transition(
+    action_type: DesktopActionType,
+    action_fields: dict[str, str],
+) -> None:
+    verifier = DesktopVerifier()
+    target = DesktopElement("2", "Open result", "Button")
+    before = DesktopObservation(
+        app="wechat",
+        generation=4,
+        accessibility_text="source window",
+        screenshot_png=b"source-frame",
+        elements=(target,),
+        local_window_id="window-a",
+        captured_at=4.0,
+    )
+    after = DesktopObservation(
+        app="WECHAT",
+        generation=5,
+        accessibility_text="related child window",
+        screenshot_png=b"related-frame",
+        local_window_id="window-b",
+        captured_at=5.0,
+    )
+    action = DesktopAction(
+        action_type,
+        app="wechat",
+        generation=4,
+        element_index="2",
+        **action_fields,
+    )
+    receipt = _receipt(action, after_local_window_id="window-b")
+
+    result = verifier.verify_action(action, receipt, before, after)
+
+    assert result.verified is True
+    assert result.app == "WECHAT"
+    assert result.generation == 5
+
+
+@pytest.mark.parametrize(
+    ("action_type", "action_fields"),
+    [
+        (DesktopActionType.CLICK, {}),
+        (DesktopActionType.PERFORM_SECONDARY_ACTION, {"action_name": "invoke"}),
+        (DesktopActionType.PRESS_KEY, {"key": "return"}),
+    ],
+)
+@pytest.mark.parametrize(
+    ("receipt_window_id", "after_window_id", "after_generation", "after_captured_at"),
+    [
+        (None, "window-b", 5, 5.0),
+        ("window-c", "window-b", 5, 5.0),
+        ("window-b", "window-b", 4, 5.0),
+        ("window-b", "window-b", 5, 3.0),
+    ],
+)
+def test_related_local_window_transition_rejects_missing_mismatched_or_stale_receipt(
+    action_type: DesktopActionType,
+    action_fields: dict[str, str],
+    receipt_window_id: str | None,
+    after_window_id: str,
+    after_generation: int,
+    after_captured_at: float,
+) -> None:
+    verifier = DesktopVerifier()
+    before = DesktopObservation(
+        app="wechat",
+        generation=4,
+        accessibility_text="source window",
+        screenshot_png=b"source-frame",
+        elements=(DesktopElement("2", "Open result", "Button"),),
+        local_window_id="window-a",
+        captured_at=4.0,
+    )
+    after = DesktopObservation(
+        app="wechat",
+        generation=after_generation,
+        accessibility_text="related child window",
+        screenshot_png=b"related-frame",
+        local_window_id=after_window_id,
+        captured_at=after_captured_at,
+    )
+    action = DesktopAction(
+        action_type,
+        app="wechat",
+        generation=4,
+        element_index="2",
+        **action_fields,
+    )
+    receipt = _receipt(action, after_local_window_id=receipt_window_id)
+
+    result = verifier.verify_action(action, receipt, before, after)
+
+    assert result.verified is False
 
 
 def test_driver_acceptance_and_matching_receipt_are_not_skipped() -> None:
@@ -236,6 +428,42 @@ def test_planner_done_prose_is_never_completion_evidence() -> None:
 
     assert not result.verified
     assert "locally verified" in result.reason
+
+
+def test_visual_completion_is_bound_to_the_exact_current_screenshot() -> None:
+    verifier = DesktopVerifier()
+    screenshot = b"fresh-rendered-window"
+    observation = DesktopObservation(
+        app="wechat",
+        generation=4,
+        accessibility_text="rendered viewport",
+        screenshot_png=screenshot,
+        local_window_id="window-a",
+        elements=(
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                visual_ocr=True,
+            ),
+        ),
+    )
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+        visual_state_binding_token(observation),
+    )
+
+    assert verifier.verify_expectation(expectation, observation).verified
+
+    stale = DesktopObservation(
+        app="wechat",
+        generation=5,
+        accessibility_text="rendered viewport",
+        screenshot_png=b"different-window-frame",
+        elements=observation.elements,
+        local_window_id="window-a",
+    )
+    assert not verifier.verify_expectation(expectation, stale).verified
 
 
 def test_completion_uses_local_literal_expectation() -> None:

@@ -31,6 +31,8 @@
           ]
         },
         "element_index": {"type": "string", "pattern": "^[0-9]+$"},
+        "x": {"type": ["integer", "null"], "minimum": 0, "maximum": 16383},
+        "y": {"type": ["integer", "null"], "minimum": 0, "maximum": 16383},
         "click_count": {"type": ["integer", "null"], "enum": [1, null]},
         "mouse_button": {"type": ["string", "null"], "enum": ["left", null]},
         "direction": {
@@ -77,6 +79,8 @@
       "required": [
         "type",
         "element_index",
+        "x",
+        "y",
         "click_count",
         "mouse_button",
         "direction",
@@ -99,7 +103,8 @@
             "text_absent",
             "focused_contains",
             "element_selected",
-            "search_submitted"
+            "search_submitted",
+            "last_action_verified"
           ]
         },
         "text": {"type": ["string", "null"], "maxLength": 500}

@@ -352,6 +352,19 @@ class WorkMapIndex:
     def resolve_open_request(self, text: str) -> Path | None:
         """Resolve one complete affirmative open request, never a partial clause."""
 
+        target_text = self._open_request_target(text)
+        if target_text is None:
+            return None
+        bindings = self._bindings.get(_normalize_key(target_text), ())
+        if not bindings:
+            return None
+        unique_bindings = {_binding_identity(binding): binding for binding in bindings}
+        if len(unique_bindings) != 1:
+            return None
+        return self._existing_target(next(iter(unique_bindings.values())))
+
+    @staticmethod
+    def _open_request_target(text: str) -> str | None:
         if not isinstance(text, str) or not text.strip():
             return None
         if _QUOTE_RE.search(text) or _NEGATION_RE.search(text) or _MULTI_CLAUSE_RE.search(text):
@@ -363,13 +376,66 @@ class WorkMapIndex:
         target_text = match.group("target").strip()
         if not target_text or re.search(r"(?:打开|进入|查看)", target_text):
             return None
-        bindings = self._bindings.get(_normalize_key(target_text), ())
-        if not bindings:
+        return target_text
+
+    def resolve_unique_name(
+        self,
+        query: str,
+        *,
+        minimum_score: float = 0.78,
+        ambiguity_margin: float = 0.06,
+    ) -> Path | None:
+        """Resolve a project/alias name only when one candidate clearly wins.
+
+        This method is the bounded local counterpart to planner candidate
+        selection.  It does not search project contents and it never treats a
+        missing or tied candidate as a successful match.
+        """
+
+        if not isinstance(query, str) or not query.strip():
             return None
-        unique_bindings = {_binding_identity(binding): binding for binding in bindings}
-        if len(unique_bindings) != 1:
+        if len(_normalize_search(query)) < 3:
             return None
-        return self._existing_target(next(iter(unique_bindings.values())))
+        if not 0.0 <= float(minimum_score) <= 1.0:
+            raise ValueError("WorkMap minimum_score must be between 0 and 1")
+        if not 0.0 <= float(ambiguity_margin) <= 1.0:
+            raise ValueError("WorkMap ambiguity_margin must be between 0 and 1")
+        ranked: dict[str, tuple[float, _AliasBinding]] = {}
+        for bindings in self._bindings.values():
+            for binding in bindings:
+                target_id = _binding_target_id(binding)
+                score = _score(query, binding.alias)
+                current = ranked.get(target_id)
+                if current is None or score > current[0]:
+                    ranked[target_id] = (score, binding)
+        ordered = sorted(
+            (
+                (score, target_id, binding)
+                for target_id, (score, binding) in ranked.items()
+                if score >= float(minimum_score)
+            ),
+            key=lambda item: (-item[0], item[1]),
+        )
+        if not ordered:
+            return None
+        best_score, _best_id, best_binding = ordered[0]
+        if len(ordered) > 1 and best_score - ordered[1][0] < float(ambiguity_margin):
+            return None
+        return self._existing_target(best_binding)
+
+    def resolve_candidate_id(self, target_id: str) -> Path | None:
+        """Bind one opaque planner candidate id back to an existing local path."""
+
+        if not isinstance(target_id, str) or not target_id.startswith("wm-"):
+            return None
+        matches: dict[tuple[str, tuple[str, ...]], _AliasBinding] = {}
+        for bindings in self._bindings.values():
+            for binding in bindings:
+                if _binding_target_id(binding) == target_id:
+                    matches[_binding_identity(binding)] = binding
+        if len(matches) != 1:
+            return None
+        return self._existing_target(next(iter(matches.values())))
 
     def search_candidates(
         self,
@@ -444,16 +510,23 @@ class WorkMapIndex:
         *,
         limit: int = 5,
         minimum_score: float = 0.65,
+        available_only: bool = False,
     ) -> tuple[dict[str, object], ...]:
         """Return a serializable, path-free candidate list; this does not grant cloud consent."""
 
+        if not isinstance(available_only, bool):
+            raise ValueError("WorkMap available_only must be a boolean")
+        pool_limit = min(20, max(limit, limit * 4)) if available_only else limit
+        candidates = self.search_candidates(
+            query,
+            limit=pool_limit,
+            minimum_score=minimum_score,
+        )
+        if available_only:
+            candidates = tuple(candidate for candidate in candidates if candidate.target_available)
         return tuple(
             candidate.planner_hint()
-            for candidate in self.search_candidates(
-                query,
-                limit=limit,
-                minimum_score=minimum_score,
-            )
+            for candidate in candidates[:limit]
         )
 
 

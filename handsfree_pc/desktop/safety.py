@@ -12,9 +12,11 @@ from .protocol import (
     DesktopAction,
     DesktopActionType,
     DesktopElement,
+    DesktopElementAction,
     DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
+    DesktopScrollAxis,
     ElementPlane,
     contains_high_confidence_credential,
     credential_findings,
@@ -38,6 +40,27 @@ class DesktopSafetyProfile(StrEnum):
 class DesktopActionBinding(StrEnum):
     USER_STEP = "user_step"
     NAVIGATION_BRIDGE = "navigation_bridge"
+
+
+_LOCAL_DICTATION_USER_TEXT_PREFIX = "[[handsfreepc-local-dictation-original-v1]]"
+
+
+def local_dictation_user_text(payload: str) -> str:
+    """Mark an exact queued transcript segment for local composer safety checks.
+
+    Ordinary command parsing treats punctuation as clause boundaries. Dictated
+    prose cannot: a segment may begin with a comma or contain many sentences.
+    The marker is accepted only by the narrow composer branch in ``evaluate``;
+    the complete suffix must still equal the dispatched payload byte-for-byte.
+    """
+
+    return f"{_LOCAL_DICTATION_USER_TEXT_PREFIX}{payload}"
+
+
+def _local_dictation_payload(user_text: str) -> str | None:
+    if not user_text.startswith(_LOCAL_DICTATION_USER_TEXT_PREFIX):
+        return None
+    return user_text[len(_LOCAL_DICTATION_USER_TEXT_PREFIX) :]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1708,6 +1731,35 @@ def _natural_search_payload_authorized(payload: str, user_text: str) -> bool:
     return bool(normalized) and normalized in _positive_natural_search_payloads(user_text)
 
 
+def _visual_navigation_payload_authorized(payload: str, user_text: str) -> bool:
+    """Allow one exact spoken destination name in an armed rendered search field."""
+
+    normalized = _normalized(payload)
+    if (
+        not normalized
+        or payload not in user_text
+        or len(payload) > 128
+        or any(character in payload for character in ("\n", "\r", "\t"))
+        or _contains_term(payload, _SECRET_TERMS)
+        or _looks_like_payment_surface(payload)
+        or _looks_like_privacy_surface(payload)
+        or _has_negated_candidate_occurrence(payload, user_text)
+    ):
+        return False
+    return any(
+        _verb_matches_action_type(verb, DesktopActionType.CLICK)
+        and bool(
+            _target_spans_for_verb(
+                payload,
+                user_text,
+                verb,
+                DesktopActionType.CLICK,
+            )
+        )
+        for verb in _positive_user_action_verbs(user_text)
+    )
+
+
 def natural_search_step_count(user_text: str) -> int:
     return sum(
         1
@@ -2335,6 +2387,31 @@ def _affirmatively_authorized_span(
         reject_outcome_bridge=True,
         competing_labels=competing_labels,
         require_complete_target=True,
+    )
+
+
+_RELATED_RESULT_AFFORDANCE_RE = re.compile(
+    r"(?:前往|go\s+to|open\s+in\s+(?:app|application))\s*$",
+    re.IGNORECASE,
+)
+
+
+def _related_result_destination_is_authorized(label: str, user_text: str) -> bool:
+    """Bind one rendered result-card affordance to an authored destination."""
+
+    normalized_label = " ".join(label.split())
+    match = _RELATED_RESULT_AFFORDANCE_RE.search(normalized_label)
+    if match is None:
+        return False
+    stem = normalized_label[: match.start()].strip(" :-—–|，,。")
+    words = stem.split()
+    candidates = [" ".join(words[:end]) for end in range(len(words), 0, -1)]
+    if not words and stem:
+        candidates.append(stem)
+    return any(
+        len(_normalized(candidate)) >= 2
+        and _affirmatively_authorized_span(candidate, user_text)
+        for candidate in candidates
     )
 
 
@@ -3089,16 +3166,23 @@ class DesktopSafetyPolicy:
     ) -> DesktopObservation:
         """Return the minimal task-authorized UI subset that may cross a planner boundary."""
 
-        # CONTENT nodes describe chat history, document bodies, and other
-        # read-only UI text.  The local driver cannot address them, so they
-        # must not influence planner-visible label uniqueness or be assigned
-        # an index that a planner could try to execute.  A focused Document is
-        # classified as INPUT by ``element_plane`` and remains eligible.
+        unrestricted = self.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
+
+        # Ordinary CONTENT nodes describe chat history and document bodies and
+        # remain non-addressable. A positive UIA ScrollPattern is the narrow
+        # exception: it exposes only scrolling capability, never click.
         addressable_elements = tuple(
             element
             for element in observation.elements
             if element.addressable
-            and element_plane(element) in {ElementPlane.CONTROL, ElementPlane.INPUT}
+            and (
+                element_plane(element) in {ElementPlane.CONTROL, ElementPlane.INPUT}
+                or (
+                    element_plane(element) == ElementPlane.CONTENT
+                    and element.supported_actions is not None
+                    and DesktopElementAction.SCROLL in element.supported_actions
+                )
+            )
         )
         name_counts: dict[str, int] = {}
         for element in addressable_elements:
@@ -3118,7 +3202,6 @@ class DesktopSafetyPolicy:
         competing_labels = tuple(
             element.name for element in addressable_elements if element.name.strip()
         )
-        unrestricted = self.profile == DesktopSafetyProfile.LOCAL_UNRESTRICTED
         for element in addressable_elements:
             normalized_name = _normalized(element.name.strip())
             plane = element_plane(element)
@@ -3137,6 +3220,13 @@ class DesktopSafetyPolicy:
                     and element.enabled
                     and (unrestricted or element.focused is True)
                 )
+                or (
+                    unrestricted
+                    and plane == ElementPlane.CONTENT
+                    and element.enabled
+                    and element.supported_actions is not None
+                    and DesktopElementAction.SCROLL in element.supported_actions
+                )
             )
             unnamed_trusted_composer = bool(
                 self.profile
@@ -3148,9 +3238,20 @@ class DesktopSafetyPolicy:
                 and element.composer
                 and unique_focused_input == [element.index]
             )
+            unnamed_scroll_target = bool(
+                unrestricted
+                and not normalized_name
+                and plane == ElementPlane.CONTENT
+                and element.supported_actions is not None
+                and DesktopElementAction.SCROLL in element.supported_actions
+            )
             if (
                 element.password
-                or (not normalized_name and not unnamed_trusted_composer)
+                or (
+                    not normalized_name
+                    and not unnamed_trusted_composer
+                    and not unnamed_scroll_target
+                )
                 or (not unrestricted and normalized_name and name_counts.get(normalized_name) != 1)
             ):
                 continue
@@ -3183,6 +3284,13 @@ class DesktopSafetyPolicy:
                     addressable=True,
                     composer=element.composer,
                     name_metadata=element.name_metadata,
+                    supported_actions=element.supported_actions,
+                    expand_collapse_state=element.expand_collapse_state,
+                    scroll_axes=element.scroll_axes,
+                    # This is a source/capability marker, not local identity or
+                    # secret metadata. The planner must retain it to bind x/y
+                    # only to the exact frame-scoped VisualViewport.
+                    visual_ocr=element.visual_ocr,
                 )
             )
         lines = [json.dumps({"app": observation.app, "task_authorized_subset": True})]
@@ -3381,9 +3489,81 @@ class DesktopSafetyPolicy:
             (element for element in observation.elements if element.index == action.element_index),
             None,
         )
+        visual_text_input = bool(
+            unrestricted
+            and action.type == DesktopActionType.TYPE_TEXT
+            and target is not None
+            and target.visual_ocr
+            and target.control_type == "VisualViewport"
+            and target.enabled
+            and target.addressable
+            and target.supported_actions is not None
+            and DesktopElementAction.TYPE_TEXT in target.supported_actions
+        )
+        visual_search_submission = bool(
+            unrestricted
+            and action.type == DesktopActionType.PRESS_KEY
+            and (action.key or "").strip().casefold() in {"enter", "return"}
+            and target is not None
+            and target.visual_ocr
+            and target.control_type == "VisualViewport"
+            and target.enabled
+            and target.addressable
+            and target.supported_actions is not None
+            and DesktopElementAction.PRESS_KEY in target.supported_actions
+        )
+
+        has_point_coordinates = action.x is not None or action.y is not None
+        if has_point_coordinates and (
+            target is None
+            or not target.visual_ocr
+            or target.control_type != "VisualViewport"
+            or action.type != DesktopActionType.CLICK
+            or action.x is None
+            or action.y is None
+        ):
+            return _block("x/y are allowed only for one bound VisualViewport click")
+        if (
+            target is not None
+            and target.visual_ocr
+            and target.control_type == "VisualViewport"
+            and action.type == DesktopActionType.CLICK
+            and not has_point_coordinates
+        ):
+            return _block("VisualViewport click requires one screenshot-local x/y point")
 
         if target is not None and not target.addressable:
             return _block("the selected element is retained only for local safety or freshness")
+
+        if target is not None and target.visual_ocr:
+            if not unrestricted:
+                return _block("visual OCR regions require local_unrestricted safety")
+            if action.type not in {
+                DesktopActionType.CLICK,
+                DesktopActionType.SCROLL,
+                DesktopActionType.TYPE_TEXT,
+                DesktopActionType.PRESS_KEY,
+            }:
+                return _block(
+                    "visual regions permit rebound click, viewport scroll, armed text, "
+                    "or one armed search submit only"
+                )
+            if action.type == DesktopActionType.TYPE_TEXT and not visual_text_input:
+                return _block(
+                    "visual text input requires a single-use viewport focus binding"
+                )
+            if action.type == DesktopActionType.PRESS_KEY and not visual_search_submission:
+                return _block(
+                    "visual Enter/Return requires one native-focus-bound search submission"
+                )
+            if (
+                action.type == DesktopActionType.CLICK
+                and (
+                    target.supported_actions is None
+                    or DesktopElementAction.CLICK not in target.supported_actions
+                )
+            ):
+                return _block("visual OCR target did not declare semantic click support")
 
         if (
             target is not None
@@ -3392,7 +3572,38 @@ class DesktopSafetyPolicy:
         ):
             return _block("chat and document content is not an addressable control target")
 
-        if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.PRESS_KEY}:
+        if target is not None and target.supported_actions is not None:
+            if action.type == DesktopActionType.PERFORM_SECONDARY_ACTION:
+                try:
+                    requested_capability = DesktopElementAction(
+                        (action.action_name or "").strip().casefold()
+                    )
+                except ValueError:
+                    return _block("secondary action is not a declared UIA capability")
+                if requested_capability not in target.supported_actions:
+                    return _block("target did not declare the requested UIA capability")
+            elif action.type == DesktopActionType.SCROLL:
+                if DesktopElementAction.SCROLL not in target.supported_actions:
+                    return _block("target did not declare UIA scrolling capability")
+                required_axis = (
+                    DesktopScrollAxis.VERTICAL
+                    if action.direction in {"up", "down"}
+                    else DesktopScrollAxis.HORIZONTAL
+                )
+                if target.scroll_axes is not None and required_axis not in target.scroll_axes:
+                    return _block("scroll direction is outside the target's observed UIA axes")
+            elif (
+                action.type == DesktopActionType.PRESS_KEY
+                and target.visual_ocr
+                and DesktopElementAction.PRESS_KEY not in target.supported_actions
+            ):
+                return _block("target did not declare native-bound key support")
+
+        if (
+            action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.PRESS_KEY}
+            and not visual_text_input
+            and not visual_search_submission
+        ):
             focused_targets = [
                 element
                 for element in observation.elements
@@ -3411,8 +3622,36 @@ class DesktopSafetyPolicy:
             else ""
         )
         if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}:
+            local_dictation_payload = _local_dictation_payload(user_text)
+            exact_local_dictation = bool(
+                unrestricted
+                and action.type == DesktopActionType.TYPE_TEXT
+                and target is not None
+                and target.local_identity
+                and target.composer
+                and target.focused is True
+                and target.enabled
+                and target.addressable
+                and not target.password
+                and not target.secret_labeled
+                and not target.high_credential
+                and not target.low_credential
+                and element_plane(target) == ElementPlane.INPUT
+                and target.editable is not False
+                and local_dictation_payload is not None
+                and action_payload == local_dictation_payload
+            )
             if unrestricted:
                 payload_is_exact = bool(action_payload) and (
+                    exact_local_dictation
+                    or (
+                        visual_text_input
+                        and _visual_navigation_payload_authorized(
+                            action_payload,
+                            user_text,
+                        )
+                    )
+                    or
                     any(
                         _verb_matches_action_type(verb, action.type)
                         and _payload_belongs_to_verb(action_payload, user_text, verb)
@@ -3523,6 +3762,7 @@ class DesktopSafetyPolicy:
             target_control_type = _normalized(target.control_type)
             if (
                 action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}
+                and not visual_text_input
                 and target_control_type not in _EDITABLE_CONTROL_TYPES
             ):
                 return _block("text input target is not an editable accessibility control")
@@ -3667,6 +3907,50 @@ class DesktopSafetyPolicy:
                 )
             )
         )
+        instrumental_reveal = bool(
+            unrestricted
+            and expectation is not None
+            and expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+            and target is not None
+            and target.addressable
+            and target.enabled
+            and not target.password
+            and not target.secret_labeled
+            and (
+                action.type == DesktopActionType.SCROLL
+                or (
+                    action.type == DesktopActionType.PERFORM_SECONDARY_ACTION
+                    and (action.action_name or "").strip().casefold()
+                    in {"expand", "scrollintoview"}
+                )
+            )
+        )
+        visual_frame_transition = bool(
+            unrestricted
+            and expectation is not None
+            and expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+            and target is not None
+            and target.visual_ocr
+            and target.control_type == "VisualViewport"
+            and (
+                (
+                    action.type == DesktopActionType.CLICK
+                    and action.x is not None
+                    and action.y is not None
+                )
+                or visual_text_input
+                or visual_search_submission
+            )
+        )
+        if (
+            expectation is not None
+            and expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+            and not instrumental_reveal
+            and not visual_frame_transition
+        ):
+            return _block(
+                "last-action verification is reserved for local scroll or reveal bridges"
+            )
         if expectation is not None and expectation.text:
             expected = _normalized(expectation.text)
             payload_exact = {
@@ -3765,11 +4049,48 @@ class DesktopSafetyPolicy:
             if not expected_is_authorized:
                 return _block("postcondition text is not bound to the user task or target")
             target_name = _normalized(target.name) if target is not None else ""
+            related_result_disappearance = bool(
+                unrestricted
+                and action.type
+                in {
+                    DesktopActionType.CLICK,
+                    DesktopActionType.PERFORM_SECONDARY_ACTION,
+                }
+                and expectation.kind == DesktopExpectationKind.TEXT_ABSENT
+                and target is not None
+                and target.control_type.strip().casefold() == "button"
+                and target.addressable
+                and target.enabled
+                and not target.visual_ocr
+                and expected == target_name
+                and _related_result_destination_is_authorized(
+                    target.name,
+                    user_text,
+                )
+                and len(
+                    tuple(
+                        element
+                        for element in observation.elements
+                        if element.control_type.strip().casefold() == "button"
+                        and element.addressable
+                        and element.enabled
+                        and not element.visual_ocr
+                        and _related_result_destination_is_authorized(
+                            element.name,
+                            user_text,
+                        )
+                    )
+                )
+                == 1
+            )
             if action.type in {
                 DesktopActionType.CLICK,
                 DesktopActionType.PERFORM_SECONDARY_ACTION,
             }:
-                if expectation.kind == DesktopExpectationKind.TEXT_ABSENT:
+                if (
+                    expectation.kind == DesktopExpectationKind.TEXT_ABSENT
+                    and not related_result_disappearance
+                ):
                     return _block("target disappearance alone cannot prove click success")
                 if (
                     expectation.kind
@@ -3817,6 +4138,19 @@ class DesktopSafetyPolicy:
                 ):
                     return _block("focus navigation needs a user-authored focused target")
         if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}:
+            if visual_text_input:
+                if (
+                    expectation is None
+                    or expectation.kind
+                    != DesktopExpectationKind.LAST_ACTION_VERIFIED
+                    or expectation.text is not None
+                ):
+                    return _block(
+                        "armed visual text requires frame-transition verification"
+                    )
+                return _allow(
+                    "local unrestricted profile allows one exact visual search payload"
+                )
             if expectation is None or not expectation.text:
                 return _block("text input needs an exact local text-presence postcondition")
             if unrestricted:
@@ -3832,6 +4166,20 @@ class DesktopSafetyPolicy:
                 expectation,
                 trusted_target_label=text_confirmation_target,
             )
+        if visual_search_submission:
+            if (
+                expectation is None
+                or expectation.kind != DesktopExpectationKind.LAST_ACTION_VERIFIED
+                or expectation.text is not None
+            ):
+                return _block(
+                    "armed visual search submission requires frame-transition verification"
+                )
+            return _allow(
+                "local unrestricted profile allows one native-focus-bound visual search submit"
+            )
+        if instrumental_reveal:
+            return _allow("local unrestricted profile allows one verified reveal bridge")
         if action.type == DesktopActionType.PRESS_KEY and key in {
             "ctrl+v",
             "control+v",

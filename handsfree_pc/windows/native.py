@@ -67,6 +67,100 @@ class WindowInfo:
         }
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class NativeFocusSnapshot:
+    """Content-free, locally verified Win32 keyboard-focus evidence.
+
+    The handles, process/thread identifiers, and rectangles are deliberately
+    retained only as private local binding material.  No window title, control
+    text, class name, or user-authored content is captured.
+
+    ``caret_rect_client`` uses the caret window's client-coordinate space, as
+    returned by ``GetGUIThreadInfo``. ``caret_rect_screen`` is mapped with
+    ``ClientToScreen`` in this process's screen-coordinate space. That is the
+    same caller space used by the UIA window rectangle and screenshot binding.
+    """
+
+    target_hwnd: int
+    target_process_id: int
+    target_thread_id: int
+    foreground_hwnd: int
+    active_hwnd: int
+    active_process_id: int
+    active_thread_id: int
+    focus_hwnd: int
+    focus_process_id: int
+    focus_thread_id: int
+    caret_hwnd: int
+    caret_process_id: int
+    caret_thread_id: int
+    gui_thread_flags: int
+    caret_rect_client: tuple[int, int, int, int] | None
+    caret_rect_screen: tuple[int, int, int, int] | None
+    active_is_target_or_child: bool
+    focus_is_target_or_child: bool
+    caret_is_target_or_child: bool | None
+    captured_at_monotonic: float
+
+    @property
+    def has_visible_system_caret(self) -> bool:
+        return bool(
+            self.caret_hwnd
+            and self.caret_rect_client is not None
+            and self.caret_rect_screen is not None
+            and self.gui_thread_flags & GUI_CARETBLINKING
+        )
+
+    def is_bound_to(self, hwnd: int) -> bool:
+        """Return whether this positive snapshot is bound to one exact target."""
+
+        try:
+            expected = int(hwnd)
+        except (TypeError, ValueError):
+            return False
+        caret_is_valid = (
+            self.caret_is_target_or_child is None
+            if not self.caret_hwnd
+            else self.caret_is_target_or_child is True
+        )
+        return bool(
+            expected > 0
+            and self.target_hwnd == expected
+            and self.foreground_hwnd == expected
+            and self.target_process_id > 0
+            and self.target_thread_id > 0
+            and self.active_hwnd
+            and self.active_process_id == self.target_process_id
+            and self.active_thread_id > 0
+            and self.active_is_target_or_child
+            and self.focus_hwnd
+            and self.focus_process_id == self.target_process_id
+            and self.focus_thread_id > 0
+            and self.focus_is_target_or_child
+            and caret_is_valid
+            and (
+                not self.caret_hwnd
+                or (
+                    self.caret_process_id == self.target_process_id
+                    and self.caret_thread_id > 0
+                    and self.caret_rect_client is not None
+                    and self.caret_rect_screen is not None
+                )
+            )
+        )
+
+    def __repr__(self) -> str:
+        """Avoid copying HWNDs, PIDs, TIDs, or coordinates into logs."""
+
+        return (
+            "NativeFocusSnapshot("
+            f"bound={self.is_bound_to(self.target_hwnd)!r}, "
+            f"has_focus={bool(self.focus_hwnd)!r}, "
+            f"has_caret={bool(self.caret_hwnd)!r}, "
+            f"caret_visible={self.has_visible_system_caret!r})"
+        )
+
+
 ULONG_PTR = ctypes.c_size_t
 
 
@@ -108,9 +202,33 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("data", _INPUTUNION)]
 
 
+class GUITHREADINFO(ctypes.Structure):
+    """Pointer-width-correct mirror of Win32 ``GUITHREADINFO``."""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
+GUI_CARETBLINKING = 0x0001
+GUI_INMOVESIZE = 0x0002
+GUI_INMENUMODE = 0x0004
+GUI_SYSTEMMENUMODE = 0x0008
+GUI_POPUPMENUMODE = 0x0010
+GUI_TRANSIENT_INPUT_FLAGS = (
+    GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE | GUI_POPUPMENUMODE
+)
 SW_RESTORE = 9
 SW_SHOWNORMAL = 1
 DESKTOP_READOBJECTS = 0x0001
@@ -212,6 +330,17 @@ def _configure_user32(user32: object) -> None:
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetForegroundWindow.argtypes = []
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetGUIThreadInfo.argtypes = [
+        wintypes.DWORD,
+        ctypes.POINTER(GUITHREADINFO),
+    ]
+    user32.GetGUIThreadInfo.restype = wintypes.BOOL
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
+    user32.IsChild.restype = wintypes.BOOL
+    user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    user32.ClientToScreen.restype = wintypes.BOOL
     user32.IsIconic.argtypes = [wintypes.HWND]
     user32.IsIconic.restype = wintypes.BOOL
     user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -420,6 +549,231 @@ class NativeWindows:
                 f"Refusing input because foreground window is {actual}, expected {int(hwnd)}"
             )
 
+    def _window_thread_and_process(self, hwnd: int) -> tuple[int, int] | None:
+        if not hwnd:
+            return None
+        process_id = wintypes.DWORD()
+        try:
+            thread_id = int(
+                self.user32.GetWindowThreadProcessId(
+                    int(hwnd),
+                    ctypes.byref(process_id),
+                )
+            )
+        except Exception:
+            return None
+        if thread_id <= 0 or int(process_id.value) <= 0:
+            return None
+        return thread_id, int(process_id.value)
+
+    def _owned_target_window(
+        self,
+        *,
+        target_hwnd: int,
+        target_process_id: int,
+        candidate_hwnd: int,
+    ) -> tuple[int, int] | None:
+        """Resolve one real HWND only when it belongs to the exact target tree."""
+
+        if not candidate_hwnd:
+            return None
+        try:
+            if not self.user32.IsWindow(int(candidate_hwnd)):
+                return None
+            belongs = int(candidate_hwnd) == int(target_hwnd) or bool(
+                self.user32.IsChild(int(target_hwnd), int(candidate_hwnd))
+            )
+        except Exception:
+            return None
+        if not belongs:
+            return None
+        owner = self._window_thread_and_process(int(candidate_hwnd))
+        if owner is None or owner[1] != int(target_process_id):
+            return None
+        return owner
+
+    def _caret_rect_to_screen(
+        self,
+        caret_hwnd: int,
+        rect: wintypes.RECT,
+    ) -> tuple[int, int, int, int] | None:
+        """Map the caret client rectangle into the caller's screen coordinates.
+
+        The visual driver compares this rectangle with a UIA window rectangle
+        captured by the same process. Using ``ClientToScreen`` directly keeps
+        both values in one DPI-virtualized caller space. A separate logical to
+        physical conversion is intentionally not composed here: on the actual
+        per-monitor-aware Weixin/UIA path it either fails or double-transforms
+        the point before the screen origin is applied.
+        """
+
+        client_to_screen = getattr(self.user32, "ClientToScreen", None)
+        if not callable(client_to_screen):
+            return None
+        left = int(rect.left)
+        top = int(rect.top)
+        right = int(rect.right)
+        bottom = int(rect.bottom)
+        if right < left or bottom < top:
+            return None
+        points: list[tuple[int, int]] = []
+        for x, y in ((left, top), (right, bottom)):
+            point = wintypes.POINT(x, y)
+            try:
+                if not client_to_screen(int(caret_hwnd), ctypes.byref(point)):
+                    return None
+            except Exception:
+                return None
+            points.append((int(point.x), int(point.y)))
+        (screen_left, screen_top), (screen_right, screen_bottom) = points
+        if screen_right < screen_left or screen_bottom < screen_top:
+            return None
+        return screen_left, screen_top, screen_right, screen_bottom
+
+    def get_focus_snapshot(self, hwnd: int) -> NativeFocusSnapshot | None:
+        """Return positive, content-free native focus evidence or ``None``.
+
+        This method never attaches input queues and never changes focus.  A
+        snapshot is returned only while the exact target remains foreground,
+        its active and focused HWNDs are real same-process members of the exact
+        target tree, and any reported caret is likewise owned and has a
+        caller-space screen rectangle. Unsupported APIs, transient
+        menu/move modes, invalid handles, ownership mismatches, and observable
+        foreground/identity races all fail closed.
+
+        A positive snapshot without a system caret proves only application
+        keyboard focus.  Callers that need evidence for a rendered text field
+        must additionally require ``has_visible_system_caret`` and bind the
+        caret rectangle to their exact local target region.
+        """
+
+        required = (
+            "GetForegroundWindow",
+            "GetGUIThreadInfo",
+            "GetWindowThreadProcessId",
+            "IsChild",
+            "IsWindow",
+        )
+        if not all(callable(getattr(self.user32, name, None)) for name in required):
+            return None
+        try:
+            target_hwnd = int(hwnd)
+        except (TypeError, ValueError):
+            return None
+        if target_hwnd <= 0:
+            return None
+        try:
+            if not self.user32.IsWindow(target_hwnd):
+                return None
+            foreground_before = int(self.user32.GetForegroundWindow() or 0)
+        except Exception:
+            return None
+        if foreground_before != target_hwnd:
+            return None
+
+        target_owner = self._window_thread_and_process(target_hwnd)
+        if target_owner is None:
+            return None
+        target_thread_id, target_process_id = target_owner
+
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        try:
+            if not self.user32.GetGUIThreadInfo(target_thread_id, ctypes.byref(info)):
+                return None
+        except Exception:
+            return None
+        gui_flags = int(info.flags)
+        if gui_flags & GUI_TRANSIENT_INPUT_FLAGS:
+            return None
+
+        active_hwnd = int(info.hwndActive or 0)
+        focus_hwnd = int(info.hwndFocus or 0)
+        caret_hwnd = int(info.hwndCaret or 0)
+        active_owner = self._owned_target_window(
+            target_hwnd=target_hwnd,
+            target_process_id=target_process_id,
+            candidate_hwnd=active_hwnd,
+        )
+        focus_owner = self._owned_target_window(
+            target_hwnd=target_hwnd,
+            target_process_id=target_process_id,
+            candidate_hwnd=focus_hwnd,
+        )
+        if active_owner is None or focus_owner is None:
+            return None
+
+        caret_owner: tuple[int, int] | None = None
+        caret_rect_client: tuple[int, int, int, int] | None = None
+        caret_rect_screen: tuple[int, int, int, int] | None = None
+        if caret_hwnd:
+            caret_owner = self._owned_target_window(
+                target_hwnd=target_hwnd,
+                target_process_id=target_process_id,
+                candidate_hwnd=caret_hwnd,
+            )
+            if caret_owner is None:
+                return None
+            caret_rect_client = (
+                int(info.rcCaret.left),
+                int(info.rcCaret.top),
+                int(info.rcCaret.right),
+                int(info.rcCaret.bottom),
+            )
+            caret_rect_screen = self._caret_rect_to_screen(
+                caret_hwnd,
+                info.rcCaret,
+            )
+            if caret_rect_screen is None:
+                return None
+
+        # Re-read both stable bindings after all cross-process queries.  This
+        # cannot make Win32 state atomic, but it rejects any race visible while
+        # the snapshot was being assembled.  Callers must still obtain a fresh
+        # snapshot immediately before each input action.
+        try:
+            foreground_after = int(self.user32.GetForegroundWindow() or 0)
+            target_still_exists = bool(self.user32.IsWindow(target_hwnd))
+        except Exception:
+            return None
+        if (
+            foreground_after != target_hwnd
+            or not target_still_exists
+            or self._window_thread_and_process(target_hwnd) != target_owner
+        ):
+            return None
+        for candidate in (active_hwnd, focus_hwnd, caret_hwnd):
+            if not candidate:
+                continue
+            try:
+                if not self.user32.IsWindow(candidate):
+                    return None
+            except Exception:
+                return None
+
+        return NativeFocusSnapshot(
+            target_hwnd=target_hwnd,
+            target_process_id=target_process_id,
+            target_thread_id=target_thread_id,
+            foreground_hwnd=foreground_after,
+            active_hwnd=active_hwnd,
+            active_process_id=active_owner[1],
+            active_thread_id=active_owner[0],
+            focus_hwnd=focus_hwnd,
+            focus_process_id=focus_owner[1],
+            focus_thread_id=focus_owner[0],
+            caret_hwnd=caret_hwnd,
+            caret_process_id=caret_owner[1] if caret_owner is not None else 0,
+            caret_thread_id=caret_owner[0] if caret_owner is not None else 0,
+            gui_thread_flags=gui_flags,
+            caret_rect_client=caret_rect_client,
+            caret_rect_screen=caret_rect_screen,
+            active_is_target_or_child=True,
+            focus_is_target_or_child=True,
+            caret_is_target_or_child=True if caret_owner is not None else None,
+            captured_at_monotonic=self._monotonic(),
+        )
+
     def activate_window(self, hwnd: int, *, timeout: float = 2.0) -> WindowInfo:
         candidates = {window.hwnd: window for window in self.enumerate_windows()}
         if int(hwnd) not in candidates:
@@ -455,10 +809,27 @@ class NativeWindows:
         message = wintypes.MSG()
         self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, PM_NOREMOVE)
         foreground_hwnd = int(self.user32.GetForegroundWindow() or 0)
+        foreground_attach_hwnd = foreground_hwnd
+        is_window_visible = getattr(self.user32, "IsWindowVisible", None)
+        if foreground_attach_hwnd and callable(is_window_visible):
+            try:
+                if not is_window_visible(foreground_attach_hwnd):
+                    # Some tablet/IME helpers leave an invisible zero-surface
+                    # HWND as the nominal foreground window. Its elevated input
+                    # queue is not an interactive user surface and joining it
+                    # can fail with ERROR_ACCESS_DENIED before we ever try the
+                    # requested visible target. Ignore only an HWND positively
+                    # proven invisible; any unknown or visible foreground keeps
+                    # the fail-closed integrity-boundary behavior below.
+                    foreground_attach_hwnd = 0
+            except Exception:
+                # Failure to prove invisibility is not permission to skip the
+                # actual foreground input queue.
+                foreground_attach_hwnd = foreground_hwnd
         current_thread = int(self.kernel32.GetCurrentThreadId())
         foreground_thread = (
-            int(self.user32.GetWindowThreadProcessId(foreground_hwnd, None))
-            if foreground_hwnd
+            int(self.user32.GetWindowThreadProcessId(foreground_attach_hwnd, None))
+            if foreground_attach_hwnd
             else 0
         )
         target_thread = int(self.user32.GetWindowThreadProcessId(hwnd, None))

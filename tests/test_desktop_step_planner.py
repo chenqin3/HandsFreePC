@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import threading
@@ -9,12 +10,23 @@ from typing import Any
 import pytest
 
 from handsfree_pc.desktop import step_planner
-from handsfree_pc.desktop.protocol import DesktopDecisionKind, DesktopObservation
+from handsfree_pc.desktop.protocol import (
+    DesktopActionType,
+    DesktopDecisionKind,
+    DesktopElement,
+    DesktopElementAction,
+    DesktopExpectationKind,
+    DesktopObservation,
+    ElementPlane,
+    visual_state_binding_token,
+)
 from handsfree_pc.desktop.step_planner import (
     ClaudeDesktopStepPlanner,
     CodexDesktopStepPlanner,
     DesktopPlannerError,
+    DesktopPlannerUnavailable,
     _parse_decision_payload,
+    _planner_image_png,
 )
 
 
@@ -46,6 +58,14 @@ def _decision_payload() -> dict[str, Any]:
         },
         "expectation": {"kind": "element_selected", "text": "Chat"},
     }
+
+
+def _png(width: int, height: int) -> bytes:
+    from PIL import Image
+
+    stream = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(stream, format="PNG")
+    return stream.getvalue()
 
 
 class FakeProcess:
@@ -118,6 +138,403 @@ def test_parser_enforces_planner_action_subset_even_without_cli_schema_validatio
         _parse_decision_payload(payload, observation=_observation())
 
 
+def test_parser_allows_x_y_only_on_current_visual_viewport() -> None:
+    payload = _decision_payload()
+    payload["action"]["x"] = 20
+    payload["action"]["y"] = 30
+    ordinary = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="ordinary",
+        elements=(DesktopElement("0", "Chat", "Button"),),
+    )
+    viewport = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual",
+        elements=(
+            DesktopElement(
+                "0",
+                "Visual OCR viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+        ),
+    )
+
+    with pytest.raises(DesktopPlannerError, match="VisualViewport"):
+        _parse_decision_payload(payload, observation=ordinary)
+
+    decision = _parse_decision_payload(payload, observation=viewport)
+    assert decision.action is not None
+    assert decision.action.x == 20
+    assert decision.action.y == 30
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+
+
+def test_parser_rebinds_screenshot_point_to_the_one_frame_bound_viewport() -> None:
+    payload = _decision_payload()
+    payload["action"]["element_index"] = "0"
+    payload["action"]["x"] = 20
+    payload["action"]["y"] = 30
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual",
+        elements=(
+            DesktopElement("0", "render host", "Pane"),
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.action is not None
+    assert decision.action.element_index == "7"
+    assert decision.action.x == 20
+    assert decision.action.y == 30
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+
+
+def test_parser_maps_bounded_planner_image_point_to_full_capture_pixels() -> None:
+    payload = _decision_payload()
+    payload["action"]["x"] = 279
+    payload["action"]["y"] = 92
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual",
+        screenshot_png=_png(2952, 1866),
+        elements=(
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.action is not None
+    assert decision.action.element_index == "7"
+    assert decision.action.x == 402
+    assert decision.action.y == 133
+
+
+def test_planner_image_is_explicitly_bounded_to_the_coordinate_canvas() -> None:
+    from PIL import Image
+
+    payload = _planner_image_png(_png(2952, 1866))
+    with Image.open(io.BytesIO(payload)) as image:
+        assert image.size == (2048, 1295)
+
+
+def test_parser_rebinds_armed_visual_search_text_to_the_viewport() -> None:
+    payload = _decision_payload()
+    payload["action"] = {
+        "type": "type_text",
+        "element_index": "0",
+        "x": None,
+        "y": None,
+        "click_count": None,
+        "mouse_button": None,
+        "direction": None,
+        "pages": None,
+        "action_name": None,
+        "text": "文件传输助手",
+        "key": None,
+        "value": None,
+    }
+    payload["expectation"] = {"kind": "focused_contains", "text": "文件传输助手"}
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual",
+        elements=(
+            DesktopElement("0", "render host", "Pane"),
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(
+                    DesktopElementAction.CLICK,
+                    DesktopElementAction.TYPE_TEXT,
+                ),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.action is not None
+    assert decision.action.element_index == "7"
+    assert decision.action.text == "文件传输助手"
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+    assert decision.expectation.text is None
+
+
+def test_parser_rebinds_one_armed_visual_search_enter_to_the_viewport() -> None:
+    payload = _decision_payload()
+    payload["action"] = {
+        "type": "press_key",
+        "element_index": "0",
+        "key": "enter",
+    }
+    payload["expectation"] = {"kind": "search_submitted", "text": "文件传输助手"}
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual",
+        elements=(
+            DesktopElement("0", "render host", "Pane"),
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(
+                    DesktopElementAction.CLICK,
+                    DesktopElementAction.PRESS_KEY,
+                ),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.action is not None
+    assert decision.action.element_index == "7"
+    assert decision.action.key == "enter"
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+    assert decision.expectation.text is None
+
+
+def test_parser_advances_armed_visual_search_instead_of_clicking_field_again() -> None:
+    payload = _decision_payload()
+    payload["action"] = {
+        "type": "click",
+        "element_index": "7",
+        "x": 280,
+        "y": 90,
+        "click_count": 1,
+        "mouse_button": "left",
+    }
+    payload["expectation"] = {
+        "kind": "last_action_verified",
+        "text": None,
+    }
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual search submission armed",
+        screenshot_png=_png(1200, 800),
+        elements=(
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(
+                    DesktopElementAction.CLICK,
+                    DesktopElementAction.PRESS_KEY,
+                ),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.action is not None
+    assert decision.action.type == DesktopActionType.PRESS_KEY
+    assert decision.action.element_index == "7"
+    assert decision.action.key == "enter"
+    assert decision.action.x is None
+    assert decision.action.y is None
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+
+
+def test_parser_preserves_unique_result_button_click_while_visual_search_is_armed() -> None:
+    label = "文件传输助手 在手机和电脑之间传输各类文件 前往"
+    payload = _decision_payload()
+    payload["action"] = {
+        "type": "click",
+        "element_index": "3",
+        "click_count": 1,
+        "mouse_button": "left",
+    }
+    payload["expectation"] = {
+        "kind": "text_absent",
+        "text": label,
+    }
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual search result ready",
+        screenshot_png=_png(1200, 800),
+        elements=(
+            DesktopElement(
+                "3",
+                label,
+                "Button",
+                plane=ElementPlane.CONTROL,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(
+                    DesktopElementAction.CLICK,
+                    DesktopElementAction.PRESS_KEY,
+                ),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.action is not None
+    assert decision.action.type == DesktopActionType.CLICK
+    assert decision.action.element_index == "3"
+    assert decision.action.key is None
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.TEXT_ABSENT
+    assert decision.expectation.text == label
+
+
+def test_parser_preserves_armed_viewport_click_outside_the_search_zone() -> None:
+    payload = _decision_payload()
+    payload["action"] = {
+        "type": "click",
+        "element_index": "7",
+        "x": 600,
+        "y": 400,
+        "click_count": 1,
+        "mouse_button": "left",
+    }
+    payload["expectation"] = {
+        "kind": "last_action_verified",
+        "text": None,
+    }
+    observation = DesktopObservation(
+        app="claude",
+        generation=8,
+        accessibility_text="visual search submission armed",
+        screenshot_png=_png(1200, 800),
+        elements=(
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(
+                    DesktopElementAction.CLICK,
+                    DesktopElementAction.PRESS_KEY,
+                ),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.action is not None
+    assert decision.action.type == DesktopActionType.CLICK
+    assert decision.action.element_index == "7"
+    assert decision.action.x == 600
+    assert decision.action.y == 400
+    assert decision.action.key is None
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+
+
+def test_parser_binds_visual_done_to_the_exact_inspected_screenshot() -> None:
+    payload = {
+        "kind": "done",
+        "reason": "the requested rendered destination is visible",
+        "app": "claude",
+        "action": None,
+        "expectation": {"kind": "focused_contains", "text": "Target"},
+    }
+    observation = DesktopObservation(
+        app="claude",
+        generation=9,
+        accessibility_text="visual",
+        screenshot_png=b"\x89PNG\r\n\x1a\nfixture",
+        local_window_id="window-a",
+        elements=(
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+        ),
+    )
+
+    decision = _parse_decision_payload(payload, observation=observation)
+
+    assert decision.kind == DesktopDecisionKind.DONE
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.VISUAL_STATE_VERIFIED
+    assert decision.expectation.text == visual_state_binding_token(observation)
+
+
+def test_parser_rejects_model_authored_internal_visual_state_kind() -> None:
+    payload = {
+        "kind": "done",
+        "reason": "untrusted internal proof",
+        "app": "claude",
+        "action": None,
+        "expectation": {"kind": "visual_state_verified", "text": "a" * 64},
+    }
+    observation = DesktopObservation(
+        app="claude",
+        generation=9,
+        accessibility_text="visual",
+        screenshot_png=b"frame",
+        local_window_id="window-a",
+        elements=(
+            DesktopElement(
+                "7",
+                "Visual screenshot viewport",
+                "VisualViewport",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(DesktopPlannerError, match="reserved for local frame"):
+        _parse_decision_payload(payload, observation=observation)
+
+
 def test_codex_command_is_ephemeral_config_free_read_only_and_returns_one_step(monkeypatch):
     popen = RecordingPopen(_decision_payload())
     monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "codex-test.exe")
@@ -184,6 +601,81 @@ def test_codex_planner_receives_the_fresh_local_window_screenshot(monkeypatch):
     assert Path(args[args.index("--image") + 1]).name == "observation.png"
 
 
+def test_codex_planner_receives_visual_region_ids_with_the_annotated_full_window(
+    monkeypatch,
+):
+    payload = _decision_payload()
+    payload["app"] = "wechat"
+    popen = RecordingPopen(payload)
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "codex-test.exe")
+    planner = CodexDesktopStepPlanner(
+        executable="codex",
+        model=None,
+        timeout_seconds=1,
+        safety_profile="local_unrestricted",
+        popen_factory=popen,
+    )
+    observation = DesktopObservation(
+        app="wechat",
+        generation=9,
+        accessibility_text='0 name="Chat" control_type="VisualText"',
+        screenshot_png=b"\x89PNG\r\n\x1a\nannotated-full-window",
+        window_title="微信",
+        elements=(
+            DesktopElement(
+                index="0",
+                name="Chat",
+                control_type="VisualText",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+        ),
+    )
+
+    planner.decide(
+        "打开 Chat",
+        apps='[{"app":"wechat"}]',
+        observation=observation,
+        history=(),
+    )
+
+    process = popen.processes[0]
+    assert "--image" in process.args
+    assert '"visual_ocr": true' in process.inputs[0]
+    assert "set-of-marks" in process.inputs[0]
+
+
+def test_claude_text_only_planner_refuses_visual_regions(monkeypatch):
+    monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "claude-test.exe")
+    planner = ClaudeDesktopStepPlanner(
+        executable="claude",
+        model=None,
+        timeout_seconds=1,
+        safety_profile="local_unrestricted",
+        popen_factory=RecordingPopen(_decision_payload(), claude=True),
+    )
+    observation = DesktopObservation(
+        app="wechat",
+        generation=1,
+        accessibility_text="visual",
+        screenshot_png=b"full-window",
+        elements=(
+            DesktopElement(
+                index="0",
+                name="Chat",
+                control_type="VisualText",
+                plane=ElementPlane.CONTROL,
+                visual_ocr=True,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+        ),
+    )
+
+    with pytest.raises(DesktopPlannerUnavailable, match="Codex planner"):
+        planner.decide("打开 Chat", apps="wechat", observation=observation, history=())
+
+
 def test_local_unrestricted_policy_supports_unscoped_cross_app_search():
     policy = step_planner._planner_policy("local_unrestricted")
 
@@ -191,6 +683,17 @@ def test_local_unrestricted_policy_supports_unscoped_cross_app_search():
     assert "across listed applications" in policy
     assert "search for X" in policy
     assert "return done with app_visible" in policy
+    assert "last_action_verified" in policy
+    assert "scrollintoview" in policy
+    assert "does not complete a user step" in policy
+    assert "non-null supported_actions" in policy
+    assert "direction matches scroll_axes" in policy
+    assert "Never infer expand, collapse, scrollintoview, or scroll support" in policy
+    assert "only when that exact operation is present" in policy
+    assert "set-of-marks" in policy
+    assert "Never invent an unmarked" in policy
+    assert "proved a visible system caret" in policy
+    assert "Do not\n  click that field again" in policy
 
 
 def test_claude_command_explicitly_disables_all_tools_and_session_persistence(monkeypatch):

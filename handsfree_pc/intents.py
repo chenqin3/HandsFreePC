@@ -10,6 +10,10 @@ _APP_ALIASES = {
     "codex": "codex",
     "科德克斯": "codex",
     "代码助手": "codex",
+    "chatgpt": "codex",
+    "chat gpt": "codex",
+    "聊天gpt": "codex",
+    "聊天 gpt": "codex",
     "claude": "claude",
     "克劳德": "claude",
     # SenseVoice commonly renders the product name this way in otherwise
@@ -33,7 +37,16 @@ _APP_NAMES_BY_CANONICAL = {
     for canonical in frozenset(_APP_ALIASES.values())
 }
 
-_SCOPED_ASR_APP_ALIASES = frozenset({"cloud", "cloloud"})
+_SCOPED_ASR_APP_ALIASES = frozenset(
+    {
+        "cloud",
+        "cloloud",
+        "chatgpt",
+        "chat gpt",
+        "聊天gpt",
+        "聊天 gpt",
+    }
+)
 
 _FEEDBACK_FULL_UTTERANCE_PATTERNS = (
     r"(?:切换到|切换成|使用|开启)?(?:屏幕反馈|大字模式|遮罩反馈)",
@@ -118,6 +131,21 @@ _APP_SURFACE_PATTERN = (
     r"(?![a-z0-9_-])"
 )
 
+# Scoped repairs for drive letters that the configured Mandarin ASR has
+# repeatedly rendered as ordinary Chinese words.  They are recognized only
+# immediately before “盘”, never rewritten in general dictation.
+_SPOKEN_DRIVE_ALIASES = {
+    "锯": "G",
+    "居": "G",
+    "句": "G",
+    "鸡": "G",
+    "据": "G",
+    "局": "G",
+}
+_SPOKEN_DRIVE_TOKEN_PATTERN = (
+    r"(?P<drive>[a-z])|(?P<drive_alias>" + "|".join(map(re.escape, _SPOKEN_DRIVE_ALIASES)) + r")"
+)
+
 
 def _canonical_app_surface(value: str) -> str:
     normalized = value.casefold()
@@ -131,7 +159,7 @@ def _detect_app(text: str) -> str | None:
         if alias in _SCOPED_ASR_APP_ALIASES:
             if re.search(
                 rf"(?:打开|启动|进入|切换到|切换至|切换道|切换|在|于)\s*"
-                rf"{re.escape(alias)}(?=$|[\s的里中内上]|app\b|应用)",
+                rf"{re.escape(alias)}(?=$|[\s，,。；;的里中内上]|app\b|应用)",
                 lower,
                 re.IGNORECASE,
             ):
@@ -174,12 +202,25 @@ def _detect_app_surface(compact: str) -> str | None:
 
 
 def _normalize_spoken_path_tail(value: str) -> str:
-    tail = re.sub(r"^(?:打开|进入)", "", value)
-    tail = re.sub(r"文件夹(?:里|下|中的|的)", r"\\", tail)
-    tail = re.sub(r"(?:里面|下面|其中)(?:的)?", r"\\", tail)
-    tail = re.sub(r"(?:然后)?打开", r"\\", tail)
+    tail = compact_text(value).strip("，。；;!?！？")
+    tail = re.sub(r"^(?:再|然后|接着)?(?:打开|进入|查看)", "", tail)
+    tail = re.sub(
+        r"(?:文件夹|目录)(?:里面|下面|里|下|中的|中|的)?(?:的)?",
+        r"\\",
+        tail,
+    )
+    tail = re.sub(r"(?:里面|下面|里边|下边|其中)(?:的)?", r"\\", tail)
+    tail = re.sub(r"(?:再|然后|接着)?(?:打开|进入|查看)", r"\\", tail)
     tail = re.sub(r"\\的", r"\\", tail)
+    tail = re.sub(r"(?<=[a-zA-Z0-9\u4e00-\u9fff])点(?=[a-zA-Z0-9]{1,8}$)", ".", tail)
     return re.sub(r"[\\/]+", r"\\", tail).strip("\\")
+
+
+def _canonical_spoken_drive(match: re.Match[str]) -> str:
+    drive = match.groupdict().get("drive")
+    if drive:
+        return drive.upper()
+    return _SPOKEN_DRIVE_ALIASES[match.group("drive_alias")]
 
 
 def _spoken_path(text: str) -> str | None:
@@ -197,12 +238,36 @@ def _spoken_path(text: str) -> str | None:
         tail = _normalize_spoken_path_tail(alias_match.group(2) or "")
         return alias if not tail else f"{alias}\\{tail}"
 
-    drive_match = re.search(r"(?i)(?:打开|进入|查看)?([a-z])盘(?:的)?(.+)?", compact)
+    drive_match = re.search(
+        rf"(?i)(?:打开|进入|查看)?(?:{_SPOKEN_DRIVE_TOKEN_PATTERN})盘"
+        r"(?:里面|下面|里|下|中的|中|的|上)?(?:的)?(?P<tail>.*)?",
+        compact,
+    )
     if not drive_match:
         return None
-    drive = drive_match.group(1).upper()
-    tail = _normalize_spoken_path_tail(drive_match.group(2) or "")
+    drive = _canonical_spoken_drive(drive_match)
+    tail = _normalize_spoken_path_tail(drive_match.group("tail") or "")
     return f"{drive}:\\{tail}" if tail else f"{drive}:\\"
+
+
+def relative_spoken_path(text: str) -> str | None:
+    """Extract one complete, affirmative relative filesystem request.
+
+    Resolution is intentionally separate.  Callers must bind this text below a
+    verified current directory or a unique WorkMap root before executing it.
+    """
+
+    compact = compact_text(text)
+    match = re.fullmatch(r"(?:请)?(?:打开|进入|查看)(?P<tail>.+)", compact)
+    if match is None or re.search(r"(?:不要|别|取消)(?:打开|进入|查看)", compact):
+        return None
+    tail = match.group("tail")
+    if any(marker in tail for marker in _PATH_UNCONSUMED_OPERATION_MARKERS):
+        return None
+    normalized = _normalize_spoken_path_tail(tail)
+    if not normalized or re.match(r"(?i)^(?:[a-z]:|\\\\)", normalized):
+        return None
+    return normalized
 
 
 class DeterministicIntentParser:
@@ -272,7 +337,7 @@ class DeterministicIntentParser:
             tail = compact_text(direct.group("tail"))
             return not any(marker in tail for marker in _PATH_UNCONSUMED_OPERATION_MARKERS)
         spoken = re.fullmatch(
-            r"(?:打开|进入|查看)(?:桌面|文档|下载|[a-z]盘)"
+            r"(?:打开|进入|查看)(?:桌面|文档|下载|[a-z锯居句鸡据局]盘)"
             r"(?:上的|下的|里的|中的|上|下|里|的)?(?P<tail>.*)",
             compact,
             re.IGNORECASE,

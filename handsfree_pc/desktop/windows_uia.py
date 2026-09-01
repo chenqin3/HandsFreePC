@@ -3,14 +3,22 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import re
 import threading
+import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..config import AppProfile
-from ..windows.native import AmbiguousWindowError, NativeWindows, WindowInfo, WindowNotFoundError
+from ..windows.native import (
+    AmbiguousWindowError,
+    NativeFocusSnapshot,
+    NativeWindows,
+    WindowInfo,
+    WindowNotFoundError,
+)
 from ..windows.uia import PasswordFieldError, UIABackend, UIAError, UIAUnavailableError
 from .protocol import (
     ActionReceipt,
@@ -19,11 +27,21 @@ from .protocol import (
     DesktopAction,
     DesktopActionType,
     DesktopElement,
+    DesktopElementAction,
+    DesktopExpandCollapseState,
     DesktopObservation,
+    DesktopScrollAxis,
     ElementPlane,
     credential_findings,
     element_plane,
     is_allowed_desktop_key,
+)
+from .visual_ocr import (
+    SensitiveVisualSurfaceError,
+    VisualOcrBlock,
+    VisualOcrClient,
+    VisualOcrError,
+    VisualOcrResult,
 )
 
 
@@ -40,6 +58,53 @@ class _Snapshot:
     hwnd: int
     observation: DesktopObservation
     wrappers: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _VisualTargetBinding:
+    """Private exact-window binding for one planner-visible visual region."""
+
+    hwnd: int
+    window_rect: tuple[int, int, int, int]
+    text: str
+    bbox: tuple[int, int, int, int]
+    label: str
+    frame_sha256: str
+    target_sha256: str
+    local_identity: str
+    viewport: bool = False
+    screenshot_png: bytes = field(default=b"", repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _VisualTextClickBinding:
+    """One exact visual point click awaiting native caret confirmation."""
+
+    hwnd: int
+    local_window_id: str
+    window_rect: tuple[int, int, int, int]
+    x: int
+    y: int
+
+
+@dataclass(frozen=True, slots=True)
+class _VisualTextFocusBinding:
+    """One single-use rendered input proven by Win32 focus/caret evidence."""
+
+    click: _VisualTextClickBinding
+    target_process_id: int
+    target_thread_id: int
+    focus_hwnd: int
+    caret_hwnd: int
+
+
+@dataclass(frozen=True, slots=True)
+class _VisualSearchSubmissionBinding:
+    """One exact visual search value awaiting an Enter/Return transition."""
+
+    focus: _VisualTextFocusBinding
+    payload_sha256: str
+    payload_length: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +175,13 @@ _COMPOSER_IDENTITY_RE = re.compile(
     r"|输入|消息|提问|回复"
 )
 
+# Windows Explorer exposes these invisible formatting marks in otherwise
+# ordinary Edit names and values. They do not identify a different control,
+# and allowing them onto the planner surface would make visually identical
+# labels compare differently. Keep the allow-list deliberately narrow: other
+# control/format characters remain invalid and are omitted per element below.
+_IGNORABLE_UIA_TEXT_TRANSLATION = str.maketrans("", "", "\x00\u200b\u200e\u200f")
+
 
 def _safe_attr(owner: Any, name: str, default: Any = None) -> Any:
     try:
@@ -128,8 +200,17 @@ def _safe_call(owner: Any, name: str, default: Any = None) -> Any:
         return default
 
 
+def _is_missing_uia_pattern(exc: Exception) -> bool:
+    """Recognize pywinauto's optional-pattern sentinel without importing it."""
+
+    return (
+        type(exc).__name__ == "NoPatternInterfaceError"
+        and type(exc).__module__.startswith("pywinauto.")
+    )
+
+
 def _normalized_text(value: Any) -> str:
-    return "" if value is None else str(value).replace("\x00", "")
+    return "" if value is None else str(value).translate(_IGNORABLE_UIA_TEXT_TRANSLATION)
 
 
 def _text(value: Any, maximum: int = 1000, *, field: str = "UIA text") -> str:
@@ -180,6 +261,152 @@ def _coerce_boolish(value: Any) -> bool | None:
         if normalized in {"false", "0", "no"}:
             return False
     return None
+
+
+_EXPAND_COLLAPSE_STATES = {
+    0: DesktopExpandCollapseState.COLLAPSED,
+    1: DesktopExpandCollapseState.EXPANDED,
+    2: DesktopExpandCollapseState.PARTIALLY_EXPANDED,
+    3: DesktopExpandCollapseState.LEAF_NODE,
+}
+
+
+def _expand_collapse_state(value: Any) -> DesktopExpandCollapseState | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric in _EXPAND_COLLAPSE_STATES:
+        return _EXPAND_COLLAPSE_STATES[numeric]
+    if isinstance(value, str):
+        normalized = re.sub(r"[\s-]+", "_", value.strip().casefold())
+        normalized = normalized.removeprefix("expandcollapsestate_")
+        try:
+            return DesktopExpandCollapseState(normalized)
+        except ValueError:
+            return None
+    return None
+
+
+def _uia_capability_metadata(
+    wrapper: Any,
+    *,
+    read_attr: Callable[[Any, str, Any], Any] = _safe_attr,
+    allow_activation: bool,
+) -> tuple[
+    tuple[DesktopElementAction, ...],
+    DesktopExpandCollapseState | None,
+    tuple[DesktopScrollAxis, ...] | None,
+]:
+    """Probe only positive UIA pattern interfaces; never infer from control type.
+
+    Pattern properties on live Electron trees can raise while the UI mutates.
+    ``read_attr`` is therefore injected by observation code so one bad pattern
+    is counted and omitted without losing the rest of the element.
+    """
+
+    actions: set[DesktopElementAction] = set()
+
+    def interface_action(
+        interface_name: str,
+        interface_method: str,
+        wrapper_method: str,
+        action: DesktopElementAction,
+    ) -> bool:
+        interface = read_attr(wrapper, interface_name, None)
+        if interface is None:
+            return False
+        available = bool(
+            callable(read_attr(interface, interface_method, None))
+            and callable(read_attr(wrapper, wrapper_method, None))
+        )
+        if available:
+            actions.add(action)
+        return available
+
+    if allow_activation:
+        activation_available = False
+        activation_available |= interface_action(
+            "iface_invoke",
+            "Invoke",
+            "invoke",
+            DesktopElementAction.INVOKE,
+        )
+        activation_available |= interface_action(
+            "iface_selection_item",
+            "Select",
+            "select",
+            DesktopElementAction.SELECT,
+        )
+        activation_available |= interface_action(
+            "iface_toggle",
+            "Toggle",
+            "toggle",
+            DesktopElementAction.TOGGLE,
+        )
+        if activation_available:
+            actions.add(DesktopElementAction.CLICK)
+
+    expand_state: DesktopExpandCollapseState | None = None
+    expand_interface = read_attr(wrapper, "iface_expand_collapse", None)
+    if expand_interface is not None:
+        expand_state = _expand_collapse_state(
+            read_attr(expand_interface, "CurrentExpandCollapseState", None)
+        )
+        can_expand = bool(
+            callable(read_attr(expand_interface, "Expand", None))
+            and callable(read_attr(wrapper, "expand", None))
+        )
+        can_collapse = bool(
+            callable(read_attr(expand_interface, "Collapse", None))
+            and callable(read_attr(wrapper, "collapse", None))
+        )
+        if can_expand and expand_state in {
+            DesktopExpandCollapseState.COLLAPSED,
+            DesktopExpandCollapseState.PARTIALLY_EXPANDED,
+        }:
+            actions.add(DesktopElementAction.EXPAND)
+        if can_collapse and expand_state in {
+            DesktopExpandCollapseState.EXPANDED,
+            DesktopExpandCollapseState.PARTIALLY_EXPANDED,
+        }:
+            actions.add(DesktopElementAction.COLLAPSE)
+
+    scroll_item_interface = read_attr(wrapper, "iface_scroll_item", None)
+    if (
+        scroll_item_interface is not None
+        and callable(read_attr(scroll_item_interface, "ScrollIntoView", None))
+        and callable(read_attr(wrapper, "scroll_into_view", None))
+    ):
+        actions.add(DesktopElementAction.SCROLL_INTO_VIEW)
+
+    scroll_axes: tuple[DesktopScrollAxis, ...] | None = None
+    scroll_interface = read_attr(wrapper, "iface_scroll", None)
+    if scroll_interface is not None:
+        axes: list[DesktopScrollAxis] = []
+        if _coerce_boolish(
+            read_attr(scroll_interface, "CurrentHorizontallyScrollable", None)
+        ) is True:
+            axes.append(DesktopScrollAxis.HORIZONTAL)
+        if _coerce_boolish(
+            read_attr(scroll_interface, "CurrentVerticallyScrollable", None)
+        ) is True:
+            axes.append(DesktopScrollAxis.VERTICAL)
+        scroll_axes = tuple(axes)
+        if (
+            axes
+            and callable(read_attr(scroll_interface, "Scroll", None))
+            and callable(read_attr(wrapper, "scroll", None))
+        ):
+            actions.add(DesktopElementAction.SCROLL)
+
+    return (
+        tuple(sorted(actions, key=lambda item: item.value)),
+        expand_state,
+        scroll_axes,
+    )
 
 
 def _metadata_digest(
@@ -238,6 +465,13 @@ class WindowsUiaDriver:
         discover_all_windows: bool = False,
         activate_on_observe: bool = False,
         capture_screenshots: bool = False,
+        visual_screenshot_enabled: bool | None = None,
+        visual_ocr_client: VisualOcrClient | None = None,
+        visual_ocr_apps: tuple[str, ...] = (),
+        visual_ocr_bbox_tolerance_pixels: int = 8,
+        visual_clicker: Callable[[int, int], None] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if max_elements < 1 or max_elements > 2000:
             raise ValueError("max_elements must be between 1 and 2000")
@@ -248,10 +482,34 @@ class WindowsUiaDriver:
         self._discover_all_windows = bool(discover_all_windows)
         self._activate_on_observe = bool(activate_on_observe)
         self._capture_screenshots = bool(capture_screenshots)
+        if not 0 <= int(visual_ocr_bbox_tolerance_pixels) <= 32:
+            raise ValueError("visual_ocr_bbox_tolerance_pixels must be between 0 and 32")
+        self._visual_ocr_client = visual_ocr_client
+        self._visual_screenshot_enabled = (
+            visual_ocr_client is not None
+            if visual_screenshot_enabled is None
+            else bool(visual_screenshot_enabled)
+        )
+        self._visual_ocr_apps = frozenset(item.strip().casefold() for item in visual_ocr_apps)
+        if any(not item for item in self._visual_ocr_apps):
+            raise ValueError("visual_ocr_apps must contain non-empty app names")
+        self._visual_ocr_bbox_tolerance_pixels = int(
+            visual_ocr_bbox_tolerance_pixels
+        )
+        self._visual_clicker = visual_clicker
+        self._monotonic = monotonic
+        self._sleep = sleeper
         self._generation = 0
         self._snapshots: dict[str, _Snapshot] = {}
         self._pending_observation: set[str] = set()
+        self._pending_visual_change: dict[str, str] = {}
+        self._visual_text_click: dict[int, _VisualTextClickBinding] = {}
+        self._visual_text_focus: dict[int, _VisualTextFocusBinding] = {}
+        self._visual_search_submission: dict[
+            int, _VisualSearchSubmissionBinding
+        ] = {}
         self._dynamic_windows: dict[str, _DynamicWindowBinding] = {}
+        self._active_cancellations: set[threading.Event] = set()
         self._task_context = ""
         self._lock = threading.RLock()
 
@@ -262,6 +520,9 @@ class WindowsUiaDriver:
             raise ValueError("desktop task context must be a bounded string or null")
         with self._lock:
             self._task_context = " ".join((task or "").casefold().split())
+            self._visual_text_click.clear()
+            self._visual_text_focus.clear()
+            self._visual_search_submission.clear()
 
     def _native_backend(self) -> NativeWindows:
         if self._native is None:
@@ -397,7 +658,60 @@ class WindowsUiaDriver:
         token = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         return f"{cls._dynamic_window_slug(window)}-{token}"
 
+    @staticmethod
+    def _immediate_parent_process_name(process_id: int) -> str | None:
+        """Return one content-free process-family hint for helper windows.
+
+        Some rendered desktop apps create a separate top-level helper process
+        for search or navigation results.  We intentionally inspect only the
+        immediate parent: walking the full ancestor chain could misclassify an
+        ordinary app as Explorer merely because Explorer launched it.
+        """
+
+        if process_id <= 0:
+            return None
+        try:
+            import psutil
+
+            parent = psutil.Process(process_id).parent()
+            if parent is None:
+                return None
+            name = parent.name()
+        except Exception:
+            return None
+        return name.strip().casefold() if isinstance(name, str) and name.strip() else None
+
     def _dynamic_profile(self, window: WindowInfo) -> tuple[AppProfile, str]:
+        # A window title commonly becomes the active document or conversation
+        # name.  An exact executable match is therefore the stable primary app
+        # identity; requiring a brand word in the changing title misclassified
+        # rendered WeChat/Claude windows as anonymous dynamic apps.
+        process_name = (window.process_name or "").strip().casefold()
+        if process_name:
+            process_matches = [
+                profile
+                for profile in self.profiles.values()
+                if process_name
+                in {item.strip().casefold() for item in profile.process_names if item.strip()}
+            ]
+            if len(process_matches) == 1:
+                profile = process_matches[0]
+                return profile, profile.name
+        parent_process_name = self._immediate_parent_process_name(window.process_id)
+        if parent_process_name:
+            parent_process_matches = [
+                profile
+                for profile in self.profiles.values()
+                if parent_process_name
+                in {
+                    item.strip().casefold()
+                    for item in profile.process_names
+                    if item.strip()
+                }
+            ]
+            if len(parent_process_matches) == 1:
+                profile = parent_process_matches[0]
+                return profile, profile.name
         for profile in self.profiles.values():
             if self._window_matches_profile(window, profile):
                 return profile, profile.name
@@ -433,6 +747,658 @@ class WindowsUiaDriver:
         if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
             return None
         return payload
+
+    @staticmethod
+    def _capture_window_rect(
+        root: Any,
+        *,
+        width: int,
+        height: int,
+    ) -> tuple[int, int, int, int]:
+        rectangle_member = _safe_attr(root, "rectangle", None)
+        try:
+            rectangle = rectangle_member() if callable(rectangle_member) else rectangle_member
+            if rectangle is None:
+                raise ValueError("missing rectangle")
+            if isinstance(rectangle, (tuple, list)) and len(rectangle) == 4:
+                values = tuple(int(item) for item in rectangle)
+            else:
+                values = tuple(
+                    int(
+                        member() if callable(member) else member
+                    )
+                    for member in (
+                        _safe_attr(rectangle, "left", None),
+                        _safe_attr(rectangle, "top", None),
+                        _safe_attr(rectangle, "right", None),
+                        _safe_attr(rectangle, "bottom", None),
+                    )
+                )
+        except (TypeError, ValueError) as exc:
+            raise WindowsUiaDriverError(
+                "visual OCR requires an exact captured-window rectangle"
+            ) from exc
+        left, top, right, bottom = values
+        if right <= left or bottom <= top:
+            raise WindowsUiaDriverError("visual OCR captured-window rectangle is invalid")
+        if right - left != width or bottom - top != height:
+            raise WindowsUiaDriverError(
+                "visual OCR screenshot dimensions do not match its exact window rectangle"
+            )
+        return values
+
+    @staticmethod
+    def _distance_to_interval(value: int, start: int, end: int) -> int:
+        if value < start:
+            return start - value
+        if value > end:
+            return value - end
+        return 0
+
+    @classmethod
+    def _focus_snapshot_matches_visual_click(
+        cls,
+        snapshot: NativeFocusSnapshot | None,
+        click: _VisualTextClickBinding,
+        *,
+        allow_horizontal_drift: bool = False,
+    ) -> bool:
+        """Bind a system caret to the exact screenshot point without OCR."""
+
+        if (
+            snapshot is None
+            or not snapshot.is_bound_to(click.hwnd)
+            or not snapshot.has_visible_system_caret
+            or snapshot.caret_rect_screen is None
+        ):
+            return False
+        window_left, window_top, window_right, window_bottom = click.window_rect
+        caret_left, caret_top, caret_right, caret_bottom = snapshot.caret_rect_screen
+        if (
+            window_right <= window_left
+            or window_bottom <= window_top
+            or caret_right < caret_left
+            or caret_bottom <= caret_top
+        ):
+            return False
+        caret_x = (caret_left + caret_right) // 2
+        caret_y = (caret_top + caret_bottom) // 2
+        if not (
+            window_left <= caret_x < window_right
+            and window_top <= caret_y < window_bottom
+        ):
+            return False
+        click_x = window_left + click.x
+        click_y = window_top + click.y
+        height = window_bottom - window_top
+        width = window_right - window_left
+        y_tolerance = max(32, min(96, height // 12))
+        if cls._distance_to_interval(click_y, caret_top, caret_bottom) > y_tolerance:
+            return False
+        if not allow_horizontal_drift:
+            x_tolerance = max(48, min(256, width // 5))
+            if cls._distance_to_interval(click_x, caret_left, caret_right) > x_tolerance:
+                return False
+        return True
+
+    @staticmethod
+    def _same_native_focus_identity(
+        binding: _VisualTextFocusBinding,
+        snapshot: NativeFocusSnapshot,
+    ) -> bool:
+        return bool(
+            snapshot.target_process_id == binding.target_process_id
+            and snapshot.target_thread_id == binding.target_thread_id
+            and snapshot.focus_hwnd == binding.focus_hwnd
+            and snapshot.caret_hwnd == binding.caret_hwnd
+        )
+
+    def _native_focus_snapshot(self, hwnd: int) -> NativeFocusSnapshot | None:
+        getter = getattr(self._native_backend(), "get_focus_snapshot", None)
+        if not callable(getter):
+            return None
+        try:
+            snapshot = getter(hwnd)
+        except Exception:
+            return None
+        return snapshot if isinstance(snapshot, NativeFocusSnapshot) else None
+
+    def _refresh_visual_text_focus(
+        self,
+        *,
+        hwnd: int,
+        window_rect: tuple[int, int, int, int],
+    ) -> bool:
+        """Promote/revalidate a rendered field only from fresh native caret evidence."""
+
+        with self._lock:
+            pending = self._visual_text_click.get(hwnd)
+            existing = self._visual_text_focus.get(hwnd)
+        candidate = pending or (existing.click if existing is not None else None)
+        if (
+            candidate is None
+            or candidate.hwnd != hwnd
+            or candidate.local_window_id != f"hwnd:{hwnd}"
+            or candidate.window_rect != window_rect
+        ):
+            with self._lock:
+                self._visual_text_click.pop(hwnd, None)
+                self._visual_text_focus.pop(hwnd, None)
+            return False
+        snapshot = self._native_focus_snapshot(hwnd)
+        valid = self._focus_snapshot_matches_visual_click(snapshot, candidate)
+        if valid and existing is not None:
+            assert snapshot is not None
+            valid = self._same_native_focus_identity(existing, snapshot)
+        if not valid:
+            with self._lock:
+                self._visual_text_click.pop(hwnd, None)
+                self._visual_text_focus.pop(hwnd, None)
+            return False
+        assert snapshot is not None
+        focus_binding = _VisualTextFocusBinding(
+            click=candidate,
+            target_process_id=snapshot.target_process_id,
+            target_thread_id=snapshot.target_thread_id,
+            focus_hwnd=snapshot.focus_hwnd,
+            caret_hwnd=snapshot.caret_hwnd,
+        )
+        with self._lock:
+            # A newer click for this HWND must not be overwritten by the query.
+            if pending is not None and self._visual_text_click.get(hwnd) != pending:
+                return False
+            self._visual_text_click.pop(hwnd, None)
+            self._visual_text_focus[hwnd] = focus_binding
+        return True
+
+    def _assert_visual_text_focus(
+        self,
+        binding: _VisualTextFocusBinding,
+        *,
+        allow_horizontal_drift: bool = False,
+    ) -> NativeFocusSnapshot:
+        snapshot = self._native_focus_snapshot(binding.click.hwnd)
+        if (
+            not self._focus_snapshot_matches_visual_click(
+                snapshot,
+                binding.click,
+                allow_horizontal_drift=allow_horizontal_drift,
+            )
+            or snapshot is None
+            or not self._same_native_focus_identity(binding, snapshot)
+        ):
+            raise WindowsUiaStaleObservation(
+                "rendered text focus/caret evidence no longer matches the exact window"
+            )
+        return snapshot
+
+    @staticmethod
+    def _visual_click_is_in_search_zone(click: _VisualTextClickBinding) -> bool:
+        height = click.window_rect[3] - click.window_rect[1]
+        return bool(height > 0 and click.y <= max(48, int(height * 0.30)))
+
+    def _refresh_visual_search_submission(
+        self,
+        *,
+        hwnd: int,
+        window_rect: tuple[int, int, int, int],
+    ) -> bool:
+        with self._lock:
+            binding = self._visual_search_submission.get(hwnd)
+        if (
+            binding is None
+            or binding.focus.click.window_rect != window_rect
+            or not self._visual_click_is_in_search_zone(binding.focus.click)
+        ):
+            with self._lock:
+                self._visual_search_submission.pop(hwnd, None)
+            return False
+        try:
+            self._assert_visual_text_focus(
+                binding.focus,
+                allow_horizontal_drift=True,
+            )
+        except WindowsUiaStaleObservation:
+            with self._lock:
+                self._visual_search_submission.pop(hwnd, None)
+            return False
+        return True
+
+    @staticmethod
+    def _processes_are_related(left_process_id: int, right_process_id: int) -> bool:
+        if left_process_id <= 0 or right_process_id <= 0:
+            return False
+        if left_process_id == right_process_id:
+            return True
+        try:
+            import psutil
+
+            left_ancestors = {item.pid for item in psutil.Process(left_process_id).parents()}
+            right_ancestors = {item.pid for item in psutil.Process(right_process_id).parents()}
+        except Exception:
+            return False
+        return bool(
+            left_process_id in right_ancestors
+            or right_process_id in left_ancestors
+        )
+
+    def _wait_for_related_foreground_transition(
+        self,
+        native: NativeWindows,
+        before_window: WindowInfo,
+        *,
+        timeout: float,
+        cancel_event: threading.Event | None,
+        operation_cancel: threading.Event,
+    ) -> WindowInfo | None:
+        remaining = max(0.0, timeout)
+        while True:
+            self._raise_if_cancelled(cancel_event, operation_cancel)
+            current = native.get_foreground_window_info()
+            if current is not None and current.hwnd != before_window.hwnd:
+                if self._processes_are_related(
+                    before_window.process_id,
+                    current.process_id,
+                ):
+                    return current
+                return None
+            if remaining <= 0.0:
+                return None
+            interval = min(0.05, remaining)
+            started = self._monotonic()
+            self._sleep(interval)
+            elapsed = max(0.0, self._monotonic() - started)
+            remaining -= max(interval, elapsed)
+
+    @staticmethod
+    def _raise_if_cancelled(
+        cancel_event: threading.Event | None,
+        operation_cancel: threading.Event,
+    ) -> None:
+        if operation_cancel.is_set() or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
+            raise WindowsUiaDriverError("desktop operation was cancelled")
+
+    def _sleep_interruptibly(
+        self,
+        duration: float,
+        *,
+        cancel_event: threading.Event | None,
+        operation_cancel: threading.Event,
+    ) -> None:
+        remaining = max(0.0, duration)
+        while remaining > 0.0:
+            self._raise_if_cancelled(cancel_event, operation_cancel)
+            interval = min(0.05, remaining)
+            started = self._monotonic()
+            self._sleep(interval)
+            elapsed = max(0.0, self._monotonic() - started)
+            remaining -= max(interval, elapsed)
+        self._raise_if_cancelled(cancel_event, operation_cancel)
+
+    def _bind_related_dynamic_window_transition(
+        self,
+        *,
+        app: str,
+        before_window: WindowInfo,
+        after_window: WindowInfo,
+    ) -> str | None:
+        with self._lock:
+            binding = self._dynamic_windows.get(app)
+            if (
+                binding is None
+                or not self._same_window_identity(binding.window, before_window)
+            ):
+                return None
+            self._dynamic_windows[app] = replace(
+                binding,
+                window=after_window,
+            )
+            # The destination may already have appeared in the pre-action
+            # inventory under another generated ID.  Keep the ID that owns the
+            # active task and remove only the duplicate binding for this exact
+            # HWND so the next inventory refresh cannot silently rename the
+            # task halfway through the verified transition.
+            duplicate_ids = tuple(
+                app_id
+                for app_id, candidate in self._dynamic_windows.items()
+                if app_id != app and candidate.window.hwnd == after_window.hwnd
+            )
+            for duplicate_id in duplicate_ids:
+                self._dynamic_windows.pop(duplicate_id, None)
+                self._snapshots.pop(duplicate_id, None)
+                self._pending_observation.discard(duplicate_id)
+        return f"hwnd:{after_window.hwnd}"
+
+    @staticmethod
+    def _visual_identity(
+        *,
+        hwnd: int,
+        window_rect: tuple[int, int, int, int],
+        text: str,
+        bbox: tuple[int, int, int, int],
+        label: str,
+        viewport: bool,
+        target_sha256: str,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "hwnd": int(hwnd),
+                "window_rect": window_rect,
+                "text": text,
+                "bbox": bbox,
+                "label": label,
+                "viewport": viewport,
+                "target_sha256": target_sha256,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _visual_crop_sha256(
+        screenshot_png: bytes,
+        bbox: tuple[int, int, int, int],
+    ) -> str:
+        try:
+            from PIL import Image
+
+            image = Image.open(io.BytesIO(screenshot_png)).convert("RGB")
+            crop = image.crop(bbox)
+            if crop.width < 1 or crop.height < 1:
+                raise ValueError("empty crop")
+            digest = hashlib.sha256()
+            digest.update(f"RGB:{crop.width}:{crop.height}:".encode("ascii"))
+            digest.update(crop.tobytes())
+            return digest.hexdigest()
+        except Exception as exc:
+            raise WindowsUiaDriverError(
+                "visual OCR requires a decodable local target crop"
+            ) from exc
+
+    @classmethod
+    def _make_visual_binding(
+        cls,
+        *,
+        hwnd: int,
+        window_rect: tuple[int, int, int, int],
+        result: VisualOcrResult,
+        screenshot_png: bytes,
+        block: VisualOcrBlock | None,
+    ) -> _VisualTargetBinding:
+        viewport = block is None
+        text = "Visual screenshot viewport" if viewport else block.text
+        bbox = (0, 0, result.width, result.height) if viewport else block.bbox
+        label = "viewport" if viewport else block.label
+        target_sha256 = (
+            hashlib.sha256(
+                f"viewport:{result.width}:{result.height}".encode("ascii")
+            ).hexdigest()
+            if viewport
+            else cls._visual_crop_sha256(screenshot_png, bbox)
+        )
+        return _VisualTargetBinding(
+            hwnd=hwnd,
+            window_rect=window_rect,
+            text=text,
+            bbox=bbox,
+            label=label,
+            frame_sha256=result.frame_sha256,
+            target_sha256=target_sha256,
+            local_identity=cls._visual_identity(
+                hwnd=hwnd,
+                window_rect=window_rect,
+                text=text,
+                bbox=bbox,
+                label=label,
+                viewport=viewport,
+                target_sha256=target_sha256,
+            ),
+            viewport=viewport,
+            screenshot_png=screenshot_png,
+        )
+
+    @staticmethod
+    def _screenshot_result(screenshot_png: bytes) -> VisualOcrResult:
+        """Describe a complete local PNG without requiring any OCR service."""
+
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(screenshot_png)) as image:
+                if image.format != "PNG":
+                    raise ValueError("not PNG")
+                width, height = image.size
+                if width < 1 or height < 1 or width > 16384 or height > 16384:
+                    raise ValueError("invalid dimensions")
+                image.verify()
+        except Exception as exc:
+            raise WindowsUiaDriverError(
+                "visual planning requires a decodable exact-window screenshot"
+            ) from exc
+        return VisualOcrResult(
+            width=int(width),
+            height=int(height),
+            frame_sha256=hashlib.sha256(screenshot_png).hexdigest(),
+            blocks=(),
+        )
+
+    @staticmethod
+    def _annotate_visual_regions(
+        screenshot_png: bytes,
+        indexed_bindings: Mapping[str, _VisualTargetBinding],
+    ) -> bytes:
+        """Overlay element indexes while preserving the complete captured window."""
+
+        try:
+            from PIL import Image, ImageDraw
+
+            image = Image.open(io.BytesIO(screenshot_png)).convert("RGB")
+            draw = ImageDraw.Draw(image)
+            for index, binding in indexed_bindings.items():
+                if binding.viewport:
+                    continue
+                left, top, right, bottom = binding.bbox
+                draw.rectangle((left, top, right - 1, bottom - 1), outline="#ff2d55", width=3)
+                marker = f"[{index}]"
+                marker_box = draw.textbbox((left, top), marker)
+                marker_width = marker_box[2] - marker_box[0] + 4
+                marker_height = marker_box[3] - marker_box[1] + 4
+                marker_top = max(0, top - marker_height)
+                draw.rectangle(
+                    (left, marker_top, min(image.width, left + marker_width), top),
+                    fill="#ff2d55",
+                )
+                draw.text((left + 2, marker_top + 1), marker, fill="white")
+            stream = io.BytesIO()
+            image.save(stream, format="PNG")
+            payload = stream.getvalue()
+        except Exception as exc:
+            raise WindowsUiaDriverError(
+                "visual OCR could not create the required set-of-marks screenshot"
+            ) from exc
+        if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise WindowsUiaDriverError(
+                "visual OCR set-of-marks encoder returned an invalid PNG"
+            )
+        return payload
+
+    @staticmethod
+    def _has_rich_uia_surface(elements: tuple[DesktopElement, ...]) -> bool:
+        inputs = tuple(
+            element
+            for element in elements
+            if element.addressable
+            and element.enabled
+            and element_plane(element) == ElementPlane.INPUT
+            and element.editable is not False
+        )
+        business_controls = tuple(
+            element
+            for element in elements
+            if element.addressable
+            and element.enabled
+            and element_plane(element) == ElementPlane.CONTROL
+        )
+        # A positively classified composer is sufficient. A plain input is
+        # sufficient only alongside a non-trivial business control surface;
+        # this keeps a few Chromium title-bar/shell buttons from suppressing
+        # augmentation in ChatGPT/Codex and Qt render-only windows.
+        return bool(
+            any(element.composer for element in inputs)
+            or (inputs and len(business_controls) >= 5)
+        )
+
+    def _visual_fallback(
+        self,
+        *,
+        app: str,
+        hwnd: int,
+        root: Any,
+        screenshot_png: bytes,
+        elements: tuple[DesktopElement, ...],
+        wrappers: dict[str, Any],
+        stats: dict[str, Any],
+    ) -> tuple[tuple[DesktopElement, ...], dict[str, Any], dict[str, Any], bytes]:
+        if (
+            not self._visual_screenshot_enabled
+            or app not in self._visual_ocr_apps
+            or self._has_rich_uia_surface(elements)
+        ):
+            return elements, wrappers, stats, screenshot_png
+        client = self._visual_ocr_client
+        result = self._screenshot_result(screenshot_png)
+        ocr_error: str | None = None
+        if client is not None:
+            try:
+                result = client.ocr_png(screenshot_png)
+            except SensitiveVisualSurfaceError:
+                raise
+            except VisualOcrError as exc:
+                # OCR is only an optional text-box enhancement. The complete
+                # screenshot and exact-frame viewport remain valid planner input.
+                ocr_error = type(exc).__name__
+        window_rect = self._capture_window_rect(
+            root,
+            width=result.width,
+            height=result.height,
+        )
+        visual_text_armed = self._refresh_visual_text_focus(
+            hwnd=hwnd,
+            window_rect=window_rect,
+        )
+        visual_search_submit_armed = self._refresh_visual_search_submission(
+            hwnd=hwnd,
+            window_rect=window_rect,
+        )
+        next_index = max((int(item.index) for item in elements), default=-1) + 1
+        capacity = max(0, self.max_elements - len(elements))
+        selected_blocks = result.blocks[: max(0, capacity - 1)]
+        bindings: dict[str, _VisualTargetBinding] = {}
+        visual_elements: list[DesktopElement] = []
+        for block in selected_blocks:
+            index = str(next_index)
+            next_index += 1
+            binding = self._make_visual_binding(
+                hwnd=hwnd,
+                window_rect=window_rect,
+                result=result,
+                screenshot_png=screenshot_png,
+                block=block,
+            )
+            bindings[index] = binding
+            name_metadata = BoundedUiText.from_text(block.text, maximum=512)
+            visual_elements.append(
+                DesktopElement(
+                    index=index,
+                    name=name_metadata.display,
+                    control_type="VisualText",
+                    automation_id=None,
+                    enabled=True,
+                    local_identity=binding.local_identity,
+                    plane=ElementPlane.CONTROL,
+                    editable=False,
+                    addressable=True,
+                    composer=False,
+                    visual_ocr=True,
+                    name_metadata=name_metadata,
+                    supported_actions=(DesktopElementAction.CLICK,),
+                )
+            )
+        if capacity > len(visual_elements):
+            index = str(next_index)
+            binding = self._make_visual_binding(
+                hwnd=hwnd,
+                window_rect=window_rect,
+                result=result,
+                screenshot_png=screenshot_png,
+                block=None,
+            )
+            bindings[index] = binding
+            viewport_actions = [
+                DesktopElementAction.CLICK,
+                DesktopElementAction.SCROLL,
+            ]
+            if visual_text_armed:
+                viewport_actions.append(DesktopElementAction.TYPE_TEXT)
+            if visual_search_submit_armed:
+                viewport_actions.append(DesktopElementAction.PRESS_KEY)
+            visual_elements.append(
+                DesktopElement(
+                    index=index,
+                    name=binding.text,
+                    control_type="VisualViewport",
+                    enabled=True,
+                    local_identity=binding.local_identity,
+                    plane=ElementPlane.CONTROL,
+                    editable=False,
+                    addressable=True,
+                    composer=False,
+                    visual_ocr=True,
+                    supported_actions=tuple(viewport_actions),
+                    scroll_axes=(DesktopScrollAxis.VERTICAL,),
+                )
+            )
+        combined = elements + tuple(visual_elements)
+        combined_wrappers = {**wrappers, **bindings}
+        updated = dict(stats)
+        updated["visual_screenshot_used"] = True
+        updated["visual_ocr_used"] = client is not None and ocr_error is None
+        if ocr_error is not None:
+            updated["visual_ocr_error"] = ocr_error
+        updated["visual_ocr_augmented_uia"] = bool(elements)
+        updated["visual_ocr_region_count"] = len(visual_elements)
+        updated["visual_ocr_text_region_count"] = len(selected_blocks)
+        updated["visual_ocr_frame_bound"] = True
+        updated["kept"] = len(combined)
+        updated["retained"] = len(combined)
+        updated["retained_actionable"] = int(updated.get("retained_actionable", 0)) + len(
+            visual_elements
+        )
+        updated["kept_control_count"] = int(updated.get("kept_control_count", 0)) + len(
+            visual_elements
+        )
+        updated["total_element_count"] = max(
+            len(combined),
+            int(updated.get("total_element_count", len(elements))) + len(visual_elements),
+        )
+        updated["elements_truncated"] = bool(
+            updated.get("elements_truncated") or len(selected_blocks) < len(result.blocks)
+        )
+        annotated_png = (
+            self._annotate_visual_regions(screenshot_png, bindings)
+            if selected_blocks
+            else screenshot_png
+        )
+        return (
+            combined,
+            combined_wrappers,
+            updated,
+            annotated_png,
+        )
 
     def _root(self, hwnd: int) -> Any:
         try:
@@ -731,6 +1697,11 @@ class WindowsUiaDriver:
         except Exception:
             selected = None
         value_observed, value = self._raw_value_state(wrapper, password=password)
+        semantic_content = control_type.strip().casefold() in _SEMANTIC_CONTENT_CONTROL_TYPES
+        supported_actions, expand_state, scroll_axes = _uia_capability_metadata(
+            wrapper,
+            allow_activation=not semantic_content,
+        )
         return DesktopElement(
             index=index,
             name=name,
@@ -743,6 +1714,9 @@ class WindowsUiaDriver:
             password=password,
             enabled=_safe_call(wrapper, "is_enabled", True) is not False,
             local_identity=self._local_identity(wrapper),
+            supported_actions=supported_actions,
+            expand_collapse_state=expand_state,
+            scroll_axes=scroll_axes,
         )
 
     @staticmethod
@@ -892,6 +1866,17 @@ class WindowsUiaDriver:
                 return member()
             except Exception:
                 if count_error:
+                    stats["property_errors"] += 1
+                return default
+
+        def counted_capability_attr(owner: Any, name: str, default: Any = None) -> Any:
+            try:
+                return getattr(owner, name, default)
+            except Exception as exc:
+                # Absence of an optional UIA pattern is a normal negative
+                # capability result. Other interface/property failures remain
+                # visible in diagnostics but are still contained per element.
+                if not _is_missing_uia_pattern(exc):
                     stats["property_errors"] += 1
                 return default
 
@@ -1250,11 +2235,19 @@ class WindowsUiaDriver:
             name_limit = (
                 min(profile.max_content_chars, 1024) if content_plane else control_name_limit
             )
-            name_metadata = _bounded_text(name, maximum=name_limit)
             value_limit = profile.max_content_chars if content_plane else 4000
-            value_metadata = (
-                _bounded_text(value, maximum=value_limit) if value is not None else None
-            )
+            try:
+                name_metadata = _bounded_text(name, maximum=name_limit)
+                value_metadata = (
+                    _bounded_text(value, maximum=value_limit) if value is not None else None
+                )
+            except ValueError:
+                # One malformed UIA property must not make the entire window
+                # unobservable. The content-free digest still participates in
+                # freshness, while no invalid text crosses the protocol boundary.
+                stats["omitted_invalid_metadata"] += 1
+                bounded_entries.append((source_index, "invalid-metadata", private_digest))
+                continue
             bounded_name = name_metadata.display
             bounded_value = value_metadata.display if value_metadata is not None else None
             name_truncated = name_metadata.truncated
@@ -1283,7 +2276,19 @@ class WindowsUiaDriver:
             semantic_content = (
                 normalized_control_type in _SEMANTIC_CONTENT_CONTROL_TYPES and not composer
             )
-            addressable = not dialog_plane and not semantic_content and not name_truncated
+            supported_actions, expand_state, scroll_axes = _uia_capability_metadata(
+                wrapper,
+                read_attr=counted_capability_attr,
+                allow_activation=not semantic_content and not dialog_plane,
+            )
+            scroll_addressable = bool(
+                enabled and DesktopElementAction.SCROLL in supported_actions
+            )
+            addressable = bool(
+                not dialog_plane
+                and not name_truncated
+                and (not semantic_content or scroll_addressable)
+            )
             if editable is False and normalized_control_type in {"edit", "document"}:
                 addressable = False
             try:
@@ -1314,6 +2319,9 @@ class WindowsUiaDriver:
                     low_credential=low_credential,
                     name_metadata=name_metadata,
                     value_metadata=value_metadata,
+                    supported_actions=supported_actions,
+                    expand_collapse_state=expand_state,
+                    scroll_axes=scroll_axes,
                 )
             except ValueError:
                 stats["omitted_invalid_metadata"] += 1
@@ -1327,7 +2335,11 @@ class WindowsUiaDriver:
                     wrapper=wrapper,
                     element=item,
                     actionable=addressable
-                    and (composer or self._is_actionable(control_type, enabled=enabled)),
+                    and (
+                        composer
+                        or self._is_actionable(control_type, enabled=enabled)
+                        or bool(supported_actions)
+                    ),
                     addressable=addressable,
                     content_plane=content_plane,
                     private_digest=private_digest,
@@ -1364,7 +2376,10 @@ class WindowsUiaDriver:
                 type_rank = 0
             elif normalized_type in {"edit", "combobox", "spinner"}:
                 type_rank = 1
-            elif normalized_type in {"listitem", "treeitem"}:
+            elif normalized_type in {"listitem", "treeitem"} or (
+                candidate.element.supported_actions is not None
+                and DesktopElementAction.SCROLL in candidate.element.supported_actions
+            ):
                 type_rank = 2
             else:
                 type_rank = 3
@@ -1467,14 +2482,46 @@ class WindowsUiaDriver:
         if self._discover_all_windows:
             windows = native.enumerate_windows()
             foreground = native.get_foreground_window_info()
+            with self._lock:
+                old_bindings = dict(self._dynamic_windows)
+            preserved_by_hwnd = {
+                binding.window.hwnd: binding
+                for binding in old_bindings.values()
+            }
+            reserved_preserved_ids = {
+                binding.app_id for binding in preserved_by_hwnd.values()
+            }
             bindings: dict[str, _DynamicWindowBinding] = {}
             visible: list[dict[str, Any]] = []
             for window in windows:
-                app_id = self._dynamic_window_id(window)
+                preserved = preserved_by_hwnd.get(window.hwnd)
+                if preserved is not None and self._same_window_identity(
+                    preserved.window,
+                    window,
+                    allow_title_change=True,
+                ):
+                    app_id = preserved.app_id
+                    profile = preserved.profile
+                    display_name = preserved.display_name
+                else:
+                    app_id = self._dynamic_window_id(window)
+                    profile, display_name = self._dynamic_profile(window)
+                    if app_id in reserved_preserved_ids:
+                        # A task-scoped alias can deliberately move from a
+                        # parent HWND to a related child HWND.  If the old
+                        # parent remains visible, its identity-derived ID is
+                        # now reserved for that child.  Give the newly seen
+                        # parent a deterministic alternate instead of stealing
+                        # the active task's alias during inventory refresh.
+                        suffix = 2
+                        candidate = f"{app_id}-visible-{suffix}"
+                        while candidate in reserved_preserved_ids or candidate in bindings:
+                            suffix += 1
+                            candidate = f"{app_id}-visible-{suffix}"
+                        app_id = candidate
                 if app_id in bindings:
                     # A duplicate HWND/PID record is not a second selectable window.
                     continue
-                profile, display_name = self._dynamic_profile(window)
                 binding = _DynamicWindowBinding(
                     app_id=app_id,
                     window=window,
@@ -1495,7 +2542,6 @@ class WindowsUiaDriver:
                     }
                 )
             with self._lock:
-                old_bindings = self._dynamic_windows
                 self._dynamic_windows = bindings
                 invalidated_ids = {
                     app_id
@@ -1551,7 +2597,47 @@ class WindowsUiaDriver:
             native.assert_foreground(window.hwnd)
         root = self._root(window.hwnd)
         elements, wrappers, stats = self._elements(root, profile)
-        screenshot_png = self._capture_window_png(root) if self._capture_screenshots else None
+        visual_app = (
+            normalized
+            if normalized in self._visual_ocr_apps
+            else profile.name.strip().casefold()
+        )
+        visual_enabled_for_window = bool(
+            self._visual_screenshot_enabled and visual_app in self._visual_ocr_apps
+        )
+        screenshot_png = (
+            self._capture_window_png(root)
+            if self._capture_screenshots or visual_enabled_for_window
+            else None
+        )
+        if visual_enabled_for_window and screenshot_png is None:
+            raise WindowsUiaDriverError(
+                "visual OCR could not capture the complete exact target window"
+            )
+        raw_screenshot_png = screenshot_png
+        with self._lock:
+            previous_visual_frame = self._pending_visual_change.get(normalized)
+        if previous_visual_frame is not None:
+            if raw_screenshot_png is None:
+                raise WindowsUiaDriverError(
+                    "visual action postcondition has no fresh window screenshot"
+                )
+            current_frame = hashlib.sha256(raw_screenshot_png).hexdigest()
+            if current_frame == previous_visual_frame:
+                raise WindowsUiaDriverError(
+                    "visual action produced no observable exact-window change"
+                )
+        if visual_enabled_for_window:
+            assert screenshot_png is not None
+            elements, wrappers, stats, screenshot_png = self._visual_fallback(
+                app=visual_app,
+                hwnd=window.hwnd,
+                root=root,
+                screenshot_png=screenshot_png,
+                elements=elements,
+                wrappers=wrappers,
+                stats=stats,
+            )
         if self._activate_on_observe:
             native.assert_foreground(window.hwnd)
         with self._lock:
@@ -1574,6 +2660,7 @@ class WindowsUiaDriver:
             )
             self._snapshots[normalized] = _Snapshot(window.hwnd, observation, wrappers)
             self._pending_observation.discard(normalized)
+            self._pending_visual_change.pop(normalized, None)
             return observation
 
     @staticmethod
@@ -1637,6 +2724,15 @@ class WindowsUiaDriver:
             )
             current_secret_labeled = self._runtime_secret_labeled_state(wrapper)
             current_composer = self._runtime_composer_state(wrapper, expected)
+            (
+                current_supported_actions,
+                current_expand_state,
+                current_scroll_axes,
+            ) = _uia_capability_metadata(
+                wrapper,
+                allow_activation=element_plane(expected)
+                not in {ElementPlane.CONTENT, ElementPlane.DIALOG},
+            )
         except (UIAError, WindowsUiaDriverError):
             raise
         except Exception as exc:
@@ -1701,18 +2797,178 @@ class WindowsUiaDriver:
         selection_changed = current_selected != expected.selected and not (
             expected.selected is False and current_selected is None
         )
+        capability_changed = bool(
+            expected.supported_actions is not None
+            and (
+                current_supported_actions != expected.supported_actions
+                or current_expand_state != expected.expand_collapse_state
+                or current_scroll_axes != expected.scroll_axes
+            )
+        )
         if (
             current_state != expected_state
             or selection_changed
+            or capability_changed
             or (require_focus and (expected.focused is not True or current_focused is not True))
         ):
             raise WindowsUiaStaleObservation(
                 "target element identity or state changed after the observation"
             )
 
+    def _rebind_visual_target(
+        self,
+        binding: _VisualTargetBinding,
+        expected: DesktopElement,
+    ) -> tuple[tuple[int, int, int, int], bytes]:
+        if not self._visual_screenshot_enabled or not expected.visual_ocr:
+            raise WindowsUiaStaleObservation("visual screenshot target is no longer enabled")
+        if expected.local_identity != binding.local_identity:
+            raise WindowsUiaStaleObservation("visual screenshot target identity changed")
+        root = self._root(binding.hwnd)
+        screenshot_png = self._capture_window_png(root)
+        if screenshot_png is None:
+            raise WindowsUiaStaleObservation("visual screenshot target could not be recaptured")
+        try:
+            screenshot_result = self._screenshot_result(screenshot_png)
+            window_rect = self._capture_window_rect(
+                root,
+                width=screenshot_result.width,
+                height=screenshot_result.height,
+            )
+        except WindowsUiaDriverError as exc:
+            raise WindowsUiaStaleObservation(
+                "visual screenshot target could not be rebound"
+            ) from exc
+        if window_rect != binding.window_rect:
+            raise WindowsUiaStaleObservation("visual screenshot target window moved or resized")
+        if binding.viewport:
+            expected_bbox = (0, 0, screenshot_result.width, screenshot_result.height)
+            if binding.bbox != expected_bbox:
+                raise WindowsUiaStaleObservation("visual screenshot viewport dimensions changed")
+            return expected_bbox, screenshot_png
+        client = self._visual_ocr_client
+        if client is None:
+            raise WindowsUiaStaleObservation(
+                "OCR text target is unavailable without the optional OCR region service"
+            )
+        try:
+            result = client.ocr_png(screenshot_png)
+        except VisualOcrError as exc:
+            raise WindowsUiaStaleObservation("visual OCR target could not be rebound") from exc
+        if result.width != screenshot_result.width or result.height != screenshot_result.height:
+            raise WindowsUiaStaleObservation("visual OCR target dimensions changed")
+        tolerance = self._visual_ocr_bbox_tolerance_pixels
+        matches = [
+            block
+            for block in result.blocks
+            if block.text == binding.text
+            and block.label == binding.label
+            and all(
+                abs(current - prior) <= tolerance
+                for current, prior in zip(block.bbox, binding.bbox, strict=True)
+            )
+        ]
+        if len(matches) != 1:
+            raise WindowsUiaStaleObservation(
+                "visual OCR target no longer has one unique same-label same-region match"
+            )
+        rebound_bbox = matches[0].bbox
+        if self._visual_crop_sha256(screenshot_png, rebound_bbox) != binding.target_sha256:
+            raise WindowsUiaStaleObservation(
+                "visual OCR target pixels changed after planning; a new observation is required"
+            )
+        return rebound_bbox, screenshot_png
+
     @staticmethod
-    def _invoke(wrapper: Any, *, foreground_guard: Callable[[], None]) -> str:
-        for name in ("invoke", "select", "toggle"):
+    def _visual_point_patch_still_matches(
+        planned_png: bytes,
+        current_png: bytes,
+        *,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        radius: int = 32,
+    ) -> bool:
+        """Ignore caret blink while rejecting a materially changed click target."""
+
+        left = max(0, x - radius)
+        top = max(0, y - radius)
+        right = min(width, x + radius + 1)
+        bottom = min(height, y + radius + 1)
+        try:
+            from PIL import Image
+
+            planned = Image.open(io.BytesIO(planned_png)).convert("RGB").crop(
+                (left, top, right, bottom)
+            )
+            current = Image.open(io.BytesIO(current_png)).convert("RGB").crop(
+                (left, top, right, bottom)
+            )
+            if planned.size != current.size or planned.width < 1 or planned.height < 1:
+                return False
+            changed_pixels = 0
+            absolute_difference = 0
+            planned_bytes = planned.tobytes()
+            current_bytes = current.tobytes()
+            for offset in range(0, len(planned_bytes), 3):
+                channel_difference = tuple(
+                    abs(before - after)
+                    for before, after in zip(
+                        planned_bytes[offset : offset + 3],
+                        current_bytes[offset : offset + 3],
+                        strict=True,
+                    )
+                )
+                absolute_difference += sum(channel_difference)
+                if max(channel_difference) > 24:
+                    changed_pixels += 1
+            pixel_count = planned.width * planned.height
+            # A two-pixel caret blinking across a normal input height is well
+            # below this bound. A moved/changed control, icon, or text label is
+            # not. The mean-difference guard also rejects broad low-contrast
+            # changes that evade the per-pixel threshold.
+            return bool(
+                changed_pixels <= max(24, int(pixel_count * 0.04))
+                and absolute_difference <= pixel_count * 3 * 6
+            )
+        except Exception:
+            return False
+
+    def _click_visual_region(self, x: int, y: int) -> None:
+        if self._visual_clicker is not None:
+            self._visual_clicker(x, y)
+            return
+        try:
+            from pywinauto import mouse
+
+            mouse.click(button="left", coords=(x, y))
+        except Exception as exc:
+            raise WindowsUiaDriverError("visual OCR semantic click failed") from exc
+
+    @staticmethod
+    def _invoke(
+        wrapper: Any,
+        expected: DesktopElement,
+        *,
+        foreground_guard: Callable[[], None],
+    ) -> str:
+        capability_methods = (
+            (DesktopElementAction.INVOKE, "invoke"),
+            (DesktopElementAction.SELECT, "select"),
+            (DesktopElementAction.TOGGLE, "toggle"),
+        )
+        declared_methods = (
+            tuple(
+                method
+                for capability, method in capability_methods
+                if expected.supported_actions is not None
+                and capability in expected.supported_actions
+            )
+            if expected.supported_actions
+            else ("invoke", "select", "toggle")
+        )
+        for name in declared_methods:
             method = _safe_attr(wrapper, name, None)
             if callable(method):
                 method()
@@ -1856,6 +3112,7 @@ class WindowsUiaDriver:
         normalized = self._normalize_app(action.app)
         if cancel_event is not None and cancel_event.is_set():
             raise WindowsUiaDriverError("desktop operation was cancelled")
+        operation_cancel = threading.Event()
         with self._lock:
             snapshot = self._snapshots.get(normalized)
             if (
@@ -1870,7 +3127,9 @@ class WindowsUiaDriver:
                     "a fresh observation is required after each action"
                 )
             self._pending_observation.add(normalized)
+            self._active_cancellations.add(operation_cancel)
         try:
+            self._raise_if_cancelled(cancel_event, operation_cancel)
             native = self._native_backend()
             native.assert_interactive_desktop()
             window = self._resolve_window(action.app)
@@ -1879,6 +3138,8 @@ class WindowsUiaDriver:
             native.activate_window(snapshot.hwnd)
             native.assert_foreground(snapshot.hwnd)
             method = ""
+            after_local_window_id: str | None = None
+            accepted_foreground_hwnd = snapshot.hwnd
             wrapper: Any | None = None
             expected_element: DesktopElement | None = None
             if action.element_index is not None:
@@ -1895,9 +3156,269 @@ class WindowsUiaDriver:
                         "element index has no unique structured observation target"
                     )
                 expected_element = expected_matches[0]
-                self._assert_element_usable(wrapper)
+                if not isinstance(wrapper, _VisualTargetBinding):
+                    with self._lock:
+                        self._visual_text_click.pop(snapshot.hwnd, None)
+                        self._visual_text_focus.pop(snapshot.hwnd, None)
+                        self._visual_search_submission.pop(snapshot.hwnd, None)
+                    self._assert_element_usable(wrapper)
 
-            if action.type == DesktopActionType.CLICK:
+            if isinstance(wrapper, _VisualTargetBinding):
+                assert expected_element is not None
+                if not expected_element.visual_ocr:
+                    raise WindowsUiaStaleObservation(
+                        "visual target lost its immutable source marker"
+                    )
+                bbox, rebound_screenshot_png = self._rebind_visual_target(
+                    wrapper,
+                    expected_element,
+                )
+                native.assert_foreground(snapshot.hwnd)
+                if action.type == DesktopActionType.CLICK:
+                    with self._lock:
+                        self._visual_text_click.pop(snapshot.hwnd, None)
+                        self._visual_text_focus.pop(snapshot.hwnd, None)
+                        self._visual_search_submission.pop(snapshot.hwnd, None)
+                    if (
+                        action.mouse_button not in {None, "left"}
+                        or action.click_count not in {None, 1}
+                    ):
+                        raise WindowsUiaDriverError(
+                            "only one rebound visual left click is enabled"
+                        )
+                    if (
+                        expected_element.supported_actions is None
+                        or DesktopElementAction.CLICK
+                        not in expected_element.supported_actions
+                    ):
+                        raise WindowsUiaDriverError(
+                            "visual target does not declare semantic click support"
+                        )
+                    if wrapper.viewport:
+                        if not snapshot.observation.local_window_id:
+                            raise WindowsUiaStaleObservation(
+                                "visual text focus requires an exact local window identity"
+                            )
+                        if action.x is None or action.y is None:
+                            raise WindowsUiaDriverError(
+                                "visual viewport click requires one screenshot-local x/y point"
+                            )
+                        if (
+                            not float(action.x).is_integer()
+                            or not float(action.y).is_integer()
+                        ):
+                            raise WindowsUiaDriverError(
+                                "visual viewport point must use integer pixels"
+                            )
+                        local_x = int(action.x)
+                        local_y = int(action.y)
+                        if not (0 <= local_x < bbox[2] and 0 <= local_y < bbox[3]):
+                            raise WindowsUiaDriverError(
+                                "visual viewport point escapes the exact screenshot"
+                            )
+                        patch_still_matches = self._visual_point_patch_still_matches(
+                            wrapper.screenshot_png,
+                            rebound_screenshot_png,
+                            x=local_x,
+                            y=local_y,
+                            width=bbox[2],
+                            height=bbox[3],
+                        )
+                        if not patch_still_matches:
+                            raise WindowsUiaStaleObservation(
+                                "visual viewport target patch materially changed after planning; "
+                                "a new observation is required"
+                            )
+                    else:
+                        if action.x is not None or action.y is not None:
+                            raise WindowsUiaDriverError(
+                                "OCR text targets are clicked only at their rebound center"
+                            )
+                        left, top, right, bottom = bbox
+                        local_x = (left + right) // 2
+                        local_y = (top + bottom) // 2
+                    window_left, window_top, window_right, window_bottom = (
+                        wrapper.window_rect
+                    )
+                    x = window_left + local_x
+                    y = window_top + local_y
+                    if not (
+                        window_left <= x < window_right
+                        and window_top <= y < window_bottom
+                    ):
+                        raise WindowsUiaStaleObservation(
+                            "visual target center escapes the exact target window"
+                        )
+                    native.assert_foreground(snapshot.hwnd)
+                    self._click_visual_region(x, y)
+                    if wrapper.viewport:
+                        with self._lock:
+                            self._visual_text_click[snapshot.hwnd] = (
+                                _VisualTextClickBinding(
+                                    hwnd=snapshot.hwnd,
+                                    local_window_id=(
+                                        snapshot.observation.local_window_id
+                                    ),
+                                    window_rect=wrapper.window_rect,
+                                    x=local_x,
+                                    y=local_y,
+                                )
+                            )
+                    method = (
+                        "fresh-frame bound visual point click"
+                        if wrapper.viewport
+                        else "fresh-frame rebound visual semantic click"
+                    )
+                elif action.type == DesktopActionType.TYPE_TEXT:
+                    if not wrapper.viewport:
+                        raise WindowsUiaDriverError(
+                            "visual text input requires the exact visual viewport"
+                        )
+                    if (
+                        expected_element.supported_actions is None
+                        or DesktopElementAction.TYPE_TEXT
+                        not in expected_element.supported_actions
+                    ):
+                        raise WindowsUiaDriverError(
+                            "visual viewport text input was not armed by a prior point click"
+                        )
+                    assert action.text is not None
+                    with self._lock:
+                        self._visual_search_submission.pop(snapshot.hwnd, None)
+                    with self._lock:
+                        focus_binding = self._visual_text_focus.get(snapshot.hwnd)
+                    if (
+                        focus_binding is None
+                        or not snapshot.observation.local_window_id
+                        or focus_binding.click.local_window_id
+                        != snapshot.observation.local_window_id
+                    ):
+                        raise WindowsUiaStaleObservation(
+                            "visual text focus binding is absent or belongs to another window"
+                        )
+                    if not (
+                        0 <= focus_binding.click.x < bbox[2]
+                        and 0 <= focus_binding.click.y < bbox[3]
+                        and focus_binding.click.window_rect == wrapper.window_rect
+                    ):
+                        raise WindowsUiaStaleObservation(
+                            "visual text focus point escapes the current screenshot"
+                        )
+                    native.assert_foreground(snapshot.hwnd)
+                    self._assert_visual_text_focus(focus_binding)
+                    try:
+                        native.send_text(action.text)
+                    finally:
+                        with self._lock:
+                            self._visual_text_click.pop(snapshot.hwnd, None)
+                            self._visual_text_focus.pop(snapshot.hwnd, None)
+                    self._assert_visual_text_focus(
+                        focus_binding,
+                        allow_horizontal_drift=True,
+                    )
+                    if self._visual_click_is_in_search_zone(focus_binding.click):
+                        with self._lock:
+                            self._visual_search_submission[snapshot.hwnd] = (
+                                _VisualSearchSubmissionBinding(
+                                    focus=focus_binding,
+                                    payload_sha256=hashlib.sha256(
+                                        action.text.encode("utf-8")
+                                    ).hexdigest(),
+                                    payload_length=len(action.text),
+                                )
+                            )
+                    method = (
+                        "single-use exact user-authored visual text input with "
+                        "native focus/caret binding"
+                    )
+                elif action.type == DesktopActionType.PRESS_KEY:
+                    if not wrapper.viewport:
+                        raise WindowsUiaDriverError(
+                            "visual search submission requires the exact visual viewport"
+                        )
+                    if (
+                        expected_element.supported_actions is None
+                        or DesktopElementAction.PRESS_KEY
+                        not in expected_element.supported_actions
+                    ):
+                        raise WindowsUiaDriverError(
+                            "visual search submission was not armed by exact text input"
+                        )
+                    if (action.key or "").strip().casefold() not in {"enter", "return"}:
+                        raise WindowsUiaDriverError(
+                            "visual search submission permits Enter/Return only"
+                        )
+                    with self._lock:
+                        submission_binding = self._visual_search_submission.get(
+                            snapshot.hwnd
+                        )
+                    if (
+                        submission_binding is None
+                        or not snapshot.observation.local_window_id
+                        or submission_binding.focus.click.local_window_id
+                        != snapshot.observation.local_window_id
+                        or submission_binding.focus.click.window_rect
+                        != wrapper.window_rect
+                        or not self._visual_click_is_in_search_zone(
+                            submission_binding.focus.click
+                        )
+                    ):
+                        raise WindowsUiaStaleObservation(
+                            "visual search submission binding is absent or stale"
+                        )
+                    native.assert_foreground(snapshot.hwnd)
+                    self._assert_visual_text_focus(
+                        submission_binding.focus,
+                        allow_horizontal_drift=True,
+                    )
+                    try:
+                        native.send_hotkey("enter")
+                    finally:
+                        with self._lock:
+                            self._visual_text_click.pop(snapshot.hwnd, None)
+                            self._visual_text_focus.pop(snapshot.hwnd, None)
+                            self._visual_search_submission.pop(snapshot.hwnd, None)
+                    method = (
+                        "single-use native-focus-bound visual search submission"
+                    )
+                elif action.type == DesktopActionType.SCROLL:
+                    with self._lock:
+                        self._visual_text_click.pop(snapshot.hwnd, None)
+                        self._visual_text_focus.pop(snapshot.hwnd, None)
+                        self._visual_search_submission.pop(snapshot.hwnd, None)
+                    if not wrapper.viewport:
+                        raise WindowsUiaDriverError(
+                            "visual scrolling requires the exact visual viewport"
+                        )
+                    if (
+                        expected_element.supported_actions is None
+                        or DesktopElementAction.SCROLL
+                        not in expected_element.supported_actions
+                    ):
+                        raise WindowsUiaDriverError(
+                            "visual viewport does not declare scroll support"
+                        )
+                    if action.direction not in {"up", "down"}:
+                        raise WindowsUiaDriverError(
+                            "visual viewport permits vertical scrolling only"
+                        )
+                    if math.ceil(float(action.pages or 1)) != 1:
+                        raise WindowsUiaDriverError(
+                            "visual viewport scroll is limited to one fresh page"
+                        )
+                    native.assert_foreground(snapshot.hwnd)
+                    native.send_hotkey("pageup" if action.direction == "up" else "pagedown")
+                    method = "fresh-frame rebound visual page scroll"
+                else:
+                    raise WindowsUiaDriverError(
+                        "visual targets permit click, viewport scroll, or one armed search text; "
+                        "keys, secondary actions, drag, Enter, and send are disabled"
+                    )
+                with self._lock:
+                    self._pending_visual_change[normalized] = hashlib.sha256(
+                        rebound_screenshot_png
+                    ).hexdigest()
+            elif action.type == DesktopActionType.CLICK:
                 if wrapper is None:
                     raise WindowsUiaDriverError("coordinate clicks are disabled")
                 if action.mouse_button not in {None, "left"} or action.click_count not in {None, 1}:
@@ -1912,6 +3433,7 @@ class WindowsUiaDriver:
                 else:
                     method = self._invoke(
                         wrapper,
+                        expected_element,
                         foreground_guard=lambda: native.assert_foreground(snapshot.hwnd),
                     )
             elif action.type == DesktopActionType.PERFORM_SECONDARY_ACTION:
@@ -1989,29 +3511,87 @@ class WindowsUiaDriver:
                 method_fn = _safe_attr(wrapper, "scroll", None)
                 if not callable(method_fn):
                     raise WindowsUiaDriverError("target element does not expose UIA scrolling")
-                method_fn(action.direction, int(action.pages or 1))
+                method_fn(
+                    action.direction,
+                    "page",
+                    count=max(1, math.ceil(float(action.pages or 1))),
+                )
                 method = "UIA scroll"
             elif action.type == DesktopActionType.DRAG:
                 raise WindowsUiaDriverError("coordinate drag is disabled")
             else:  # pragma: no cover - enum exhaustiveness guard
                 raise WindowsUiaDriverError("unsupported desktop action")
-            native.assert_foreground(snapshot.hwnd)
+            if action.type in {
+                DesktopActionType.CLICK,
+                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                DesktopActionType.PRESS_KEY,
+            }:
+                transitioned = self._wait_for_related_foreground_transition(
+                    native,
+                    window,
+                    timeout=(
+                        2.0
+                        if action.type == DesktopActionType.PRESS_KEY
+                        else 0.35
+                    ),
+                    cancel_event=cancel_event,
+                    operation_cancel=operation_cancel,
+                )
+                if transitioned is not None:
+                    after_local_window_id = self._bind_related_dynamic_window_transition(
+                        app=normalized,
+                        before_window=window,
+                        after_window=transitioned,
+                    )
+                    if after_local_window_id is None:
+                        raise WindowsUiaStaleObservation(
+                            "related foreground transition was not bound to the exact app"
+                        )
+                    accepted_foreground_hwnd = transitioned.hwnd
+                    # Rendered helper windows (notably WeChat's separate
+                    # WeChatAppEx search surface) expose their top-level HWND
+                    # before the actionable document tree has loaded.  A
+                    # precision-first controller should wait for that bounded
+                    # transition instead of planning against the transient
+                    # shell and guessing a coordinate.
+                    self._sleep_interruptibly(
+                        2.0,
+                        cancel_event=cancel_event,
+                        operation_cancel=operation_cancel,
+                    )
+            native.assert_foreground(accepted_foreground_hwnd)
         except Exception:
             with self._lock:
                 self._snapshots.pop(normalized, None)
+                self._pending_visual_change.pop(normalized, None)
+                self._visual_text_click.pop(snapshot.hwnd, None)
+                self._visual_text_focus.pop(snapshot.hwnd, None)
+                self._visual_search_submission.pop(snapshot.hwnd, None)
             raise
+        finally:
+            with self._lock:
+                self._active_cancellations.discard(operation_cancel)
         return ActionReceipt(
             action=action,
             accepted=True,
             before_generation=before.generation,
             driver_message=f"Windows UIA accepted one atomic action via {method}",
+            after_local_window_id=after_local_window_id,
         )
 
     def cancel(self) -> bool:
-        return False
+        with self._lock:
+            active_cancellations = tuple(self._active_cancellations)
+        for operation_cancel in active_cancellations:
+            operation_cancel.set()
+        return bool(active_cancellations)
 
     def close(self) -> None:
         with self._lock:
             self._snapshots.clear()
             self._pending_observation.clear()
+            self._pending_visual_change.clear()
+            self._visual_text_click.clear()
+            self._visual_text_focus.clear()
+            self._visual_search_submission.clear()
             self._dynamic_windows.clear()

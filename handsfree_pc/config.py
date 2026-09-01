@@ -90,11 +90,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "beam_size": 5,
             "initial_prompt": (
                 "语音控制命令可能包含 "
-                "Claude、Codex、Chrome、资源管理器、微信、"
+                "Claude、Codex、ChatGPT、Chrome、资源管理器、微信、"
                 "Chat and Cowork、Design 和 over。"
             ),
             "hotwords": (
-                "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat "
+                "Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat "
                 "Chat and Cowork Design over"
             ),
         },
@@ -107,11 +107,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "beam_size": 5,
             "initial_prompt": (
                 "语音控制命令可能包含 "
-                "Claude、Codex、Chrome、资源管理器、微信、"
+                "Claude、Codex、ChatGPT、Chrome、资源管理器、微信、"
                 "Chat and Cowork、Design 和 over。"
             ),
             "hotwords": (
-                "Claude Codex Chrome 资源管理器 文件资源管理器 微信 WeChat "
+                "Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat "
                 "Chat and Cowork Design over"
             ),
         },
@@ -149,6 +149,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allow_experimental_driver": False,
         "allow_coordinate_actions": False,
     },
+    "visual_ocr": {
+        "enabled": False,
+        "ocr_regions_enabled": False,
+        "endpoint": "http://127.0.0.1:8766/layout-parsing",
+        "allow_remote_screen_ocr": False,
+        "apps": ["codex", "wechat"],
+        "timeout_seconds": 60.0,
+        "max_image_bytes": 8388608,
+        "max_response_bytes": 2097152,
+        "max_items": 160,
+        "max_text_chars": 256,
+        "bbox_tolerance_pixels": 8,
+    },
     "workmap": {
         "enabled": False,
         "out_directory": None,
@@ -174,6 +187,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "process_names": ["ChatGPT.exe", "codex.exe"],
             "executable": None,
             "title_patterns": ["ChatGPT", "Codex"],
+            "activation_hotkey": None,
             "search_hotkey": None,
             "native_voice_hotkey": None,
             "voice_button_names": [],
@@ -209,6 +223,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "process_names": ["claude.exe"],
             "executable": None,
             "title_patterns": ["Claude"],
+            "activation_hotkey": None,
             "search_hotkey": None,
             "native_voice_hotkey": None,
             "voice_button_names": [],
@@ -249,6 +264,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "process_names": ["chrome.exe"],
             "executable": None,
             "title_patterns": ["Chrome"],
+            "activation_hotkey": None,
             "search_hotkey": None,
             "native_voice_hotkey": None,
             "voice_button_names": [],
@@ -263,6 +279,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "ComboBox",
                 "CheckBox",
                 "RadioButton",
+                "Hyperlink",
                 "Dialog",
                 "Window",
             ],
@@ -277,6 +294,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "process_names": ["explorer.exe"],
             "executable": None,
             "title_patterns": ["File Explorer", "资源管理器", "此电脑"],
+            "activation_hotkey": None,
             "search_hotkey": None,
             "native_voice_hotkey": None,
             "voice_button_names": [],
@@ -306,6 +324,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "process_names": ["Weixin.exe", "WeChat.exe"],
             "executable": None,
             "title_patterns": ["微信", "WeChat"],
+            "activation_hotkey": "ctrl+alt+w",
             "search_hotkey": None,
             "native_voice_hotkey": None,
             "voice_button_names": [],
@@ -396,6 +415,20 @@ def _optional_string_list(
     ):
         raise ValueError(f"{section}.{key} must be a YAML list of non-empty strings")
     return [item.strip() for item in value]
+
+
+def _optional_string(
+    mapping: dict[str, Any],
+    key: str,
+    *,
+    section: str,
+) -> str | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{section}.{key} must be a non-empty string or null")
+    return value.strip()
 
 
 def _optional_bool(
@@ -521,6 +554,21 @@ class WorkMapSettings:
 
 
 @dataclass(slots=True)
+class VisualOcrSettings:
+    enabled: bool
+    ocr_regions_enabled: bool
+    endpoint: str
+    allow_remote_screen_ocr: bool
+    apps: list[str]
+    timeout_seconds: float
+    max_image_bytes: int
+    max_response_bytes: int
+    max_items: int
+    max_text_chars: int
+    bbox_tolerance_pixels: int
+
+
+@dataclass(slots=True)
 class AppProfile:
     name: str
     process_names: list[str]
@@ -529,6 +577,7 @@ class AppProfile:
     search_hotkey: str | None
     native_voice_hotkey: str | None
     voice_button_names: list[str]
+    activation_hotkey: str | None = None
     mode_names: dict[str, list[str]] = field(default_factory=dict)
     # Empty observation fields retain the pre-profile driver behavior. This is
     # intentional so existing direct AppProfile(...) construction remains
@@ -550,6 +599,7 @@ class Settings:
     speech: SpeechSettings
     planner: PlannerSettings
     computer_control: ComputerControlSettings
+    visual_ocr: VisualOcrSettings
     execution: ExecutionSettings
     workmap: WorkMapSettings
     apps: dict[str, AppProfile] = field(default_factory=dict)
@@ -587,6 +637,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
     speech_raw = raw["speech"]
     planner_raw = raw["planner"]
     computer_control_raw = raw["computer_control"]
+    visual_ocr_raw = raw["visual_ocr"]
     workmap_raw = raw["workmap"]
     execution_raw = raw["execution"]
 
@@ -627,6 +678,17 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
         computer_control_raw,
         "allow_coordinate_actions",
         section="computer_control",
+    )
+    visual_ocr_enabled = _require_bool(visual_ocr_raw, "enabled", section="visual_ocr")
+    visual_ocr_regions_enabled = _require_bool(
+        visual_ocr_raw,
+        "ocr_regions_enabled",
+        section="visual_ocr",
+    )
+    allow_remote_screen_ocr = _require_bool(
+        visual_ocr_raw,
+        "allow_remote_screen_ocr",
+        section="visual_ocr",
     )
     execution_dry_run = _require_bool(execution_raw, "dry_run", section="execution")
     workmap_enabled = _require_bool(workmap_raw, "enabled", section="workmap")
@@ -700,6 +762,11 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             process_names=_require_string_list(value, "process_names", section=f"apps.{name}"),
             executable=_expand_path(str(executable), base_dir=base_dir) if executable else None,
             title_patterns=_require_string_list(value, "title_patterns", section=f"apps.{name}"),
+            activation_hotkey=_optional_string(
+                value,
+                "activation_hotkey",
+                section=f"apps.{name}",
+            ),
             search_hotkey=value.get("search_hotkey"),
             native_voice_hotkey=value.get("native_voice_hotkey"),
             voice_button_names=_require_string_list(
@@ -824,6 +891,19 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             allow_experimental_driver=allow_experimental_driver,
             allow_coordinate_actions=allow_coordinate_actions,
         ),
+        visual_ocr=VisualOcrSettings(
+            enabled=visual_ocr_enabled,
+            ocr_regions_enabled=visual_ocr_regions_enabled,
+            endpoint=str(visual_ocr_raw["endpoint"]),
+            allow_remote_screen_ocr=allow_remote_screen_ocr,
+            apps=_require_string_list(visual_ocr_raw, "apps", section="visual_ocr"),
+            timeout_seconds=float(visual_ocr_raw["timeout_seconds"]),
+            max_image_bytes=int(visual_ocr_raw["max_image_bytes"]),
+            max_response_bytes=int(visual_ocr_raw["max_response_bytes"]),
+            max_items=int(visual_ocr_raw["max_items"]),
+            max_text_chars=int(visual_ocr_raw["max_text_chars"]),
+            bbox_tolerance_pixels=int(visual_ocr_raw["bbox_tolerance_pixels"]),
+        ),
         execution=ExecutionSettings(
             dry_run=execution_dry_run,
             ambiguity_threshold=float(execution_raw["ambiguity_threshold"]),
@@ -847,6 +927,56 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
 
 
 def _validate(settings: Settings) -> None:
+    from .desktop.visual_ocr import validate_visual_ocr_endpoint
+
+    validate_visual_ocr_endpoint(
+        settings.visual_ocr.endpoint,
+        allow_remote_screen_ocr=settings.visual_ocr.allow_remote_screen_ocr,
+    )
+    if not settings.visual_ocr.apps or any(
+        not isinstance(item, str) or not item.strip() for item in settings.visual_ocr.apps
+    ):
+        raise ValueError("visual_ocr.apps must contain at least one non-empty app name")
+    if len(settings.visual_ocr.apps) != len(
+        {item.strip().casefold() for item in settings.visual_ocr.apps}
+    ):
+        raise ValueError("visual_ocr.apps must not contain duplicates")
+    if not 0.1 <= settings.visual_ocr.timeout_seconds <= 120:
+        raise ValueError("visual_ocr.timeout_seconds must be between 0.1 and 120")
+    if not 1024 <= settings.visual_ocr.max_image_bytes <= 32 * 1024 * 1024:
+        raise ValueError("visual_ocr.max_image_bytes must be between 1024 and 33554432")
+    if not 1024 <= settings.visual_ocr.max_response_bytes <= 16 * 1024 * 1024:
+        raise ValueError("visual_ocr.max_response_bytes must be between 1024 and 16777216")
+    if not 1 <= settings.visual_ocr.max_items <= 500:
+        raise ValueError("visual_ocr.max_items must be between 1 and 500")
+    if not 8 <= settings.visual_ocr.max_text_chars <= 512:
+        raise ValueError("visual_ocr.max_text_chars must be between 8 and 512")
+    if not 0 <= settings.visual_ocr.bbox_tolerance_pixels <= 32:
+        raise ValueError("visual_ocr.bbox_tolerance_pixels must be between 0 and 32")
+    unknown_visual_apps = {
+        item.strip().casefold() for item in settings.visual_ocr.apps
+    } - set(settings.apps)
+    if unknown_visual_apps:
+        raise ValueError("visual_ocr.apps must name configured apps")
+    if settings.visual_ocr.enabled:
+        if settings.computer_control.driver != "windows_uia":
+            raise ValueError("visual_ocr.enabled requires computer_control.driver=windows_uia")
+        if settings.computer_control.safety_profile != "local_unrestricted":
+            raise ValueError(
+                "visual_ocr.enabled requires computer_control.safety_profile=local_unrestricted"
+            )
+        if (
+            settings.computer_control.enabled
+            and settings.computer_control.planner_backend != "codex_cli_best_effort"
+        ):
+            raise ValueError(
+                "visual_ocr desktop planning requires planner_backend=codex_cli_best_effort "
+                "because the Claude CLI backend does not receive screenshots"
+            )
+    if settings.visual_ocr.ocr_regions_enabled and not settings.visual_ocr.enabled:
+        raise ValueError(
+            "visual_ocr.ocr_regions_enabled requires visual_ocr.enabled=true"
+        )
     if settings.workmap.enabled and settings.workmap.out_directory is None:
         raise ValueError("workmap.out_directory is required when workmap.enabled is true")
     phrase_groups = {

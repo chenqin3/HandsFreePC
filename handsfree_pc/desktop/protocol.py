@@ -35,6 +35,33 @@ class ElementPlane(StrEnum):
     DIALOG = "dialog"
 
 
+class DesktopElementAction(StrEnum):
+    """One locally bound operation positively supported by an observed element."""
+
+    CLICK = "click"
+    INVOKE = "invoke"
+    SELECT = "select"
+    TOGGLE = "toggle"
+    EXPAND = "expand"
+    COLLAPSE = "collapse"
+    SCROLL_INTO_VIEW = "scrollintoview"
+    SCROLL = "scroll"
+    TYPE_TEXT = "type_text"
+    PRESS_KEY = "press_key"
+
+
+class DesktopExpandCollapseState(StrEnum):
+    COLLAPSED = "collapsed"
+    EXPANDED = "expanded"
+    PARTIALLY_EXPANDED = "partially_expanded"
+    LEAF_NODE = "leaf_node"
+
+
+class DesktopScrollAxis(StrEnum):
+    HORIZONTAL = "horizontal"
+    VERTICAL = "vertical"
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedUiText:
     """A display-safe UIA string plus an exact local identity for the original.
@@ -264,6 +291,7 @@ class DesktopExpectationKind(StrEnum):
     ELEMENT_SELECTED = "element_selected"
     SEARCH_SUBMITTED = "search_submitted"
     LAST_ACTION_VERIFIED = "last_action_verified"
+    VISUAL_STATE_VERIFIED = "visual_state_verified"
 
 
 ALLOWED_DESKTOP_KEYS = frozenset(
@@ -367,10 +395,20 @@ class DesktopElement:
     # Positive, app-profile-aware composer classification. Focus or RuntimeId
     # alone is never enough to set this flag.
     composer: bool = False
+    # True only for a window-bound OCR element synthesized by the owned local
+    # driver after UIA exposed no useful control. It is never inferred from a
+    # control name and remains visible to both the planner and verifier.
+    visual_ocr: bool = False
     high_credential: bool = False
     low_credential: bool = False
     name_metadata: BoundedUiText | None = None
     value_metadata: BoundedUiText | None = None
+    # ``None`` means an older producer did not report capabilities.  A tuple,
+    # including an empty tuple, is a positive bounded UIA capability probe.
+    # Tuples keep planner-visible action metadata immutable after observation.
+    supported_actions: tuple[DesktopElementAction, ...] | None = None
+    expand_collapse_state: DesktopExpandCollapseState | None = None
+    scroll_axes: tuple[DesktopScrollAxis, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.index, str) or not self.index.isdecimal():
@@ -410,6 +448,8 @@ class DesktopElement:
             raise ValueError("desktop element secret_labeled must be a boolean")
         if not isinstance(self.composer, bool):
             raise ValueError("desktop element composer must be a boolean")
+        if not isinstance(self.visual_ocr, bool):
+            raise ValueError("desktop element visual_ocr must be a boolean")
         if not isinstance(self.high_credential, bool) or not isinstance(
             self.low_credential,
             bool,
@@ -425,6 +465,51 @@ class DesktopElement:
                 raise ValueError("desktop element value_metadata must be BoundedUiText")
             if self.value_metadata.display != self.value:
                 raise ValueError("desktop element value must match bounded value display")
+        if self.supported_actions is not None:
+            if not isinstance(self.supported_actions, tuple):
+                raise ValueError("desktop element supported_actions must be an immutable tuple")
+            try:
+                supported_actions = tuple(
+                    DesktopElementAction(item) for item in self.supported_actions
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "desktop element supported_actions contains an unknown action"
+                ) from exc
+            if len(supported_actions) > len(DesktopElementAction):
+                raise ValueError("desktop element supported_actions exceeds the bounded allow-list")
+            if len(supported_actions) != len(set(supported_actions)):
+                raise ValueError("desktop element supported_actions must be unique")
+            supported_actions = tuple(sorted(supported_actions, key=lambda item: item.value))
+            object.__setattr__(self, "supported_actions", supported_actions)
+        if self.expand_collapse_state is not None:
+            try:
+                expand_collapse_state = DesktopExpandCollapseState(
+                    self.expand_collapse_state
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("desktop element expand_collapse_state is invalid") from exc
+            object.__setattr__(self, "expand_collapse_state", expand_collapse_state)
+        if self.scroll_axes is not None:
+            if not isinstance(self.scroll_axes, tuple):
+                raise ValueError("desktop element scroll_axes must be an immutable tuple")
+            try:
+                scroll_axes = tuple(DesktopScrollAxis(item) for item in self.scroll_axes)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("desktop element scroll_axes contains an unknown axis") from exc
+            if len(scroll_axes) > len(DesktopScrollAxis):
+                raise ValueError("desktop element scroll_axes exceeds the bounded allow-list")
+            if len(scroll_axes) != len(set(scroll_axes)):
+                raise ValueError("desktop element scroll_axes must be unique")
+            scroll_axes = tuple(sorted(scroll_axes, key=lambda item: item.value))
+            object.__setattr__(self, "scroll_axes", scroll_axes)
+        if (
+            self.supported_actions is not None
+            and DesktopElementAction.SCROLL in self.supported_actions
+            and self.scroll_axes is not None
+            and not self.scroll_axes
+        ):
+            raise ValueError("scroll support requires at least one observed scroll axis")
         if self.plane == ElementPlane.INPUT and self.editable is False and not self.password:
             raise ValueError("non-editable desktop elements cannot use the input plane")
         if self.password and self.value:
@@ -451,6 +536,22 @@ class DesktopElement:
             "editable": self.editable,
             "addressable": self.addressable,
             "composer": self.composer,
+            "visual_ocr": self.visual_ocr,
+            "supported_actions": (
+                [item.value for item in self.supported_actions]
+                if self.supported_actions is not None
+                else None
+            ),
+            "expand_collapse_state": (
+                self.expand_collapse_state.value
+                if self.expand_collapse_state is not None
+                else None
+            ),
+            "scroll_axes": (
+                [item.value for item in self.scroll_axes]
+                if self.scroll_axes is not None
+                else None
+            ),
             # Credential classifications remain local. Labels have already
             # been redacted and values are never planner payload.
         }
@@ -473,8 +574,24 @@ class DesktopElement:
             "addressable": self.addressable,
             "secret_labeled": self.secret_labeled,
             "composer": self.composer,
+            "visual_ocr": self.visual_ocr,
             "high_credential": self.high_credential,
             "low_credential": self.low_credential,
+            "supported_actions": (
+                [item.value for item in self.supported_actions]
+                if self.supported_actions is not None
+                else None
+            ),
+            "expand_collapse_state": (
+                self.expand_collapse_state.value
+                if self.expand_collapse_state is not None
+                else None
+            ),
+            "scroll_axes": (
+                [item.value for item in self.scroll_axes]
+                if self.scroll_axes is not None
+                else None
+            ),
             "name_metadata": (
                 self.name_metadata.payload() if self.name_metadata is not None else None
             ),
@@ -676,6 +793,23 @@ class DesktopObservation:
         return payload
 
 
+def visual_state_binding_token(observation: DesktopObservation) -> str:
+    """Bind one visual-planner decision to one exact local window capture."""
+
+    if observation.screenshot_png is None or not observation.local_window_id:
+        raise ValueError("visual state requires a screenshot and exact local window identity")
+    digest = hashlib.sha256()
+    digest.update(b"HandsFreePC visual-state v1\0")
+    digest.update(observation.app.strip().casefold().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(observation.local_window_id.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(observation.generation).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(observation.screenshot_png)
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class DesktopAction:
     """One allow-listed desktop action tied to a fresh observation generation."""
@@ -864,6 +998,13 @@ class DesktopExpectation:
             DesktopExpectationKind.LAST_ACTION_VERIFIED,
         }:
             _validate_text(self.text or "", label="expectation text", maximum=500)
+        if (
+            self.kind == DesktopExpectationKind.VISUAL_STATE_VERIFIED
+            and not re.fullmatch(r"[0-9a-f]{64}", self.text or "")
+        ):
+            raise ValueError(
+                "visual-state expectation text must be a lowercase SHA-256 digest"
+            )
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> DesktopExpectation:
@@ -893,7 +1034,7 @@ class DesktopDecision:
                 raise ValueError("action decision requires a task-specific postcondition")
             if self.expectation.kind in {
                 DesktopExpectationKind.APP_VISIBLE,
-                DesktopExpectationKind.LAST_ACTION_VERIFIED,
+                DesktopExpectationKind.VISUAL_STATE_VERIFIED,
             }:
                 raise ValueError("action postcondition must describe a task-specific UI change")
         elif self.kind == DesktopDecisionKind.DONE:
@@ -954,6 +1095,7 @@ class ActionReceipt:
     accepted: bool
     before_generation: int
     driver_message: str = ""
+    after_local_window_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,8 +11,13 @@ from handsfree_pc.desktop.protocol import (
     DesktopDecision,
     DesktopDecisionKind,
     DesktopElement,
+    DesktopElementAction,
+    DesktopExpandCollapseState,
+    DesktopExpectation,
     DesktopExpectationKind,
     DesktopObservation,
+    DesktopScrollAxis,
+    visual_state_binding_token,
 )
 
 
@@ -33,6 +38,51 @@ def _observation(*, app: str = "claude", generation: int = 7) -> DesktopObservat
         accessibility_text="0 name=Chat control_type=TabItem",
         elements=(DesktopElement(index="0", name="Chat", control_type="TabItem"),),
     )
+
+
+def test_element_capabilities_are_immutable_bounded_and_planner_visible() -> None:
+    element = DesktopElement(
+        index="4",
+        name="Conversation list",
+        control_type="Pane",
+        supported_actions=("scroll", "collapse"),
+        expand_collapse_state="expanded",
+        scroll_axes=("vertical",),
+    )
+
+    assert element.supported_actions == (
+        DesktopElementAction.COLLAPSE,
+        DesktopElementAction.SCROLL,
+    )
+    assert element.expand_collapse_state == DesktopExpandCollapseState.EXPANDED
+    assert element.scroll_axes == (DesktopScrollAxis.VERTICAL,)
+    assert element.planner_payload()["supported_actions"] == ["collapse", "scroll"]
+    assert element.planner_payload()["expand_collapse_state"] == "expanded"
+    assert element.planner_payload()["scroll_axes"] == ["vertical"]
+    assert element.fingerprint_payload()["supported_actions"] == ["collapse", "scroll"]
+
+    with pytest.raises(ValueError, match="immutable tuple"):
+        DesktopElement(
+            index="4",
+            name="List",
+            control_type="Pane",
+            supported_actions=["scroll"],  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unknown action"):
+        DesktopElement(
+            index="4",
+            name="List",
+            control_type="Pane",
+            supported_actions=("execute_anything",),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unique"):
+        DesktopElement(
+            index="4",
+            name="List",
+            control_type="Pane",
+            supported_actions=("scroll", "scroll"),  # type: ignore[arg-type]
+            scroll_axes=("vertical",),
+        )
 
 
 def test_action_from_dict_binds_untrusted_payload_to_observation_identity():
@@ -119,6 +169,108 @@ def test_decision_from_dict_uses_current_generation_and_requires_one_atomic_shap
                 "app": "claude",
                 "action": {"type": "click", "element_index": "0"},
                 "expectation": None,
+            },
+            observation=observation,
+        )
+
+
+def test_action_decision_accepts_last_action_verified_for_a_reveal_bridge() -> None:
+    observation = _observation(generation=23)
+
+    decision = DesktopDecision.from_dict(
+        {
+            "kind": "action",
+            "reason": "Reveal more of the requested list",
+            "app": "claude",
+            "action": {
+                "type": "scroll",
+                "element_index": "0",
+                "direction": "down",
+                "pages": 1,
+            },
+            "expectation": {"kind": "last_action_verified", "text": None},
+        },
+        observation=observation,
+    )
+
+    assert decision.action is not None
+    assert decision.action.type == DesktopActionType.SCROLL
+    assert decision.expectation is not None
+    assert decision.expectation.kind == DesktopExpectationKind.LAST_ACTION_VERIFIED
+
+
+def test_visual_state_expectation_requires_an_exact_lowercase_digest() -> None:
+    digest = "a" * 64
+
+    expectation = DesktopExpectation(
+        DesktopExpectationKind.VISUAL_STATE_VERIFIED,
+        digest,
+    )
+
+    assert expectation.text == digest
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        DesktopExpectation(DesktopExpectationKind.VISUAL_STATE_VERIFIED, "not-a-digest")
+
+
+def test_visual_state_token_binds_app_window_generation_and_frame() -> None:
+    base = DesktopObservation(
+        app="wechat",
+        generation=1,
+        accessibility_text="visual",
+        screenshot_png=b"frame",
+        local_window_id="window-a",
+    )
+
+    token = visual_state_binding_token(base)
+
+    assert token != visual_state_binding_token(
+        DesktopObservation(
+            app="wechat",
+            generation=2,
+            accessibility_text="visual",
+            screenshot_png=b"frame",
+            local_window_id="window-a",
+        )
+    )
+    assert token != visual_state_binding_token(
+        DesktopObservation(
+            app="wechat",
+            generation=1,
+            accessibility_text="visual",
+            screenshot_png=b"frame",
+            local_window_id="window-b",
+        )
+    )
+    assert token != visual_state_binding_token(
+        DesktopObservation(
+            app="wechat",
+            generation=1,
+            accessibility_text="visual",
+            screenshot_png=b"changed",
+            local_window_id="window-a",
+        )
+    )
+
+
+def test_visual_state_expectation_is_completion_only() -> None:
+    observation = _observation(generation=24)
+
+    with pytest.raises(ValueError, match="task-specific UI change"):
+        DesktopDecision.from_dict(
+            {
+                "kind": "action",
+                "reason": "invalid self-attested action",
+                "app": "claude",
+                "action": {
+                    "type": "click",
+                    "element_index": "0",
+                    "click_count": 1,
+                    "mouse_button": "left",
+                },
+                "expectation": {
+                    "kind": "visual_state_verified",
+                    "text": "a" * 64,
+                },
             },
             observation=observation,
         )

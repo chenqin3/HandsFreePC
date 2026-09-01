@@ -15,6 +15,7 @@ from .protocol import (
     DesktopObservation,
     ElementPlane,
     element_plane,
+    visual_state_binding_token,
 )
 
 
@@ -188,13 +189,73 @@ class DesktopVerifier:
             return _result(False, "desktop driver receipt used a different generation", after)
         if action.generation != before.generation or not _same_app(action.app, before.app):
             return _result(False, "desktop action is not bound to its observation", after)
-        if failure := _fresh_observation_failure(before, after):
+        before_target = _element_by_index(before, action.element_index)
+        driver_related_window_transition = bool(
+            receipt.after_local_window_id
+            and before_target is not None
+            and before_target.addressable
+            and before_target.enabled
+            and action.type
+            in {
+                DesktopActionType.CLICK,
+                DesktopActionType.PERFORM_SECONDARY_ACTION,
+                DesktopActionType.PRESS_KEY,
+            }
+            and _same_app(before.app, after.app)
+            and after.generation > before.generation
+            and after.captured_at >= before.captured_at
+            and before.local_window_id
+            and after.local_window_id == receipt.after_local_window_id
+            and after.local_window_id != before.local_window_id
+        )
+        if (
+            not driver_related_window_transition
+            and (failure := _fresh_observation_failure(before, after))
+        ):
             return _result(False, failure, after)
-        if before.fingerprint == after.fingerprint:
+        visual_screenshot_transition = bool(
+            before_target is not None
+            and before_target.visual_ocr
+            and before_target.control_type == "VisualViewport"
+            and action.type
+            in {
+                DesktopActionType.CLICK,
+                DesktopActionType.SCROLL,
+                DesktopActionType.TYPE_TEXT,
+                DesktopActionType.PRESS_KEY,
+            }
+            and before.screenshot_png is not None
+            and after.screenshot_png is not None
+            and before.screenshot_png != after.screenshot_png
+        )
+        if before.fingerprint == after.fingerprint and not visual_screenshot_transition:
             return _result(False, "no observable application change followed the action", after)
 
+        if (
+            action.type
+            in {
+                DesktopActionType.TYPE_TEXT,
+                DesktopActionType.PRESS_KEY,
+            }
+            and before_target is not None
+            and before_target.visual_ocr
+            and before_target.control_type == "VisualViewport"
+        ):
+            if action.type == DesktopActionType.PRESS_KEY:
+                return _result(
+                    True,
+                    "fresh screenshot changed after one native-focus-bound visual search "
+                    "submission; the planner must inspect the resulting exact window",
+                    after,
+                )
+            return _result(
+                True,
+                "fresh screenshot changed after one native-focus-bound visual text injection; "
+                "the planner must inspect the new frame before claiming the requested state",
+                after,
+            )
+
         if action.type in {DesktopActionType.TYPE_TEXT, DesktopActionType.SET_VALUE}:
-            before_target = _element_by_index(before, action.element_index)
             after_target = _matching_element_after(before_target, after)
             if before_target is None or after_target is None:
                 return _result(
@@ -325,6 +386,37 @@ class DesktopVerifier:
                     observation,
                 )
             return _result(True, "the last action has matching local verification", observation)
+
+        if expectation.kind == DesktopExpectationKind.VISUAL_STATE_VERIFIED:
+            viewports = tuple(
+                element
+                for element in observation.elements
+                if element.visual_ocr and element.control_type == "VisualViewport"
+            )
+            if (
+                observation.screenshot_png is None
+                or not observation.local_window_id
+                or len(viewports) != 1
+                or not viewports[0].enabled
+                or not viewports[0].addressable
+            ):
+                return _result(
+                    False,
+                    "the visual completion condition has no unique bound viewport",
+                    observation,
+                )
+            if visual_state_binding_token(observation) != expectation.text:
+                return _result(
+                    False,
+                    "the visual completion token no longer matches its exact window frame",
+                    observation,
+                )
+            return _result(
+                True,
+                "the planner completion is bound to the exact current screenshot",
+                observation,
+                expectation=expectation,
+            )
 
         if expectation.kind == DesktopExpectationKind.SEARCH_SUBMITTED:
             if (
