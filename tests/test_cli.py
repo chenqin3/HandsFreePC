@@ -493,6 +493,7 @@ def test_run_prints_diagnostic_and_transcript_locations(
             pass
 
     monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+    monkeypatch.setattr(cli, "_acquire_single_instance_lock", lambda: tmp_path / "run.lock")
     monkeypatch.setattr(cli, "load_settings", lambda _config: settings)
     monkeypatch.setattr(cli, "_build_executor", lambda _settings: object())
     monkeypatch.setattr(cli, "default_transcript_path", lambda: transcript_path)
@@ -509,7 +510,7 @@ def test_run_prints_diagnostic_and_transcript_locations(
     }
 
 
-def test_run_records_runtime_lifecycle_without_transcript_content(monkeypatch) -> None:
+def test_run_records_runtime_lifecycle_without_transcript_content(monkeypatch, tmp_path) -> None:
     events: list[dict[str, object]] = []
 
     class FakeDiagnostics:
@@ -530,6 +531,7 @@ def test_run_records_runtime_lifecycle_without_transcript_content(monkeypatch) -
             self.stopped = True
 
     monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+    monkeypatch.setattr(cli, "_acquire_single_instance_lock", lambda: tmp_path / "run.lock")
     monkeypatch.setattr(cli, "load_settings", lambda _config: object())
     monkeypatch.setattr(cli, "_build_executor", lambda _settings: object())
     monkeypatch.setattr("handsfree_pc.runtime.VoiceRuntime", FakeRuntime)
@@ -539,7 +541,7 @@ def test_run_records_runtime_lifecycle_without_transcript_content(monkeypatch) -
     assert all("prompt" not in event and "uia_text" not in event for event in events)
 
 
-def test_run_records_initialization_failure_by_exception_type_only(monkeypatch) -> None:
+def test_run_records_initialization_failure_by_exception_type_only(monkeypatch, tmp_path) -> None:
     events: list[dict[str, object]] = []
 
     class FakeDiagnostics:
@@ -547,6 +549,7 @@ def test_run_records_initialization_failure_by_exception_type_only(monkeypatch) 
             events.append(kwargs)
 
     monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+    monkeypatch.setattr(cli, "_acquire_single_instance_lock", lambda: tmp_path / "run.lock")
     monkeypatch.setattr(
         cli,
         "load_settings",

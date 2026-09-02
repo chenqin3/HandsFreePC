@@ -19,6 +19,7 @@ from .config import Settings
 from .diagnostics import classify_control_failure, stage_display_name
 from .feedback import FeedbackController
 from .intents import DeterministicIntentParser
+from .mic_guard import MicrophoneGuard
 from .models import (
     Action,
     ActionType,
@@ -160,6 +161,12 @@ class VoiceRuntime:
         self.feedback = feedback or FeedbackController(settings.app.feedback_mode)
         self.safety = SafetyPolicy(settings.execution)
         self.state = RuntimeState.ARMED
+        self._microphone_guard_paused = False
+        self._microphone_guard = MicrophoneGuard(
+            enabled=settings.app.auto_pause_when_microphone_busy,
+            poll_seconds=settings.app.microphone_guard_poll_seconds,
+            ignore=settings.app.microphone_guard_ignore,
+        )
         self._plan_confirmation_lock = threading.RLock()
         self._plan_confirmation_epoch = 0
         self._pending_plan: Plan | None = None
@@ -314,6 +321,9 @@ class VoiceRuntime:
     ) -> bool:
         # Overlay feedback is immediate. Spoken feedback is deferred until the microphone thread
         # reaches an utterance boundary, so SAPI can never start halfway through user speech.
+        if self._microphone_guard_paused:
+            # Someone is in a meeting or a call: never talk over it.
+            allow_voice = False
         displayed = self.feedback.emit(
             text,
             kind=kind,
@@ -1747,6 +1757,72 @@ class VoiceRuntime:
             "feedback_mode": self.feedback.mode.value,
         }
 
+    def _microphone_guard_interrupt(self) -> bool:
+        """Abort the current listen as soon as another app starts capturing."""
+
+        guard = self._microphone_guard
+        if guard is None or not guard.enabled or self._microphone_guard_paused:
+            return False
+        return guard.busy_app() is not None
+
+    def _guard_microphone(self, speech: Any) -> bool:
+        """Release the microphone while another app captures; return True while paused.
+
+        Meeting and call apps show up in Windows' microphone consent store the
+        moment they start capturing. Listening stops (no transcription, no
+        spoken feedback) until they release the device, then resumes on its own.
+        """
+
+        guard = self._microphone_guard
+        if not hasattr(speech, "pause_microphone"):
+            return False
+        if guard is None or not guard.enabled:
+            return False
+        busy = guard.busy_app()
+        if busy is None:
+            if self._microphone_guard_paused:
+                try:
+                    speech.resume_microphone()
+                except Exception as exc:
+                    self._record_diagnostic(
+                        stage="runtime",
+                        error_code="MICROPHONE_GUARD_RESUME_FAILED",
+                        safe_message=f"Microphone could not be reopened: {type(exc).__name__}",
+                        level="error",
+                    )
+                    self.stop_event.wait(guard.poll_seconds)
+                    return True
+                self._microphone_guard_paused = False
+                self._record_diagnostic(
+                    stage="runtime",
+                    error_code="MICROPHONE_GUARD_RESUMED",
+                    safe_message="Another app released the microphone; listening resumed",
+                    level="info",
+                )
+                self._emit_continuous("麦克风已空闲，恢复监听。", kind="armed", duration=4)
+            return False
+        if not self._microphone_guard_paused:
+            self._microphone_guard_paused = True
+            if self.session_state == SessionState.ACTIVE:
+                with suppress(Exception):
+                    self._set_session_state(SessionState.ARMED)
+            with suppress(Exception):
+                speech.pause_microphone()
+            self._record_diagnostic(
+                stage="runtime",
+                error_code="MICROPHONE_GUARD_PAUSED",
+                safe_message="Another app is using the microphone; listening paused",
+                level="info",
+            )
+            self._emit_continuous(
+                f"检测到 {busy} 正在使用麦克风，已暂停监听，结束后自动恢复。",
+                kind="armed",
+                duration=0,
+                allow_voice=False,
+            )
+        self.stop_event.wait(guard.poll_seconds)
+        return True
+
     def _run_continuous_microphone(self) -> None:
         phrases = [
             *self.settings.app.wake_phrases,
@@ -1776,6 +1852,9 @@ class VoiceRuntime:
             phrases=phrases,
             marker_phrases=self.settings.app.prompt_delimiters,
         ) as speech:
+            source = getattr(speech, "source", None)
+            if source is not None:
+                source.interrupt_check = self._microphone_guard_interrupt
             self._record_diagnostic(
                 stage="runtime",
                 error_code="MICROPHONE_READY",
@@ -1789,6 +1868,8 @@ class VoiceRuntime:
             )
             while not self.stop_event.is_set():
                 try:
+                    if self._guard_microphone(speech):
+                        continue
                     if self._voice_feedback_event.is_set():
                         self._flush_voice_feedback(speech)
                         if self.stop_event.is_set():
@@ -1932,8 +2013,13 @@ class VoiceRuntime:
         base_dir = self.settings.config_path.parent
         self.feedback.emit("HandsFreePC 已就绪", kind="armed", duration=2)
         with LocalSpeechSession(self.settings.speech, base_dir=base_dir, phrases=phrases) as speech:
+            source = getattr(speech, "source", None)
+            if source is not None:
+                source.interrupt_check = self._microphone_guard_interrupt
             while not self.stop_event.is_set():
                 try:
+                    if self._guard_microphone(speech):
+                        continue
                     if self.feedback.speaker.speaking.wait(timeout=0.05):
                         while self.feedback.speaker.speaking.is_set():
                             time.sleep(0.05)

@@ -110,6 +110,10 @@ def has_transcribable_energy(
 class MicrophoneSource:
     """A bounded, in-memory microphone stream. It never writes audio to disk."""
 
+    # Optional hook consulted on every block read; returning True aborts the
+    # current listen so the runtime can act (e.g. release the mic for a meeting).
+    interrupt_check: Any = None
+
     def __init__(
         self,
         *,
@@ -169,6 +173,9 @@ class MicrophoneSource:
             self._stream = None
 
     def read(self, timeout: float = 1.0) -> Any:
+        check = self.interrupt_check
+        if check is not None and check():
+            raise AudioError("No complete utterance detected: microphone guard interrupt")
         try:
             return self._queue.get(timeout=timeout)
         except queue.Empty as exc:
@@ -790,7 +797,29 @@ class LocalSpeechSession:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if getattr(self, "_microphone_paused", False):
+            return
         self.source.__exit__(exc_type, exc, traceback)
+
+    def pause_microphone(self) -> None:
+        """Release the capture device but keep every loaded model in memory."""
+
+        if getattr(self, "_microphone_paused", False):
+            return
+        self.source.__exit__(None, None, None)
+        self._microphone_paused = True
+
+    def resume_microphone(self) -> None:
+        """Re-open the capture device after ``pause_microphone``."""
+
+        if not getattr(self, "_microphone_paused", False):
+            return
+        self.source.__enter__()
+        self._microphone_paused = False
+
+    @property
+    def microphone_paused(self) -> bool:
+        return bool(getattr(self, "_microphone_paused", False))
 
     def wait_for_phrase(
         self,

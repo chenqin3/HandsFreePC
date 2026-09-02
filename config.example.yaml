@@ -15,6 +15,11 @@ app:
     - "电脑"
   awake_timeout_seconds: 0
   feedback_mode: overlay
+  # Release the microphone while another app (a meeting, a call) is capturing
+  # and resume automatically when it stops; names/paths here never count.
+  auto_pause_when_microphone_busy: true
+  microphone_guard_poll_seconds: 3.0
+  microphone_guard_ignore: []
 
 privacy:
   save_audio: false

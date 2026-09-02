@@ -767,9 +767,66 @@ def command_diagnose_last(args: argparse.Namespace) -> int:
     return 0
 
 
+def _acquire_single_instance_lock() -> Path | None:
+    """Refuse to start a second listener; two runtimes would fight for the microphone.
+
+    Returns the lock path when acquired, or None when another live runtime
+    already holds it. A stale lock (its process is gone) is taken over.
+    """
+
+    lock_path = default_log_path().resolve().parent / "run.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            try:
+                other_pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+            except ValueError:
+                other_pid = 0
+            if other_pid and other_pid != os.getpid():
+                try:
+                    import psutil
+
+                    alive = psutil.pid_exists(other_pid)
+                except Exception:
+                    alive = False
+                if alive:
+                    return None
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        return lock_path
+    return lock_path
+
+
+def _attach_console_log_when_headless() -> None:
+    """Under pythonw there is no console: send stdout/stderr to logs\\run.log."""
+
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        log_path = default_log_path().resolve().parent / "run.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stream = open(log_path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
+    except OSError:
+        stream = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
 def command_run(args: argparse.Namespace) -> int:
     from .runtime import VoiceRuntime
 
+    _attach_console_log_when_headless()
+    lock_path = _acquire_single_instance_lock()
+    if lock_path is None:
+        _json(
+            {
+                "error": "HandsFreePC is already running in this session",
+                "hint": "stop the other listener first (it holds the microphone)",
+            }
+        )
+        return 3
     diagnostics = configure_diagnostics()
     runtime: VoiceRuntime | None = None
     transcript_journal: TranscriptJournal | None = None

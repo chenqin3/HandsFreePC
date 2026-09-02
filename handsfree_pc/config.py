@@ -26,6 +26,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "control_prefixes": ["电脑"],
         "awake_timeout_seconds": 0,
         "feedback_mode": "overlay",
+        # Release the microphone while another app (a meeting, a call) is
+        # capturing, and resume automatically when it stops.
+        "auto_pause_when_microphone_busy": True,
+        "microphone_guard_poll_seconds": 3.0,
+        # Executable names or full paths that never count as a meeting.
+        "microphone_guard_ignore": [],
     },
     "privacy": {
         "save_audio": False,
@@ -489,6 +495,9 @@ class AppSettings:
     control_prefixes: list[str]
     awake_timeout_seconds: float
     feedback_mode: FeedbackMode
+    auto_pause_when_microphone_busy: bool = True
+    microphone_guard_poll_seconds: float = 3.0
+    microphone_guard_ignore: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -908,6 +917,15 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             control_prefixes=control_prefixes,
             awake_timeout_seconds=float(app_raw["awake_timeout_seconds"]),
             feedback_mode=FeedbackMode(app_raw["feedback_mode"]),
+            auto_pause_when_microphone_busy=bool(
+                app_raw.get("auto_pause_when_microphone_busy", True)
+            ),
+            microphone_guard_poll_seconds=float(
+                app_raw.get("microphone_guard_poll_seconds", 3.0)
+            ),
+            microphone_guard_ignore=[
+                str(item) for item in (app_raw.get("microphone_guard_ignore") or [])
+            ],
         ),
         privacy=PrivacySettings(**privacy_values),
         diagnostics=DiagnosticsSettings(**diagnostics_values),

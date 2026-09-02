@@ -282,6 +282,18 @@ workmap:
 
 可以说“切换到屏幕反馈”“切换到语音反馈”“大字和语音两种都开”或“切换到静默模式”。SAPI 播放期间采用半双工处理，播报结束前说的话可能被丢弃，且语音急停不能打断正在播放的 SAPI；需要连续快速输入时优先用 `overlay`。
 
+## 开机自启与麦克风避让
+
+想让它随 Windows 登录自动开始监听：
+
+```powershell
+pwsh scripts/install_autostart.ps1 -StartNow
+```
+
+这会注册一个用户登录触发的计划任务 `HandsFreePC`（延迟 20 s，运行在交互桌面会话里，退出后自动重启），任务动作是 `.venv\Scripts\pythonw.exe -m handsfree_pc.cli --config config.local.yaml run`，没有控制台窗口，stdout/stderr 追加到 `%LOCALAPPDATA%\HandsFreePC\logsun.log`。用 `-Config` 指定别的配置文件。`Stop-ScheduledTask HandsFreePC` / `Start-ScheduledTask HandsFreePC` 可随时停止和重新开始；`pwsh scripts/uninstall_autostart.ps1` 注销任务并结束监听进程。`run` 带单实例锁（`logsun.lock`），第二个实例会直接退出，所以手动再开一个也不会抢麦克风。
+
+监听常开时，一旦别的程序（Zoom、Teams、腾讯会议、微信通话、浏览器里的会议……）开始采集麦克风，运行时会在约 3 秒内释放麦克风并暂停转写和语音播报，屏幕上显示"检测到 X 正在使用麦克风，已暂停监听"；对方释放后 3 秒内自动恢复。它靠读取 Windows 自己的麦克风使用记录（`CapabilityAccessManager\ConsentStore\microphone` 注册表，`LastUsedTimeStop == 0` 即正在采集）判断，不会去探测或占用别的设备。相关配置在 `app` 段：`auto_pause_when_microphone_busy`（默认 `true`）、`microphone_guard_poll_seconds`（默认 `3`）、`microphone_guard_ignore`（不算作抢占的程序名或完整路径列表，例如 `["obs64.exe"]`）。程序自身的解释器始终不算抢占。
+
 ## 本地诊断日志
 
 运行时会写入有界轮转的 JSONL 诊断事件。任务失败后先看最近事件，再看最近一次失败：
