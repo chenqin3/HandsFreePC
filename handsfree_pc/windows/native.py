@@ -4,11 +4,18 @@ import ctypes
 import hashlib
 import os
 import re
+import struct
 import time
 from collections.abc import Callable, Iterable, Sequence
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
+
+from .text import sanitize_windows_ui_text
+
+CF_HDROP = 15
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
 
 
 class NativeWindowsError(RuntimeError):
@@ -57,6 +64,7 @@ class WindowInfo:
     title: str
     process_id: int
     process_name: str | None = None
+    class_name: str | None = None
 
     def to_evidence(self) -> dict[str, object]:
         return {
@@ -64,6 +72,7 @@ class WindowInfo:
             "title": self.title,
             "process_id": self.process_id,
             "process_name": self.process_name,
+            "class_name": self.class_name,
         }
 
 
@@ -323,6 +332,8 @@ def _configure_user32(user32: object) -> None:
     user32.GetWindowTextLengthW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
     user32.GetWindowThreadProcessId.argtypes = [
         wintypes.HWND,
         ctypes.POINTER(wintypes.DWORD),
@@ -445,9 +456,15 @@ class NativeWindows:
                 return True
             buffer = ctypes.create_unicode_buffer(length + 1)
             self.user32.GetWindowTextW(hwnd, buffer, len(buffer))
-            title = buffer.value.strip()
+            title = sanitize_windows_ui_text(buffer.value).strip()
             if not title:
                 return True
+            class_name: str | None = None
+            get_class_name = getattr(self.user32, "GetClassNameW", None)
+            if callable(get_class_name):
+                class_buffer = ctypes.create_unicode_buffer(256)
+                if int(get_class_name(hwnd, class_buffer, len(class_buffer))) > 0:
+                    class_name = sanitize_windows_ui_text(class_buffer.value).strip() or None
             process_id = wintypes.DWORD()
             self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
             pid = int(process_id.value)
@@ -457,6 +474,7 @@ class NativeWindows:
                     title=title,
                     process_id=pid,
                     process_name=self._process_name_resolver(pid),
+                    class_name=class_name,
                 )
             )
             return True
@@ -890,6 +908,12 @@ class NativeWindows:
         if opener is not None:
             opener(target)
             return "os.startfile"
+        return self.shell_execute_path(target)
+
+    def shell_execute_path(self, path: str | Path) -> str:
+        """Open one trusted path directly with ``ShellExecuteW``."""
+
+        target = str(path)
         if self.shell32 is None:
             raise NativeWindowsError("No Windows path opener is available")
         result = int(self.shell32.ShellExecuteW(None, "open", target, None, None, SW_SHOWNORMAL))
@@ -1039,6 +1063,108 @@ class NativeWindows:
         )
         self._send_inputs(inputs)
         return keys
+
+
+    def copy_files_to_clipboard(self, paths: Sequence[str | Path]) -> int:
+        """Place existing local files on the clipboard as a CF_HDROP file list.
+
+        This is how a file reaches a chat app that has no automation surface
+        for attachments: the app's own paste handler (Ctrl+V) receives exactly
+        what Explorer's "Copy" would have produced.
+        """
+
+        targets = [str(Path(item).resolve(strict=True)) for item in paths]
+        if not targets:
+            raise ValueError("at least one file is required")
+        # DROPFILES: pFiles offset (20), POINT pt, BOOL fNC, BOOL fWide.
+        encoded = ("\0".join(targets) + "\0\0").encode("utf-16-le")
+        self._publish_clipboard(CF_HDROP, struct.pack("<IiiII", 20, 0, 0, 0, 1) + encoded)
+        return len(targets)
+
+    def _configure_clipboard(self) -> tuple[object, object]:
+        if self.user32 is None or self.kernel32 is None:
+            raise NativeWindowsError("The clipboard is unavailable outside Windows")
+        user32 = self.user32
+        kernel32 = self.kernel32
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.argtypes = []
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+        user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+        return user32, kernel32
+
+    def _open_clipboard(self, user32: object) -> bool:
+        for _attempt in range(10):
+            if user32.OpenClipboard(None):
+                return True
+            self._sleep(0.05)
+        return False
+
+    def _publish_clipboard(self, clipboard_format: int, payload: bytes) -> None:
+        user32, kernel32 = self._configure_clipboard()
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
+        if not handle:
+            raise NativeWindowsError("GlobalAlloc failed for the clipboard payload")
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            kernel32.GlobalFree(handle)
+            raise NativeWindowsError("GlobalLock failed for the clipboard payload")
+        ctypes.memmove(pointer, payload, len(payload))
+        kernel32.GlobalUnlock(handle)
+        if not self._open_clipboard(user32):
+            kernel32.GlobalFree(handle)
+            raise NativeWindowsError("The clipboard is held by another application")
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(clipboard_format, handle):
+                kernel32.GlobalFree(handle)
+                raise NativeWindowsError("SetClipboardData rejected the payload")
+        finally:
+            user32.CloseClipboard()
+
+    def read_clipboard_text(self) -> str | None:
+        """Return the clipboard's Unicode text, or None when it holds no text."""
+
+        user32, kernel32 = self._configure_clipboard()
+        if not self._open_clipboard(user32):
+            return None
+        try:
+            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                return None
+            handle = user32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                return None
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                return None
+            try:
+                return ctypes.wstring_at(pointer)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+
+    def set_clipboard_text(self, text: str) -> None:
+        """Put plain Unicode text back on the clipboard (used to restore it)."""
+
+        if not isinstance(text, str):
+            raise TypeError("clipboard text must be a string")
+        self._publish_clipboard(CF_UNICODETEXT, (text + "\0").encode("utf-16-le"))
 
 
 # A descriptive alias for callers that prefer a backend-oriented name.

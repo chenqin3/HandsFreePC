@@ -14,6 +14,7 @@ from .native import (
     WindowNotFoundError,
     parse_hotkey,
 )
+from .text import sanitize_windows_ui_text
 from .uia import (
     UIA,
     AmbiguousElementError,
@@ -49,4 +50,5 @@ __all__ = [
     "WindowsExecutionError",
     "WindowsExecutor",
     "parse_hotkey",
+    "sanitize_windows_ui_text",
 ]

@@ -536,7 +536,8 @@ class CommandWorker:
                     and not outcome.cancelled
                     and (
                         self._failure_policy == "pause"
-                        or outcome.error_type == "NeedsConfirmation"
+                        or outcome.error_type in {"NeedsConfirmation", "HardBlock"}
+                        or outcome.error_code == "ASSISTIVE_HARD_BLOCK"
                     )
                 )
                 with self._condition:

@@ -110,6 +110,7 @@ def command_parse(args: argparse.Namespace) -> int:
 
 def command_simulate(args: argparse.Namespace) -> int:
     from .runtime import VoiceRuntime
+    from .scenarios import inject_runtime_text
 
     settings = load_settings(args.config, allow_missing=True)
     settings.execution.dry_run = True
@@ -126,7 +127,11 @@ def command_simulate(args: argparse.Namespace) -> int:
         if args.independent:
             runtime.state = RuntimeState.ARMED
             runtime.pending_plan = None
-        outcome = runtime.handle_text(command, require_wake=args.require_wake)
+        outcome = inject_runtime_text(
+            runtime,
+            command,
+            require_wake=args.require_wake,
+        )
         outcomes.append(
             {
                 "input": command,
@@ -140,6 +145,89 @@ def command_simulate(args: argparse.Namespace) -> int:
     _json(outcomes)
     runtime.stop()
     return 0 if outcomes and all(item["success"] for item in outcomes) else 2
+
+
+def command_scenarios(args: argparse.Namespace) -> int:
+    """Run the live suite through VoiceRuntime's text ingress and controller."""
+
+    from .scenarios import (
+        live_configuration_blocker,
+        run_scenarios,
+        scenario_catalog,
+        unavailable_report,
+        write_report,
+    )
+
+    selected = getattr(args, "scenario", None)
+    repeat = int(getattr(args, "repeat", 1))
+    report_path = getattr(args, "report", None)
+    if getattr(args, "list", False):
+        _json({"scenarios": scenario_catalog(), "max_repeat": 20})
+        return 0
+
+    try:
+        settings = load_settings(args.config, allow_missing=False)
+    except Exception as exc:
+        report = unavailable_report(
+            scenario_names=selected,
+            repeat=repeat,
+            reason=f"configuration could not be loaded: {type(exc).__name__}",
+            failure_stage="configuration",
+        )
+        write_report(report, report_path)
+        _json(report)
+        return 2
+
+    blocker = live_configuration_blocker(settings)
+    if blocker is not None:
+        report = unavailable_report(
+            scenario_names=selected,
+            repeat=repeat,
+            reason=blocker,
+        )
+        report["engine"] = settings.computer_control.engine
+        write_report(report, report_path)
+        _json(report)
+        return 2
+
+    controller = None
+    try:
+        try:
+            from .desktop.factory import build_computer_controller
+
+            controller = build_computer_controller(settings, _build_executor(settings))
+        except Exception as exc:
+            report = unavailable_report(
+                scenario_names=selected,
+                repeat=repeat,
+                reason=f"controller could not be built: {type(exc).__name__}",
+                failure_stage="controller_build",
+            )
+            report["engine"] = settings.computer_control.engine
+        else:
+            native = None
+            try:
+                from .windows.native import NativeWindows
+
+                native = NativeWindows()
+            except (OSError, RuntimeError):
+                # Scenarios without a Win32 precondition may still execute.
+                # Any scenario needing this observer reports itself skipped.
+                native = None
+            report = run_scenarios(
+                settings,
+                controller,
+                scenario_names=selected,
+                repeat=repeat,
+                native=native,
+            )
+    finally:
+        if controller is not None:
+            controller.close()
+
+    write_report(report, report_path)
+    _json(report)
+    return 0 if report["all_success"] else 2
 
 
 def _check_command(
@@ -780,6 +868,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reset runtime state before every input command",
     )
     simulate.set_defaults(func=command_simulate)
+
+    from .scenarios import SCENARIOS
+
+    scenarios = subparsers.add_parser(
+        "scenarios",
+        help="Run opt-in live assistive acceptance scenarios and emit a JSON report",
+    )
+    scenarios.add_argument(
+        "--scenario",
+        action="append",
+        choices=[item.scenario for item in SCENARIOS],
+        help="Run only this scenario; repeat the option to select more than one",
+    )
+    scenarios.add_argument(
+        "--repeat",
+        type=int,
+        choices=range(1, 21),
+        default=1,
+        metavar="N",
+        help="Run each selected scenario N times (1-20; use 20 for the 95%% gate)",
+    )
+    scenarios.add_argument(
+        "--report",
+        help="Also write the exact JSON report to this local path",
+    )
+    scenarios.add_argument(
+        "--list",
+        action="store_true",
+        help="List scenario commands, thresholds, and required preconditions without running",
+    )
+    scenarios.set_defaults(func=command_scenarios)
 
     doctor = subparsers.add_parser("doctor", help="Check configuration and dependencies")
     doctor.add_argument(

@@ -30,6 +30,12 @@ def test_factory_defaults_to_owned_local_agent_stack(tmp_path):
     assert controller.driver._discover_all_windows is False
     assert controller.driver._activate_on_observe is False
     assert controller.driver._capture_screenshots is False
+    assert controller.driver._strict_visual_postcondition is True
+    assert controller.driver._same_window_browser_navigation_fast_path is False
+    assert controller.planner.timeout_seconds == min(
+        settings.computer_control.timeout_seconds,
+        settings.planner.timeout_seconds,
+    )
 
 
 def test_factory_can_choose_claude_as_step_planner(tmp_path):
@@ -40,6 +46,20 @@ def test_factory_can_choose_claude_as_step_planner(tmp_path):
 
     assert isinstance(controller, DesktopAgentLoopController)
     assert isinstance(controller.planner, ClaudeDesktopStepPlanner)
+
+
+def test_factory_proof_planner_keeps_legacy_min_timeout_and_passes_model(tmp_path):
+    settings = _settings(tmp_path)
+    settings.computer_control.planner_step_timeout_seconds = 73
+    settings.computer_control.timeout_seconds = 900
+    settings.planner.timeout_seconds = 1
+    settings.computer_control.model = "haiku"
+
+    controller = build_computer_controller(settings, FakeExecutor())
+
+    assert isinstance(controller.planner, ClaudeDesktopStepPlanner)
+    assert controller.planner.timeout_seconds == 1
+    assert controller.planner.model == "haiku"
 
 
 def test_factory_passes_configured_control_prefixes_to_continuous_dictation(tmp_path):
@@ -71,6 +91,36 @@ def test_factory_enables_dynamic_visual_driver_only_for_local_unrestricted(tmp_p
     assert controller.driver._discover_all_windows is True
     assert controller.driver._activate_on_observe is True
     assert controller.driver._capture_screenshots is True
+
+
+def test_factory_routes_assistive_engine_with_passive_observation(tmp_path):
+    settings = _settings(tmp_path)
+    settings.computer_control.engine = "assistive_v1"
+    settings.computer_control.safety_profile = "local_unrestricted"
+    settings.computer_control.send_policy = {
+        "claude": "auto",
+        "codex": "auto",
+        "wechat": "confirm",
+    }
+    settings.computer_control.planner_step_timeout_seconds = 41
+    settings.computer_control.timeout_seconds = 900
+    settings.planner.timeout_seconds = 1
+
+    controller = build_computer_controller(settings, FakeExecutor())
+
+    from handsfree_pc.desktop.assistive.controller import AssistiveController
+
+    assert isinstance(controller, AssistiveController)
+    assert isinstance(controller.driver, WindowsUiaDriver)
+    assert controller.driver._discover_all_windows is True
+    assert controller.driver._activate_on_observe is False
+    assert controller.driver._capture_screenshots is False
+    assert controller.driver._strict_visual_postcondition is False
+    assert controller.driver._activate_before_execute is False
+    assert controller.driver._same_window_browser_navigation_fast_path is True
+    assert controller.driver._visual_screenshot_enabled is False
+    assert controller.planner.timeout_seconds == 41
+    assert controller.send_policy == settings.computer_control.send_policy
 
 
 def test_factory_wires_screenshot_visual_planning_without_requiring_ocr(tmp_path):
@@ -170,7 +220,30 @@ def test_factory_can_reuse_claude_backend_for_bounded_workmap_selection(tmp_path
     settings.privacy.allow_cloud_planner = True
     settings.workmap.enabled = True
     settings.workmap.out_directory = tmp_path / "workmap-out"
+    settings.planner.timeout_seconds = 1
+    settings.computer_control.planner_step_timeout_seconds = 41
 
     controller = build_computer_controller(settings, FakeExecutor())
 
     assert isinstance(controller.native_router.workmap_selector, ClaudeWorkMapSelector)
+    assert controller.native_router.workmap_selector.timeout_seconds == 1
+
+
+def test_factory_assistive_planner_and_workmap_use_dedicated_step_timeout(tmp_path):
+    settings = _settings(tmp_path)
+    settings.computer_control.engine = "assistive_v1"
+    settings.computer_control.enabled = True
+    settings.computer_control.planner_backend = "claude"
+    settings.computer_control.allow_screen_context_to_cloud = True
+    settings.privacy.allow_cloud_planner = True
+    settings.workmap.enabled = True
+    settings.workmap.out_directory = tmp_path / "workmap-out"
+    settings.planner.timeout_seconds = 1
+    settings.computer_control.timeout_seconds = 900
+    settings.computer_control.planner_step_timeout_seconds = 41
+
+    controller = build_computer_controller(settings, FakeExecutor())
+
+    assert controller.planner.timeout_seconds == 41
+    assert isinstance(controller.native_router.workmap_selector, ClaudeWorkMapSelector)
+    assert controller.native_router.workmap_selector.timeout_seconds == 41

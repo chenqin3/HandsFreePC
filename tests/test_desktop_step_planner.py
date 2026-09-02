@@ -584,6 +584,7 @@ def test_codex_command_is_ephemeral_config_free_read_only_and_returns_one_step(m
     for feature in ("hooks", "memories", "code_mode_host"):
         assert args[args.index(feature) - 1] == "--disable"
     assert "--strict-config" in args
+    assert args[args.index("--model") + 1] == "test-model"
     assert "shell_tool" in args
     assert args[args.index("--sandbox") + 1] == "read-only"
     assert "shell_environment_policy.inherit=none" in args
@@ -724,7 +725,7 @@ def test_claude_command_explicitly_disables_all_tools_and_session_persistence(mo
     monkeypatch.setattr(step_planner, "resolve_executable", lambda _value: "claude-test.exe")
     planner = ClaudeDesktopStepPlanner(
         executable="claude",
-        model=None,
+        model="haiku",
         timeout_seconds=1,
         popen_factory=popen,
     )
@@ -757,6 +758,7 @@ def test_claude_command_explicitly_disables_all_tools_and_session_persistence(mo
     # result is returned, even though every external tool is disabled.
     assert "--max-turns" not in args
     assert args[args.index("--output-format") + 1] == "json"
+    assert args[args.index("--model") + 1] == "haiku"
     system_prompt = args[args.index("--system-prompt") + 1]
     data_prompt = json.loads(process.inputs[0])
     assert "打开 Chat" not in system_prompt

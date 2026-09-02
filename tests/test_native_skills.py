@@ -657,6 +657,83 @@ def test_semantic_workmap_choice_is_rebound_locally_before_opening(settings, tmp
     assert executor.executed[0].actions[0].path == str(first.resolve())
 
 
+def test_assistive_semantic_workmap_candidate_identity_change_is_blocked(
+    settings,
+    tmp_path,
+) -> None:
+    first = tmp_path / "first"
+    replacement = tmp_path / "replacement"
+    second = tmp_path / "second"
+    first.mkdir()
+    replacement.mkdir()
+    second.mkdir()
+    selected_id = "wm-11111111111111111111"
+    index = SemanticWorkMapIndex(
+        {
+            selected_id: ("第一资料库", first),
+            "wm-22222222222222222222": ("第二资料库", second),
+        }
+    )
+    selector = FakeWorkMapSelector(
+        selected_id,
+        on_select=lambda: index.candidates.__setitem__(
+            selected_id,
+            ("替换资料库", replacement),
+        ),
+    )
+    settings.computer_control.engine = "assistive_v1"
+    _enable_codex_workmap_selection(settings)
+    executor = RecordingExecutor()
+    router = NativeSkillRouter(
+        settings,
+        executor=executor,
+        workmap_index=index,
+        workmap_selector=selector,
+    )
+
+    result = router.route("打开我之前说的资料库")
+
+    assert result.status == NativeRouteStatus.BLOCKED
+    assert "identity changed" in result.message
+    assert executor.executed == []
+
+
+def test_assistive_semantic_workmap_candidate_disappearance_is_blocked(
+    settings,
+    tmp_path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    selected_id = "wm-11111111111111111111"
+    index = SemanticWorkMapIndex(
+        {
+            selected_id: ("第一资料库", first),
+            "wm-22222222222222222222": ("第二资料库", second),
+        }
+    )
+    selector = FakeWorkMapSelector(
+        selected_id,
+        on_select=lambda: index.candidates.pop(selected_id),
+    )
+    settings.computer_control.engine = "assistive_v1"
+    _enable_codex_workmap_selection(settings)
+    executor = RecordingExecutor()
+    router = NativeSkillRouter(
+        settings,
+        executor=executor,
+        workmap_index=index,
+        workmap_selector=selector,
+    )
+
+    result = router.route("打开我之前说的资料库")
+
+    assert result.status == NativeRouteStatus.BLOCKED
+    assert "disappeared" in result.message
+    assert executor.executed == []
+
+
 def test_semantic_workmap_forged_id_null_error_and_stale_choice_all_miss(
     settings,
     tmp_path,
@@ -924,6 +1001,51 @@ def test_safe_native_path_is_rebound_at_the_final_execution_boundary(
     assert executor.executed == []
 
 
+def test_assistive_path_identity_change_during_binding_is_blocked(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings.computer_control.engine = "assistive_v1"
+    target = tmp_path / "bound-directory"
+    target.mkdir()
+    plan = Plan("open bound directory", [Action(ActionType.OPEN_PATH, path=str(target))])
+    executor = RecordingExecutor()
+    router = NativeSkillRouter(settings, parser=FixedParser(plan), executor=executor)
+
+    def changed_identity(_plan: Plan) -> str:
+        raise RuntimeError("path identity changed during safety binding")
+
+    monkeypatch.setattr(native_skills, "bind_plan_paths", changed_identity)
+
+    result = router.route("打开 bound-directory")
+
+    assert result.status == NativeRouteStatus.BLOCKED
+    assert result.message.startswith("NATIVE_PATH_BINDING_FAILED")
+    assert executor.executed == []
+
+
+def test_assistive_path_identity_change_during_execution_is_blocked(
+    settings,
+    tmp_path,
+) -> None:
+    class IdentityChangingExecutor(RecordingExecutor):
+        def execute_plan(self, plan: Plan) -> list[ExecutionResult]:
+            raise RuntimeError("selected path identity changed during execution")
+
+    settings.computer_control.engine = "assistive_v1"
+    target = tmp_path / "execution-directory"
+    target.mkdir()
+    plan = Plan("open execution directory", [Action(ActionType.OPEN_PATH, path=str(target))])
+    executor = IdentityChangingExecutor()
+    router = NativeSkillRouter(settings, parser=FixedParser(plan), executor=executor)
+
+    result = router.route("打开 execution-directory")
+
+    assert result.status == NativeRouteStatus.BLOCKED
+    assert result.message.startswith("NATIVE_EXECUTION_FAILED")
+
+
 def test_unconsumed_blocked_keyword_falls_through_without_native_execution(settings) -> None:
     executor = RecordingExecutor()
     router = NativeSkillRouter(settings, executor=executor)
@@ -991,6 +1113,28 @@ def test_failed_action_is_not_reported_as_verified_completion(settings) -> None:
     assert result.status == NativeRouteStatus.FAILED
     assert result.success is False
     assert result.message == "NATIVE_EXECUTION_FAILED: postcondition missing"
+
+
+def test_assistive_wrapped_secure_desktop_execution_result_is_blocked(settings) -> None:
+    settings.computer_control.engine = "assistive_v1"
+    executor = RecordingExecutor()
+    failed_action = Action(ActionType.SET_FEEDBACK_MODE, feedback_mode=settings.app.feedback_mode)
+    executor.results = [
+        ExecutionResult(
+            False,
+            "secure desktop",
+            action=failed_action,
+            evidence={"error_type": "DesktopUnavailableError"},
+        )
+    ]
+    router = NativeSkillRouter(settings, executor=executor)
+
+    result = router.route("切换到屏幕反馈")
+
+    assert result.status == NativeRouteStatus.BLOCKED
+    assert result.message.startswith(
+        "NATIVE_EXECUTION_BLOCKED: DesktopUnavailableError"
+    )
 
 
 def test_short_execution_result_is_failure(settings) -> None:

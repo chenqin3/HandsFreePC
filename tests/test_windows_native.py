@@ -16,11 +16,56 @@ from handsfree_pc.windows.native import (
     WindowActivationError,
     WindowInfo,
 )
+from handsfree_pc.windows.text import sanitize_windows_ui_text
 
 
 class FakeKernel32:
     def GetCurrentThreadId(self):
         return 10
+
+
+class EnumerationUser32:
+    def __init__(self) -> None:
+        self.hwnd = 301
+        self.title = "\u200eDownloads\u200f\u200b"
+        self.class_name = "\u200eCabinetWClass\u200f"
+
+    def EnumWindows(self, callback, _lparam):
+        return callback(self.hwnd, 0)
+
+    def IsWindowVisible(self, hwnd):
+        return int(hwnd) == self.hwnd
+
+    def GetWindowTextLengthW(self, hwnd):
+        return len(self.title) if int(hwnd) == self.hwnd else 0
+
+    def GetWindowTextW(self, hwnd, buffer, _size):
+        if int(hwnd) != self.hwnd:
+            return 0
+        buffer.value = self.title
+        return len(self.title)
+
+    def GetClassNameW(self, hwnd, buffer, _size):
+        if int(hwnd) != self.hwnd:
+            return 0
+        buffer.value = self.class_name
+        return len(self.class_name)
+
+    def GetWindowThreadProcessId(self, hwnd, process_id):
+        if int(hwnd) != self.hwnd:
+            return 0
+        ctypes.cast(process_id, ctypes.POINTER(wintypes.DWORD)).contents.value = 7001
+        return 71
+
+
+class FakeShell32:
+    def __init__(self, result: int = 33) -> None:
+        self.result = result
+        self.calls: list[tuple[object, ...]] = []
+
+    def ShellExecuteW(self, *args):
+        self.calls.append(args)
+        return self.result
 
 
 class ActivationUser32:
@@ -204,6 +249,43 @@ def build_native(user32: ActivationUser32) -> NativeWindows:
         WindowInfo(user32.target, "Owned fixture", 5001, "python.exe")
     ]
     return native
+
+
+def test_shared_windows_text_sanitizer_removes_known_nonsemantic_marks() -> None:
+    assert sanitize_windows_ui_text("\x00A\u200bB\u200eC\u200f") == "ABC"
+    assert sanitize_windows_ui_text(None) == ""
+
+
+def test_enumerate_windows_sanitizes_title_and_records_class_name() -> None:
+    user32 = EnumerationUser32()
+    native = NativeWindows(
+        user32=user32,
+        shell32=object(),
+        kernel32=FakeKernel32(),
+        process_name_resolver=lambda process_id: "explorer.exe" if process_id == 7001 else None,
+    )
+
+    windows = native.enumerate_windows()
+
+    assert windows == [WindowInfo(301, "Downloads", 7001, "explorer.exe", "CabinetWClass")]
+    assert windows[0].to_evidence()["class_name"] == "CabinetWClass"
+
+
+def test_shell_execute_path_bypasses_the_optional_startfile_opener() -> None:
+    shell32 = FakeShell32()
+    path_opener_calls: list[str] = []
+    native = NativeWindows(
+        user32=object(),
+        shell32=shell32,
+        kernel32=FakeKernel32(),
+        path_opener=path_opener_calls.append,
+    )
+
+    backend = native.shell_execute_path("D:\\")
+
+    assert backend == "ShellExecuteW"
+    assert path_opener_calls == []
+    assert shell32.calls == [(None, "open", "D:\\", None, None, 1)]
 
 
 def test_gui_thread_info_layout_is_pointer_width_safe() -> None:

@@ -23,6 +23,12 @@ privacy:
   redact_paths_in_logs: true
   allow_cloud_planner: false
 
+diagnostics:
+  # Local exception/stage diagnostics for development. It never records audio,
+  # screenshots, the full UIA tree, or the full spoken command.
+  debug_log_enabled: false
+  debug_log_local_only: true
+
 speech:
   sample_rate: 16000
   input_device: null
@@ -105,6 +111,9 @@ planner:
 
 computer_control:
   enabled: false
+  # proof_v1 preserves the existing proof-oriented controller. assistive_v1 is
+  # the opt-in task-goal controller; keep the public default on proof_v1.
+  engine: proof_v1
   backend: local_agent
   driver: windows_uia
   # strict requires each generic task to name exactly one configured app.
@@ -133,6 +142,12 @@ computer_control:
   # Legacy Codex Computer Use has broader tools and no 0.3 local action verifier.
   allow_legacy_codex_computer_use: false
   timeout_seconds: 600
+  # Deadline for one cold CLI planning step. This is independent of both the
+  # overall computer-control timeout above and legacy planner.timeout_seconds.
+  planner_step_timeout_seconds: 60
+  # Reasoning effort for one assistive planning step (Codex backend). A single
+  # UI decision rarely needs deep deliberation; null keeps the backend default.
+  planner_reasoning_effort: low
   max_steps: 20
   max_observation_chars: 24000
   max_queue_size: 8
@@ -142,7 +157,14 @@ computer_control:
   working_directory: runtime/computer-control
   codex_executable: codex
   claude_executable: claude
+  # Use a backend-supported fast model explicitly in private configuration
+  # (for example, gpt-5.6-luna for Codex or haiku for Claude).
   model: null
+  # Apps omitted from this mapping default to confirm in assistive_v1.
+  send_policy:
+    claude: auto
+    codex: auto
+    wechat: confirm
   open_computer_use_executable: open-computer-use
   open_computer_use_args: [mcp]
   allow_experimental_driver: false

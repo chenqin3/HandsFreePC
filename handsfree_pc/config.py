@@ -33,6 +33,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "redact_paths_in_logs": True,
         "allow_cloud_planner": False,
     },
+    "diagnostics": {
+        "debug_log_enabled": False,
+        "debug_log_local_only": True,
+    },
     "speech": {
         "sample_rate": 16000,
         "input_device": None,
@@ -126,6 +130,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "computer_control": {
         "enabled": False,
+        "engine": "proof_v1",
         "backend": "local_agent",
         "driver": "windows_uia",
         "planner_backend": "claude",
@@ -134,6 +139,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allow_codex_cli_host_read": False,
         "allow_legacy_codex_computer_use": False,
         "timeout_seconds": 600,
+        "planner_step_timeout_seconds": 60,
+        "planner_reasoning_effort": "low",
         "max_steps": 20,
         "max_observation_chars": 24000,
         "max_queue_size": 8,
@@ -144,6 +151,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "codex_executable": "codex",
         "claude_executable": "claude",
         "model": None,
+        "send_policy": {
+            "claude": "auto",
+            "codex": "auto",
+            "wechat": "confirm",
+        },
         "open_computer_use_executable": "open-computer-use",
         "open_computer_use_args": ["mcp"],
         "allow_experimental_driver": False,
@@ -480,6 +492,12 @@ class PrivacySettings:
 
 
 @dataclass(slots=True)
+class DiagnosticsSettings:
+    debug_log_enabled: bool
+    debug_log_local_only: bool
+
+
+@dataclass(slots=True)
 class SpeechSettings:
     sample_rate: int
     input_device: int | str | None
@@ -509,6 +527,7 @@ class PlannerSettings:
 @dataclass(slots=True)
 class ComputerControlSettings:
     enabled: bool
+    engine: str
     backend: str
     driver: str
     planner_backend: str
@@ -517,6 +536,8 @@ class ComputerControlSettings:
     allow_codex_cli_host_read: bool
     allow_legacy_codex_computer_use: bool
     timeout_seconds: float
+    planner_step_timeout_seconds: float
+    planner_reasoning_effort: str | None
     max_steps: int
     max_observation_chars: int
     max_queue_size: int
@@ -527,6 +548,7 @@ class ComputerControlSettings:
     codex_executable: str
     claude_executable: str
     model: str | None
+    send_policy: dict[str, str]
     open_computer_use_executable: str
     open_computer_use_args: list[str]
     allow_experimental_driver: bool
@@ -596,6 +618,7 @@ class Settings:
     config_path: Path
     app: AppSettings
     privacy: PrivacySettings
+    diagnostics: DiagnosticsSettings
     speech: SpeechSettings
     planner: PlannerSettings
     computer_control: ComputerControlSettings
@@ -634,9 +657,22 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
 
     app_raw = raw["app"]
     privacy_raw = raw["privacy"]
+    diagnostics_raw = raw["diagnostics"]
     speech_raw = raw["speech"]
     planner_raw = raw["planner"]
     computer_control_raw = raw["computer_control"]
+    loaded_control = loaded.get("computer_control")
+    if (
+        str(computer_control_raw.get("engine", "proof_v1")).casefold() == "assistive_v1"
+        and (
+            not isinstance(loaded_control, dict)
+            or "failure_policy" not in loaded_control
+        )
+    ):
+        # Keep the historical proof_v1 default (pause), while a newly opted-in
+        # assistive profile continues after ordinary failures unless the user
+        # explicitly requests otherwise.
+        computer_control_raw["failure_policy"] = "continue"
     visual_ocr_raw = raw["visual_ocr"]
     workmap_raw = raw["workmap"]
     execution_raw = raw["execution"]
@@ -649,6 +685,10 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             "redact_paths_in_logs",
             "allow_cloud_planner",
         )
+    }
+    diagnostics_values = {
+        key: _require_bool(diagnostics_raw, key, section="diagnostics")
+        for key in ("debug_log_enabled", "debug_log_local_only")
     }
     planner_enabled = _require_bool(planner_raw, "enabled", section="planner")
     computer_control_enabled = _require_bool(
@@ -679,6 +719,24 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
         "allow_coordinate_actions",
         section="computer_control",
     )
+    send_policy_raw = computer_control_raw.get("send_policy")
+    if not isinstance(send_policy_raw, dict):
+        raise ValueError(
+            "computer_control.send_policy must be a YAML mapping of app names to auto or confirm"
+        )
+    send_policy: dict[str, str] = {}
+    for app_name, policy_value in send_policy_raw.items():
+        if not isinstance(app_name, str) or not app_name.strip():
+            raise ValueError("computer_control.send_policy keys must be non-empty strings")
+        if not isinstance(policy_value, str) or policy_value.strip().casefold() not in {
+            "auto",
+            "confirm",
+        }:
+            raise ValueError(
+                "computer_control.send_policy values must be auto or confirm"
+            )
+        normalized_app = app_name.strip().casefold()
+        send_policy[normalized_app] = policy_value.strip().casefold()
     visual_ocr_enabled = _require_bool(visual_ocr_raw, "enabled", section="visual_ocr")
     visual_ocr_regions_enabled = _require_bool(
         visual_ocr_raw,
@@ -837,6 +895,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             feedback_mode=FeedbackMode(app_raw["feedback_mode"]),
         ),
         privacy=PrivacySettings(**privacy_values),
+        diagnostics=DiagnosticsSettings(**diagnostics_values),
         speech=SpeechSettings(
             sample_rate=int(speech_raw["sample_rate"]),
             input_device=speech_raw["input_device"],
@@ -862,6 +921,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
         ),
         computer_control=ComputerControlSettings(
             enabled=computer_control_enabled,
+            engine=str(computer_control_raw["engine"]).lower(),
             backend=str(computer_control_raw["backend"]).lower(),
             driver=str(computer_control_raw["driver"]).lower(),
             planner_backend=str(computer_control_raw["planner_backend"]).lower(),
@@ -870,6 +930,14 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             allow_codex_cli_host_read=allow_codex_cli_host_read,
             allow_legacy_codex_computer_use=allow_legacy_codex_computer_use,
             timeout_seconds=float(computer_control_raw["timeout_seconds"]),
+            planner_step_timeout_seconds=float(
+                computer_control_raw["planner_step_timeout_seconds"]
+            ),
+            planner_reasoning_effort=_optional_string(
+                computer_control_raw,
+                "planner_reasoning_effort",
+                section="computer_control",
+            ),
             max_steps=int(computer_control_raw["max_steps"]),
             max_observation_chars=int(computer_control_raw["max_observation_chars"]),
             max_queue_size=int(computer_control_raw["max_queue_size"]),
@@ -881,7 +949,12 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             ),
             codex_executable=str(computer_control_raw["codex_executable"]),
             claude_executable=str(computer_control_raw["claude_executable"]),
-            model=computer_control_raw.get("model"),
+            model=_optional_string(
+                computer_control_raw,
+                "model",
+                section="computer_control",
+            ),
+            send_policy=send_policy,
             open_computer_use_executable=str(computer_control_raw["open_computer_use_executable"]),
             open_computer_use_args=_require_string_list(
                 computer_control_raw,
@@ -933,6 +1006,13 @@ def _validate(settings: Settings) -> None:
         settings.visual_ocr.endpoint,
         allow_remote_screen_ocr=settings.visual_ocr.allow_remote_screen_ocr,
     )
+    if (
+        settings.diagnostics.debug_log_enabled
+        and not settings.diagnostics.debug_log_local_only
+    ):
+        raise ValueError(
+            "diagnostics.debug_log_enabled requires debug_log_local_only=true"
+        )
     if not settings.visual_ocr.apps or any(
         not isinstance(item, str) or not item.strip() for item in settings.visual_ocr.apps
     ):
@@ -1026,6 +1106,8 @@ def _validate(settings: Settings) -> None:
         )
     if settings.computer_control.backend not in {"local_agent", "legacy_codex_cli"}:
         raise ValueError("computer_control.backend must be local_agent or legacy_codex_cli")
+    if settings.computer_control.engine not in {"proof_v1", "assistive_v1"}:
+        raise ValueError("computer_control.engine must be proof_v1 or assistive_v1")
     if settings.computer_control.driver not in {
         "windows_uia",
         "open_computer_use",
@@ -1063,6 +1145,20 @@ def _validate(settings: Settings) -> None:
         raise ValueError("computer_control.max_prompt_chars must be between 1 and 8000")
     if settings.computer_control.timeout_seconds <= 0:
         raise ValueError("computer_control.timeout_seconds must be positive")
+    if settings.computer_control.planner_step_timeout_seconds <= 0:
+        raise ValueError(
+            "computer_control.planner_step_timeout_seconds must be positive"
+        )
+    effort = settings.computer_control.planner_reasoning_effort
+    if effort is not None and effort.strip().casefold() not in {
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    }:
+        raise ValueError(
+            "computer_control.planner_reasoning_effort must be minimal, low, medium, high, or null"
+        )
     if not 1 <= settings.computer_control.max_steps <= 100:
         raise ValueError("computer_control.max_steps must be between 1 and 100")
     if not 1000 <= settings.computer_control.max_observation_chars <= 100000:

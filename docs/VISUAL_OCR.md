@@ -53,6 +53,15 @@ The default bind is numeric loopback `127.0.0.1:8766`. The protocol is a raw
 PNG and disables access logs. Verify it from Windows with
 `http://127.0.0.1:8766/health`.
 
+`--engine ppocr` swaps the PaddleOCR-VL layout pipeline for PP-OCRv5 line
+detection/recognition (`--ocr-models server|mobile`). Line-level boxes are what
+UI automation needs: every list entry, menu item, and section header becomes
+its own region, and a full-window screenshot takes about one second on a GPU
+instead of several. The assistive conversation skills (WeChat search results)
+rely on this engine. On Windows, `scripts/start_visual_ocr_wsl.ps1` launches it
+inside WSL and waits for `/health`; pick a free port with `-Port` when 8766 is
+taken by something else and point `visual_ocr.endpoint` at it.
+
 ## Private configuration
 
 Put the opt-in in ignored `config.local.yaml`, never in the public repository:

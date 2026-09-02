@@ -28,11 +28,47 @@ def _result_mapping(result: Any) -> Mapping[str, Any]:
     return nested if isinstance(nested, Mapping) else payload
 
 
-def create_app(*, max_image_bytes: int, max_items: int):
+def _line_blocks(parsed: Mapping[str, Any], *, min_score: float) -> list[dict[str, Any]]:
+    """Turn PP-OCR line results into the same block shape as layout parsing.
+
+    Line-level boxes are what a UI needs: each list entry, menu item, or
+    header becomes its own clickable region instead of one merged paragraph.
+    """
+
+    texts = _plain(parsed.get("rec_texts")) or []
+    scores = _plain(parsed.get("rec_scores")) or []
+    boxes = _plain(parsed.get("rec_boxes"))
+    if not boxes:
+        boxes = []
+        for polygon in _plain(parsed.get("dt_polys")) or []:
+            xs = [float(point[0]) for point in polygon]
+            ys = [float(point[1]) for point in polygon]
+            boxes.append([min(xs), min(ys), max(xs), max(ys)])
+    blocks: list[dict[str, Any]] = []
+    for index, text in enumerate(texts):
+        if index >= len(boxes):
+            break
+        score = float(scores[index]) if index < len(scores) else 1.0
+        content = str(text).strip()
+        if not content or score < min_score:
+            continue
+        box = [int(round(float(value))) for value in boxes[index][:4]]
+        blocks.append({"block_content": content, "block_bbox": box, "block_label": "text"})
+    return blocks
+
+
+def create_app(
+    *,
+    max_image_bytes: int,
+    max_items: int,
+    engine: str = "vl",
+    ocr_models: str = "server",
+    min_score: float = 0.5,
+):
     try:
         import numpy as np
         from fastapi import FastAPI, HTTPException, Request
-        from paddleocr import PaddleOCRVL
+        from paddleocr import PaddleOCR, PaddleOCRVL
         from PIL import Image
     except ImportError as exc:  # pragma: no cover - deployment environment only
         raise RuntimeError(
@@ -47,7 +83,18 @@ def create_app(*, max_image_bytes: int, max_items: int):
     def pipeline():
         with pipeline_lock:
             if not pipeline_holder:
-                pipeline_holder.append(PaddleOCRVL())
+                if engine == "ppocr":
+                    pipeline_holder.append(
+                        PaddleOCR(
+                            use_doc_orientation_classify=False,
+                            use_doc_unwarping=False,
+                            use_textline_orientation=False,
+                            text_detection_model_name=f"PP-OCRv5_{ocr_models}_det",
+                            text_recognition_model_name=f"PP-OCRv5_{ocr_models}_rec",
+                        )
+                    )
+                else:
+                    pipeline_holder.append(PaddleOCRVL())
             return pipeline_holder[0]
 
     @app.get("/health")
@@ -90,7 +137,10 @@ def create_app(*, max_image_bytes: int, max_items: int):
             predictions = pipeline().predict(np.asarray(rgb))
             prediction = next(iter(predictions))
             parsed = _result_mapping(prediction)
-            raw_blocks = parsed.get("parsing_res_list", [])
+            if engine == "ppocr":
+                raw_blocks = _line_blocks(parsed, min_score=min_score)
+            else:
+                raw_blocks = parsed.get("parsing_res_list", [])
         except Exception as exc:
             raise HTTPException(status_code=500, detail="OCR inference failed") from exc
         if not isinstance(raw_blocks, Sequence) or isinstance(raw_blocks, (str, bytes)):
@@ -128,6 +178,24 @@ def main() -> int:
     parser.add_argument("--max-image-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--max-items", type=int, default=160)
     parser.add_argument("--allow-remote-bind", action="store_true")
+    parser.add_argument(
+        "--engine",
+        choices=("vl", "ppocr"),
+        default="vl",
+        help="vl = PaddleOCR-VL layout blocks; ppocr = PP-OCRv5 line boxes (fast, UI-friendly)",
+    )
+    parser.add_argument(
+        "--ocr-models",
+        choices=("mobile", "server"),
+        default="server",
+        help="PP-OCRv5 detection/recognition model size used by --engine ppocr",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=0.5,
+        help="Drop PP-OCR lines whose recognition confidence is below this value",
+    )
     args = parser.parse_args()
     try:
         loopback_bind = ipaddress.ip_address(args.host).is_loopback
@@ -145,8 +213,16 @@ def main() -> int:
         import uvicorn
     except ImportError as exc:  # pragma: no cover - deployment environment only
         raise RuntimeError("Install Uvicorn in the WSL OCR environment first") from exc
+    if not 0.0 <= args.min_score <= 1.0:
+        parser.error("--min-score must be between 0 and 1")
     uvicorn.run(
-        create_app(max_image_bytes=args.max_image_bytes, max_items=args.max_items),
+        create_app(
+            max_image_bytes=args.max_image_bytes,
+            max_items=args.max_items,
+            engine=args.engine,
+            ocr_models=args.ocr_models,
+            min_score=args.min_score,
+        ),
         host=args.host,
         port=args.port,
         access_log=False,

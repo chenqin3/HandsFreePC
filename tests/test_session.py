@@ -230,6 +230,42 @@ def test_command_worker_continue_policy_still_pauses_for_confirmation() -> None:
     assert worker.stop(timeout=1)
 
 
+def test_command_worker_continue_policy_pauses_only_when_hard_block_is_reached() -> None:
+    calls: list[int] = []
+
+    def handler(command: QueuedCommand, _cancel: threading.Event) -> JobOutcome:
+        calls.append(command.sequence)
+        if command.sequence == 1:
+            return JobOutcome(
+                command,
+                success=False,
+                error_code="ASSISTIVE_PLANNER_FAILED",
+            )
+        if command.sequence == 2:
+            return JobOutcome(
+                command,
+                success=False,
+                error_code="ASSISTIVE_HARD_BLOCK",
+            )
+        return JobOutcome(command, success=True)
+
+    worker = CommandWorker(handler, failure_policy="continue")
+    worker.start()
+    try:
+        assert worker.enqueue(QueuedCommand("ordinary failure continues", sequence=1))
+        assert worker.enqueue(QueuedCommand("hard block pauses", sequence=2))
+        assert worker.enqueue(QueuedCommand("must wait", sequence=3))
+
+        wait_for_state(worker, WorkerState.PAUSED)
+        assert calls == [1, 2]
+        assert worker.unfinished_count == 1
+        assert worker.resume()
+        assert worker.drain(timeout=1)
+        assert calls == [1, 2, 3]
+    finally:
+        worker.stop(timeout=1)
+
+
 def test_control_command_runs_before_ordinary_fifo_after_confirmation_pause() -> None:
     calls: list[str] = []
 

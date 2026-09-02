@@ -12,9 +12,11 @@ from handsfree_pc.config import AppProfile
 from handsfree_pc.desktop.protocol import (
     DesktopAction,
     DesktopActionType,
+    DesktopElement,
     DesktopElementAction,
     DesktopExpectation,
     DesktopExpectationKind,
+    DesktopObservation,
     ElementPlane,
     element_plane,
 )
@@ -27,6 +29,137 @@ from handsfree_pc.desktop.windows_uia import (
 )
 from handsfree_pc.windows.native import NativeFocusSnapshot, WindowActivationError, WindowInfo
 from handsfree_pc.windows.uia import PasswordFieldError
+
+
+def test_browser_omnibox_enter_skips_only_the_new_window_transition_watch() -> None:
+    observation = DesktopObservation(
+        app="chrome-dynamic",
+        generation=4,
+        accessibility_text="",
+        process_name="chrome.exe",
+        local_window_id="hwnd:101",
+    )
+    target = DesktopElement(
+        "0",
+        "https://google.com/",
+        "Edit",
+        automation_id="view_1012",
+        value="https://google.com/",
+        value_observed=True,
+        focused=True,
+        editable=True,
+        local_identity="a" * 64,
+        browser_chrome=True,
+    )
+    enter = DesktopAction(
+        DesktopActionType.PRESS_KEY,
+        app=observation.app,
+        generation=observation.generation,
+        element_index="0",
+        key="enter",
+    )
+
+    assert WindowsUiaDriver._is_same_window_browser_address_navigation(
+        enter,
+        observation,
+        target,
+    )
+    assert not WindowsUiaDriver._is_same_window_browser_address_navigation(
+        enter,
+        DesktopObservation(
+            app="editor",
+            generation=4,
+            accessibility_text="",
+            process_name="notepad.exe",
+            local_window_id="hwnd:202",
+        ),
+        target,
+    )
+
+
+def test_browser_navigation_fast_path_is_opt_in_for_assistive_only() -> None:
+    profile = AppProfile(
+        name="Chrome",
+        process_names=["chrome.exe"],
+        executable=None,
+        title_patterns=["Chrome"],
+        search_hotkey=None,
+        native_voice_hotkey=None,
+        voice_button_names=[],
+    )
+
+    proof_driver = WindowsUiaDriver({"chrome": profile})
+    assistive_driver = WindowsUiaDriver(
+        {"chrome": profile},
+        same_window_browser_navigation_fast_path=True,
+    )
+
+    assert proof_driver._same_window_browser_navigation_fast_path is False
+    assert assistive_driver._same_window_browser_navigation_fast_path is True
+
+
+def test_driver_provenance_distinguishes_browser_chrome_from_spoofed_web_toolbar() -> None:
+    root = FakeRoot([])
+    native_toolbar = FakeElement("Browser controls", "ToolBar", parent=root)
+    document = FakeElement("Page", "Document", parent=root)
+    page_toolbar = FakeElement("Page toolbar", "ToolBar", parent=document)
+    omnibox = FakeElement(
+        "Address and search bar",
+        "Edit",
+        automation_id="view_1012",
+        runtime_id=(1, 2, 3),
+        value="https://google.com/",
+        focused=False,
+        parent=native_toolbar,
+    )
+    spoofed = FakeElement(
+        "Address and search bar",
+        "Edit",
+        automation_id="view_1012",
+        runtime_id=(4, 5, 6),
+        value="https://google.com/",
+        focused=False,
+        parent=page_toolbar,
+    )
+    root.elements = [omnibox, spoofed]
+    window = WindowInfo(101, "Google - Google Chrome", 5101, "chrome.exe")
+    native = FakeNative([window])
+    driver = WindowsUiaDriver(
+        {
+            "chrome": _profile(
+                name="Chrome",
+                process_names=["chrome.exe"],
+                title_patterns=["Chrome"],
+            )
+        },
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop({window.hwnd: root}),
+        same_window_browser_navigation_fast_path=True,
+    )
+
+    observation = driver.observe("chrome")
+
+    assert [item.browser_chrome for item in observation.elements] == [True, False]
+
+
+def test_browser_chrome_provenance_fails_closed_on_deep_detached_or_cyclic_ancestry() -> None:
+    root = FakeRoot([])
+    document = FakeElement("Page", "Document", parent=root)
+    parent = document
+    for index in range(30):
+        parent = FakeElement(f"Group {index}", "Group", parent=parent)
+    deep_toolbar = FakeElement("Page toolbar", "ToolBar", parent=parent)
+    deep_spoof = FakeElement("Address and search bar", "Edit", parent=deep_toolbar)
+    detached_toolbar = FakeElement("Detached toolbar", "ToolBar")
+    detached = FakeElement("Address and search bar", "Edit", parent=detached_toolbar)
+    cycle_a = FakeElement("Cycle A", "ToolBar")
+    cycle_b = FakeElement("Cycle B", "Group", parent=cycle_a)
+    cycle_a._parent = cycle_b
+    cyclic = FakeElement("Address and search bar", "Edit", parent=cycle_a)
+
+    assert not WindowsUiaDriver._is_browser_chrome_descendant(deep_spoof, root)
+    assert not WindowsUiaDriver._is_browser_chrome_descendant(detached, root)
+    assert not WindowsUiaDriver._is_browser_chrome_descendant(cyclic, root)
 
 
 class FakeElement:
@@ -56,6 +189,7 @@ class FakeElement:
         scroll_item_pattern: bool = False,
         on_focus_check=None,
         on_visibility_check=None,
+        parent=None,
     ) -> None:
         labeled_by = (
             SimpleNamespace(CurrentName=labeled_by_name) if labeled_by_name is not None else None
@@ -88,6 +222,7 @@ class FakeElement:
         self.on_click = on_click
         self.on_focus_check = on_focus_check
         self.on_visibility_check = on_visibility_check
+        self._parent = parent
         self.focus_checks = 0
         self.visibility_checks = 0
         self.value_reads = 0
@@ -133,6 +268,9 @@ class FakeElement:
 
     def window_text(self):
         return self._name
+
+    def parent(self):
+        return self._parent
 
     def is_visible(self):
         self.visibility_checks += 1
@@ -697,6 +835,41 @@ def _screenshot_visual_driver(
         visual_clicker=clicker,
         **driver_options,
     )
+
+
+def test_explicit_visual_screenshot_action_executes_without_implicit_activation() -> None:
+    window = _window()
+    native = FakeNative([window])
+    root = _VisualPngRoot()
+    clicks: list[tuple[int, int]] = []
+    driver = _screenshot_visual_driver(
+        root,
+        native=native,
+        clicker=lambda x, y: clicks.append((x, y)),
+        activate_before_execute=False,
+        automatic_visual_screenshots=False,
+    )
+    observation = driver.observe("wechat", capture_screenshot=True)
+    viewport = next(
+        element for element in observation.elements if element.control_type == "VisualViewport"
+    )
+    native.calls.clear()
+
+    receipt = driver.execute(
+        DesktopAction(
+            DesktopActionType.CLICK,
+            app="wechat",
+            generation=observation.generation,
+            element_index=viewport.index,
+            x=40,
+            y=30,
+        ),
+        observation,
+    )
+
+    assert receipt.accepted
+    assert clicks == [(140, 230)]
+    assert not any(call[0] == "activate_window" for call in native.calls)
 
 
 def _typed_visual_filter():
@@ -3238,7 +3411,7 @@ def test_long_container_names_are_omitted_but_hashed_for_observation_freshness(
 
 def test_known_ignorable_uia_format_marks_are_normalized_without_losing_element():
     window = _window()
-    formatted = FakeElement("\u200eG:\u200f\u200b", "Edit", value="\u200eProjects\u200f")
+    formatted = FakeElement("\x00\u200eG:\u200f\u200b", "Edit", value="\u200eProjects\u200f\x00")
     native = FakeNative([window])
     desktop = FakeDesktop({window.hwnd: FakeRoot([formatted])})
     driver = _driver(native=native, desktop=desktop)
@@ -3469,6 +3642,36 @@ def test_action_requires_same_hwnd_generation_foreground_and_fresh_reobserve():
     )
     with pytest.raises(WindowsUiaStaleObservation, match="window changed"):
         driver.execute(replacement_action, second)
+
+
+def test_execute_with_activation_disabled_never_steals_foreground() -> None:
+    target = _window()
+    other = WindowInfo(202, "Other", 5202, "other.exe")
+    button = FakeElement("Chat", "Button")
+    native = FakeNative([target])
+    native.foreground = other
+    driver = WindowsUiaDriver(
+        {"claude": _profile()},
+        native=native,
+        desktop_factory=lambda **_kwargs: FakeDesktop(
+            {target.hwnd: FakeRoot([button])}
+        ),
+        activate_before_execute=False,
+    )
+    observation = driver.observe("claude")
+    native.calls.clear()
+    action = DesktopAction(
+        DesktopActionType.CLICK,
+        app="claude",
+        generation=observation.generation,
+        element_index="0",
+    )
+
+    with pytest.raises(WindowActivationError, match="foreground"):
+        driver.execute(action, observation)
+
+    assert not any(call[0] == "activate_window" for call in native.calls)
+    assert button.invocations == 0
 
 
 def test_password_metadata_is_redacted_and_password_elements_are_never_activated():

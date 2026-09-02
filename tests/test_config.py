@@ -13,14 +13,23 @@ def test_defaults_are_privacy_preserving(tmp_path: Path) -> None:
     assert settings.privacy.save_audio is False
     assert settings.privacy.save_transcripts is False
     assert settings.privacy.allow_cloud_planner is False
+    assert settings.diagnostics.debug_log_enabled is False
+    assert settings.diagnostics.debug_log_local_only is True
     assert settings.planner.enabled is False
     assert settings.computer_control.enabled is False
+    assert settings.computer_control.engine == "proof_v1"
     assert settings.computer_control.backend == "local_agent"
     assert settings.computer_control.driver == "windows_uia"
     assert settings.computer_control.planner_backend == "claude"
     assert settings.computer_control.allow_screen_context_to_cloud is False
     assert settings.computer_control.allow_codex_cli_host_read is False
     assert settings.computer_control.allow_legacy_codex_computer_use is False
+    assert settings.computer_control.planner_step_timeout_seconds == 60
+    assert settings.computer_control.send_policy == {
+        "claude": "auto",
+        "codex": "auto",
+        "wechat": "confirm",
+    }
     assert settings.computer_control.failure_policy == "pause"
     assert settings.visual_ocr.enabled is False
     assert settings.visual_ocr.endpoint == "http://127.0.0.1:8766/layout-parsing"
@@ -87,6 +96,35 @@ def test_visual_ocr_rejects_remote_screen_endpoint_without_separate_consent(
     )
 
     with pytest.raises(ValueError, match="allow_remote_screen_ocr"):
+        load_settings(config)
+
+
+def test_debug_diagnostics_are_local_only_and_strictly_typed(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "diagnostics:\n"
+        "  debug_log_enabled: true\n"
+        "  debug_log_local_only: true\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.diagnostics.debug_log_enabled is True
+    assert settings.diagnostics.debug_log_local_only is True
+
+    config.write_text(
+        "diagnostics:\n  debug_log_enabled: true\n  debug_log_local_only: false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="debug_log_local_only=true"):
+        load_settings(config)
+
+    config.write_text(
+        'diagnostics:\n  debug_log_enabled: "true"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="YAML boolean"):
         load_settings(config)
 
 
@@ -169,6 +207,85 @@ def test_personal_runtime_can_continue_fifo_after_an_ordinary_failure(tmp_path: 
     settings = load_settings(config)
 
     assert settings.computer_control.failure_policy == "continue"
+
+
+@pytest.mark.parametrize(
+    ("engine", "expected_policy"),
+    [("assistive_v1", "continue"), ("proof_v1", "pause")],
+)
+def test_failure_policy_default_depends_on_selected_engine(
+    tmp_path: Path,
+    engine: str,
+    expected_policy: str,
+) -> None:
+    config = tmp_path / f"{engine}.yaml"
+    config.write_text(
+        f"computer_control:\n  engine: {engine}\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.computer_control.failure_policy == expected_policy
+
+
+def test_assistive_engine_settings_are_explicit_and_normalized(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "computer_control:\n"
+        "  engine: ASSISTIVE_V1\n"
+        "  planner_step_timeout_seconds: 47.5\n"
+        "  model: gpt-fast\n"
+        "  send_policy:\n"
+        "    Claude: AUTO\n"
+        "    WECHAT: confirm\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.computer_control.engine == "assistive_v1"
+    assert settings.computer_control.planner_step_timeout_seconds == 47.5
+    assert settings.computer_control.model == "gpt-fast"
+    assert settings.computer_control.send_policy == {
+        "claude": "auto",
+        "codex": "auto",
+        "wechat": "confirm",
+    }
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("computer_control:\n  engine: future_v2\n", "engine must be"),
+        (
+            "computer_control:\n  planner_step_timeout_seconds: 0\n",
+            "planner_step_timeout_seconds must be positive",
+        ),
+        (
+            "computer_control:\n  send_policy: disabled\n",
+            "send_policy must be a YAML mapping",
+        ),
+        (
+            "computer_control:\n  send_policy:\n    wechat: sometimes\n",
+            "send_policy values must be auto or confirm",
+        ),
+        (
+            "computer_control:\n  model: 123\n",
+            "computer_control.model must be a non-empty string or null",
+        ),
+    ],
+)
+def test_assistive_engine_configuration_rejects_invalid_values(
+    tmp_path: Path,
+    content: str,
+    expected: str,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=expected):
+        load_settings(config)
 
 
 def test_workmap_read_only_index_and_aliases_are_explicit_local_configuration(
@@ -523,4 +640,22 @@ def test_quoted_boolean_values_are_rejected(
     config.write_text(content, encoding="utf-8")
 
     with pytest.raises(ValueError, match="must be a YAML boolean"):
+        load_settings(config)
+
+
+def test_planner_reasoning_effort_defaults_to_low_and_is_validated(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("computer_control:\n  enabled: false\n", encoding="utf-8")
+    assert load_settings(config).computer_control.planner_reasoning_effort == "low"
+
+    config.write_text(
+        "computer_control:\n  planner_reasoning_effort: medium\n", encoding="utf-8"
+    )
+    assert load_settings(config).computer_control.planner_reasoning_effort == "medium"
+
+    config.write_text("computer_control:\n  planner_reasoning_effort: null\n", encoding="utf-8")
+    assert load_settings(config).computer_control.planner_reasoning_effort is None
+
+    config.write_text("computer_control:\n  planner_reasoning_effort: turbo\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="planner_reasoning_effort"):
         load_settings(config)

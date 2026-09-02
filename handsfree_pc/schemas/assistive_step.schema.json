@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "reason", "app", "action"],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["observe", "action", "done", "fail", "screenshot"]
+    },
+    "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+    "app": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+    "action": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "element_index",
+            "x",
+            "y",
+            "click_count",
+            "mouse_button",
+            "direction",
+            "pages",
+            "action_name",
+            "text",
+            "key",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "click",
+                "perform_secondary_action",
+                "scroll",
+                "type_text",
+                "press_key",
+                "set_value"
+              ]
+            },
+            "element_index": {"type": ["string", "null"], "pattern": "^[0-9]+$"},
+            "x": {"type": ["integer", "null"], "minimum": 0},
+            "y": {"type": ["integer", "null"], "minimum": 0},
+            "click_count": {"type": ["integer", "null"], "minimum": 1, "maximum": 2},
+            "mouse_button": {
+              "type": ["string", "null"],
+              "enum": ["left", "right", "middle", null]
+            },
+            "direction": {
+              "type": ["string", "null"],
+              "enum": ["up", "down", "left", "right", null]
+            },
+            "pages": {"type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 10},
+            "action_name": {
+              "type": ["string", "null"],
+              "enum": ["invoke", "select", "toggle", "expand", "collapse", "scrollintoview", "clickfocus", "setfocus", null]
+            },
+            "text": {"type": ["string", "null"], "maxLength": 4000},
+            "key": {
+              "type": ["string", "null"],
+              "enum": ["tab", "shift+tab", "enter", "return", "escape", "space", "pageup", "pagedown", "home", "end", "left", "up", "right", "down", null]
+            },
+            "value": {"type": ["string", "null"], "maxLength": 4000}
+          }
+        }
+      ]
+    }
+  }
+}

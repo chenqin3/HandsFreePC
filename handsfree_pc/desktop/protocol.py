@@ -399,6 +399,9 @@ class DesktopElement:
     # driver after UIA exposed no useful control. It is never inferred from a
     # control name and remains visible to both the planner and verifier.
     visual_ocr: bool = False
+    # Local-only provenance: the owned driver proved this element is outside
+    # every web Document and below browser chrome such as a native ToolBar.
+    browser_chrome: bool = False
     high_credential: bool = False
     low_credential: bool = False
     name_metadata: BoundedUiText | None = None
@@ -450,6 +453,8 @@ class DesktopElement:
             raise ValueError("desktop element composer must be a boolean")
         if not isinstance(self.visual_ocr, bool):
             raise ValueError("desktop element visual_ocr must be a boolean")
+        if not isinstance(self.browser_chrome, bool):
+            raise ValueError("desktop element browser_chrome must be a boolean")
         if not isinstance(self.high_credential, bool) or not isinstance(
             self.low_credential,
             bool,
@@ -575,6 +580,7 @@ class DesktopElement:
             "secret_labeled": self.secret_labeled,
             "composer": self.composer,
             "visual_ocr": self.visual_ocr,
+            "browser_chrome": self.browser_chrome,
             "high_credential": self.high_credential,
             "low_credential": self.low_credential,
             "supported_actions": (
@@ -649,6 +655,11 @@ class DesktopObservation:
     accessibility_text: str
     screenshot_png: bytes | None = None
     window_title: str | None = None
+    # Trusted Win32 identity of the exact top-level window.  These fields are
+    # intentionally separate from its mutable title and opaque planner app id;
+    # local policy uses them to block terminals and protected system surfaces.
+    process_name: str | None = None
+    class_name: str | None = None
     elements: tuple[DesktopElement, ...] = ()
     captured_at: float = field(default_factory=time.monotonic)
     local_window_id: str | None = None
@@ -676,6 +687,20 @@ class DesktopObservation:
             raise ValueError("screenshot_png must be bytes or null")
         if self.window_title is not None:
             _validate_unicode(self.window_title, label="window_title", maximum=4096)
+        if self.process_name is not None:
+            _validate_unicode(
+                self.process_name,
+                label="process_name",
+                maximum=512,
+                allow_empty=False,
+            )
+        if self.class_name is not None:
+            _validate_unicode(
+                self.class_name,
+                label="class_name",
+                maximum=512,
+                allow_empty=False,
+            )
         if any(not isinstance(item, DesktopElement) for item in self.elements):
             raise ValueError("observation elements must contain DesktopElement values")
         if self.local_window_id is not None:
@@ -712,6 +737,10 @@ class DesktopObservation:
         digest.update(self.app.casefold().encode("utf-8"))
         digest.update(b"\0")
         digest.update((self.window_title or "").encode("utf-8"))
+        digest.update(b"\0process\0")
+        digest.update((self.process_name or "").casefold().encode("utf-8"))
+        digest.update(b"\0class\0")
+        digest.update((self.class_name or "").casefold().encode("utf-8"))
         digest.update(b"\0local-window\0")
         digest.update((self.local_window_id or "").encode("utf-8"))
         digest.update(b"\0")

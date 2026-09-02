@@ -1653,7 +1653,7 @@ def test_emergency_stop_is_last_feedback_across_outcome_race(settings) -> None:
 
         def emit(self, text, **kwargs):
             super().emit(text, **kwargs)
-            if "已完成本地验收" in text:
+            if "已完成：" in text:
                 self.outcome_entered.set()
                 assert self.release_outcome.wait(timeout=2)
 
@@ -1682,7 +1682,7 @@ def test_emergency_stop_is_last_feedback_across_outcome_race(settings) -> None:
         assert not stopper.is_alive()
         assert stop_outcomes[0].success
         texts = [text for text, _kwargs in feedback.events]
-        completion = next(text for text in texts if "已完成本地验收" in text)
+        completion = next(text for text in texts if "已完成：" in text)
         assert texts.index(completion) < texts.index(
             next(text for text in texts if "已请求立即停止" in text)
         )

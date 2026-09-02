@@ -109,6 +109,9 @@ class ComputerControlResult:
     returncode: int | None = None
     needs_confirmation: bool = False
     confirmation_id: str | None = None
+    # assistive_v1 uses an action-specific spoken phrase instead of a random
+    # numeric challenge. Proof controllers leave this field unset.
+    confirmation_phrase: str | None = None
     stage: str | None = None
     error_code: str | None = None
     safe_message: str | None = None

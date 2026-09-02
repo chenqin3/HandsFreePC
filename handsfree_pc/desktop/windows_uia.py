@@ -20,7 +20,9 @@ from ..windows.native import (
     WindowInfo,
     WindowNotFoundError,
 )
+from ..windows.text import sanitize_windows_ui_text
 from ..windows.uia import PasswordFieldError, UIABackend, UIAError, UIAUnavailableError
+from .assistive.browser_identity import is_browser_process, is_verified_browser_address
 from .protocol import (
     ActionReceipt,
     BoundedUiText,
@@ -59,6 +61,7 @@ class _Snapshot:
     hwnd: int
     observation: DesktopObservation
     wrappers: dict[str, Any]
+    root: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,14 +178,6 @@ _COMPOSER_IDENTITY_RE = re.compile(
     r"|输入|消息|提问|回复"
 )
 
-# Windows Explorer exposes these invisible formatting marks in otherwise
-# ordinary Edit names and values. They do not identify a different control,
-# and allowing them onto the planner surface would make visually identical
-# labels compare differently. Keep the allow-list deliberately narrow: other
-# control/format characters remain invalid and are omitted per element below.
-_IGNORABLE_UIA_TEXT_TRANSLATION = str.maketrans("", "", "\x00\u200b\u200e\u200f")
-
-
 def _safe_attr(owner: Any, name: str, default: Any = None) -> Any:
     try:
         return getattr(owner, name, default)
@@ -210,7 +205,7 @@ def _is_missing_uia_pattern(exc: Exception) -> bool:
 
 
 def _normalized_text(value: Any) -> str:
-    return "" if value is None else str(value).translate(_IGNORABLE_UIA_TEXT_TRANSLATION)
+    return sanitize_windows_ui_text(value)
 
 
 def _text(value: Any, maximum: int = 1000, *, field: str = "UIA text") -> str:
@@ -465,7 +460,11 @@ class WindowsUiaDriver:
         discover_all_windows: bool = False,
         activate_on_observe: bool = False,
         capture_screenshots: bool = False,
+        strict_visual_postcondition: bool = True,
+        activate_before_execute: bool = True,
+        same_window_browser_navigation_fast_path: bool = False,
         visual_screenshot_enabled: bool | None = None,
+        automatic_visual_screenshots: bool = True,
         visual_ocr_client: VisualOcrClient | None = None,
         visual_ocr_apps: tuple[str, ...] = (),
         visual_ocr_bbox_tolerance_pixels: int = 8,
@@ -482,6 +481,11 @@ class WindowsUiaDriver:
         self._discover_all_windows = bool(discover_all_windows)
         self._activate_on_observe = bool(activate_on_observe)
         self._capture_screenshots = bool(capture_screenshots)
+        self._strict_visual_postcondition = bool(strict_visual_postcondition)
+        self._activate_before_execute = bool(activate_before_execute)
+        self._same_window_browser_navigation_fast_path = bool(
+            same_window_browser_navigation_fast_path
+        )
         if not 0 <= int(visual_ocr_bbox_tolerance_pixels) <= 32:
             raise ValueError("visual_ocr_bbox_tolerance_pixels must be between 0 and 32")
         self._visual_ocr_client = visual_ocr_client
@@ -490,6 +494,7 @@ class WindowsUiaDriver:
             if visual_screenshot_enabled is None
             else bool(visual_screenshot_enabled)
         )
+        self._automatic_visual_screenshots = bool(automatic_visual_screenshots)
         self._visual_ocr_apps = frozenset(item.strip().casefold() for item in visual_ocr_apps)
         if any(not item for item in self._visual_ocr_apps):
             raise ValueError("visual_ocr_apps must contain non-empty app names")
@@ -570,7 +575,7 @@ class WindowsUiaDriver:
         cannot turn ``*`` into an implicit expansion of a configured-app scope.
         """
 
-        if not self._visual_screenshot_enabled:
+        if not self._visual_screenshot_enabled or not self._automatic_visual_screenshots:
             return False
         if self._discover_all_windows and "*" in self._visual_ocr_apps:
             return True
@@ -1057,6 +1062,32 @@ class WindowsUiaDriver:
             remaining -= max(interval, elapsed)
 
     @staticmethod
+    def _is_same_window_browser_address_navigation(
+        action: DesktopAction,
+        observation: DesktopObservation,
+        target: DesktopElement | None,
+    ) -> bool:
+        """Identify Enter on an exact browser omnibox bound to the same HWND.
+
+        Ordinary Enter keeps the historical two-second related-window watch.
+        HTTP(S) navigation in a browser omnibox is expected to stay in the
+        current top-level window, so waiting for a new HWND only consumes the
+        strict assistive latency budget without adding evidence.
+        """
+
+        return bool(
+            action.type == DesktopActionType.PRESS_KEY
+            and (action.key or "").casefold() in {"enter", "return"}
+            and target is not None
+            and is_verified_browser_address(
+                target,
+                observation.process_name,
+                require_focused=True,
+            )
+            and re.match(r"https?://", target.value or "", re.IGNORECASE)
+        )
+
+    @staticmethod
     def _raise_if_cancelled(
         cancel_event: threading.Event | None,
         operation_cancel: threading.Event,
@@ -1327,8 +1358,9 @@ class WindowsUiaDriver:
         elements: tuple[DesktopElement, ...],
         wrappers: dict[str, Any],
         stats: dict[str, Any],
+        force: bool = False,
     ) -> tuple[tuple[DesktopElement, ...], dict[str, Any], dict[str, Any], bytes]:
-        if not self._visual_screenshot_enabled:
+        if not self._visual_screenshot_enabled and not force:
             return elements, wrappers, stats, screenshot_png
         rich_uia_surface = self._has_rich_uia_surface(elements)
         # A semantic UIA surface remains the preferred and first-listed action
@@ -1731,6 +1763,38 @@ class WindowsUiaDriver:
         return bool(len(normalized) <= 120 and _SECRET_LABELED_BY_RE.fullmatch(normalized))
 
     @staticmethod
+    def _is_browser_chrome_descendant(wrapper: Any, trusted_root: Any) -> bool:
+        """Reach the exact UIA window root through ToolBar, never through Document."""
+
+        root_identity = WindowsUiaDriver._local_identity(trusted_root)
+        current = wrapper
+        seen: set[tuple[str, object]] = set()
+        saw_toolbar = False
+        for _depth in range(24):
+            parent = _safe_call(current, "parent", None)
+            if parent is None or parent is current:
+                return False
+            parent_identity = WindowsUiaDriver._local_identity(parent)
+            parent_control_type = WindowsUiaDriver._raw_control_type(parent).casefold()
+            token = (
+                ("runtime", parent_identity)
+                if parent_identity is not None
+                else ("object", id(parent))
+            )
+            if token in seen:
+                return False
+            if parent is trusted_root or (
+                root_identity is not None and parent_identity == root_identity
+            ):
+                return saw_toolbar
+            seen.add(token)
+            if parent_control_type == "document":
+                return False
+            saw_toolbar = saw_toolbar or parent_control_type == "toolbar"
+            current = parent
+        return False
+
+    @staticmethod
     def _runtime_composer_state(wrapper: Any, expected: DesktopElement) -> bool:
         if not expected.composer:
             return False
@@ -2113,6 +2177,7 @@ class WindowsUiaDriver:
 
         include_types = self._profile_control_types(profile)
         content_types = self._profile_content_types(profile)
+        browser_profile = any(is_browser_process(name) for name in profile.process_names)
         profile_enabled = bool(
             profile.include_control_types or profile.content_control_types or profile.composer_names
         )
@@ -2267,6 +2332,16 @@ class WindowsUiaDriver:
             )
             if composer and content_plane:
                 content_plane = False
+            # Only an editable address control can ever be verified browser
+            # chrome, and the ancestor walk costs one COM round trip per level,
+            # so skip it for every other element (about half of a Chrome
+            # observation otherwise).
+            browser_chrome = bool(
+                self._same_window_browser_navigation_fast_path
+                and browser_profile
+                and normalized_control_type in {"edit", "combobox"}
+                and self._is_browser_chrome_descendant(wrapper, root)
+            )
 
             if profile_enabled:
                 # Modal/window structure is always retained for local safety,
@@ -2379,6 +2454,7 @@ class WindowsUiaDriver:
                     addressable=addressable,
                     secret_labeled=secret_labeled,
                     composer=composer,
+                    browser_chrome=browser_chrome,
                     high_credential=high_credential,
                     low_credential=low_credential,
                     name_metadata=name_metadata,
@@ -2590,6 +2666,26 @@ class WindowsUiaDriver:
             self._pending_observation.discard(normalized)
             self._dynamic_windows[normalized] = replacement
 
+    def activate_app(self, app: str, *, cancel_event: threading.Event | None = None) -> int:
+        """Bring one listed app window to the foreground as an explicit step.
+
+        Assistive observation is passive, so the controller calls this before
+        observing a window the planner selected while another app was in front.
+        The exact HWND bound at inventory time is activated; a window whose
+        identity changed since then is a stale observation, not a new target.
+        """
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise WindowsUiaDriverError("desktop operation was cancelled")
+        native = self._native_backend()
+        native.assert_interactive_desktop()
+        window = self._resolve_window(app, allow_dynamic_title_change=True)
+        foreground = native.get_foreground_window_info()
+        if foreground is None or foreground.hwnd != window.hwnd:
+            native.activate_window(window.hwnd)
+        native.assert_foreground(window.hwnd)
+        return window.hwnd
+
     def list_apps(self, *, cancel_event: threading.Event | None = None) -> str:
         if cancel_event is not None and cancel_event.is_set():
             raise WindowsUiaDriverError("desktop operation was cancelled")
@@ -2689,6 +2785,7 @@ class WindowsUiaDriver:
         app: str,
         *,
         cancel_event: threading.Event | None = None,
+        capture_screenshot: bool = False,
     ) -> DesktopObservation:
         if cancel_event is not None and cancel_event.is_set():
             raise WindowsUiaDriverError("desktop operation was cancelled")
@@ -2715,7 +2812,12 @@ class WindowsUiaDriver:
             native.assert_foreground(window.hwnd)
         root = self._root(window.hwnd)
         elements, wrappers, stats = self._elements(root, profile)
-        visual_enabled_for_window = self._visual_enabled_for_window(normalized, profile)
+        # Assistive observation stays passive and screenshot-free by default.
+        # A caller may explicitly escalate this exact window to the existing
+        # frame-bound visual path for one planning step.
+        visual_enabled_for_window = bool(
+            capture_screenshot or self._visual_enabled_for_window(normalized, profile)
+        )
         screenshot_png = (
             self._capture_window_png(root)
             if self._capture_screenshots or visual_enabled_for_window
@@ -2742,7 +2844,10 @@ class WindowsUiaDriver:
                     "visual action postcondition has no fresh window screenshot"
                 )
             current_frame = hashlib.sha256(raw_screenshot_png).hexdigest()
-            if current_frame == pending_visual_change.frame_sha256:
+            if (
+                current_frame == pending_visual_change.frame_sha256
+                and self._strict_visual_postcondition
+            ):
                 raise WindowsUiaDriverError(
                     "visual action produced no observable exact-window change"
                 )
@@ -2755,6 +2860,7 @@ class WindowsUiaDriver:
                 elements=elements,
                 wrappers=wrappers,
                 stats=stats,
+                force=capture_screenshot,
             )
         if self._activate_on_observe:
             native.assert_foreground(window.hwnd)
@@ -2776,6 +2882,8 @@ class WindowsUiaDriver:
                 accessibility_text=self._accessibility_text(window, elements, stats),
                 screenshot_png=screenshot_png,
                 window_title=window.title,
+                process_name=window.process_name,
+                class_name=window.class_name,
                 elements=elements,
                 local_window_id=f"hwnd:{window.hwnd}",
                 total_element_count=int(stats["total_element_count"]),
@@ -2786,7 +2894,7 @@ class WindowsUiaDriver:
                 low_credential_count=int(stats["low_credential_count"]),
                 credential_affected_element_count=int(stats["credential_affected_element_count"]),
             )
-            self._snapshots[normalized] = _Snapshot(window.hwnd, observation, wrappers)
+            self._snapshots[normalized] = _Snapshot(window.hwnd, observation, wrappers, root)
             self._pending_observation.discard(normalized)
             if pending_visual_change is not None:
                 self._pending_visual_change.pop(window.hwnd, None)
@@ -2824,6 +2932,7 @@ class WindowsUiaDriver:
         expected: DesktopElement,
         *,
         require_focus: bool = False,
+        trusted_root: Any | None = None,
     ) -> None:
         try:
             current_name = self._raw_name(wrapper)
@@ -2853,6 +2962,11 @@ class WindowsUiaDriver:
             )
             current_secret_labeled = self._runtime_secret_labeled_state(wrapper)
             current_composer = self._runtime_composer_state(wrapper, expected)
+            current_browser_chrome = bool(
+                expected.browser_chrome
+                and trusted_root is not None
+                and self._is_browser_chrome_descendant(wrapper, trusted_root)
+            )
             (
                 current_supported_actions,
                 current_expand_state,
@@ -2907,6 +3021,7 @@ class WindowsUiaDriver:
             expected.editable,
             expected.secret_labeled,
             expected.composer,
+            expected.browser_chrome,
         )
         current_state = (
             _text_digest(current_name),
@@ -2922,6 +3037,7 @@ class WindowsUiaDriver:
             current_editable,
             current_secret_labeled,
             current_composer,
+            current_browser_chrome,
         )
         selection_changed = current_selected != expected.selected and not (
             expected.selected is False and current_selected is None
@@ -3219,10 +3335,16 @@ class WindowsUiaDriver:
             window = self._resolve_window(before.app)
             if window.hwnd != snapshot.hwnd:
                 raise WindowsUiaStaleObservation("the draft composer window changed")
-            native.activate_window(snapshot.hwnd)
+            if self._activate_before_execute:
+                native.activate_window(snapshot.hwnd)
             native.assert_foreground(snapshot.hwnd)
             self._assert_element_usable(wrapper)
-            self._assert_element_still_bound(wrapper, element, require_focus=True)
+            self._assert_element_still_bound(
+                wrapper,
+                element,
+                require_focus=True,
+                trusted_root=snapshot.root,
+            )
             method = self._set_value(wrapper, "")
             native.assert_foreground(snapshot.hwnd)
             return method
@@ -3230,6 +3352,103 @@ class WindowsUiaDriver:
             with self._lock:
                 self._snapshots.pop(normalized, None)
             raise
+
+    def assert_browser_address_bound(
+        self,
+        before: DesktopObservation,
+        element: DesktopElement,
+        *,
+        require_focus: bool = False,
+    ) -> None:
+        """Revalidate private browser-chrome provenance without changing state."""
+
+        normalized = self._normalize_app(before.app)
+        with self._lock:
+            snapshot = self._snapshots.get(normalized)
+            if (
+                snapshot is None
+                or snapshot.observation.generation != before.generation
+                or before.app.casefold() != normalized
+                or normalized in self._pending_observation
+            ):
+                raise WindowsUiaStaleObservation("browser address used a stale observation")
+            observed = [item for item in before.elements if item.index == element.index]
+            wrapper = snapshot.wrappers.get(element.index)
+            if len(observed) != 1 or observed[0] != element or wrapper is None:
+                raise WindowsUiaStaleObservation("browser address binding changed")
+        if not is_verified_browser_address(
+            element,
+            before.process_name,
+            require_focused=require_focus,
+        ):
+            raise WindowsUiaStaleObservation("target lacks private browser-chrome provenance")
+        native = self._native_backend()
+        native.assert_interactive_desktop()
+        window = self._resolve_window(before.app)
+        if window.hwnd != snapshot.hwnd:
+            raise WindowsUiaStaleObservation("browser address window changed")
+        native.assert_foreground(snapshot.hwnd)
+        self._assert_element_usable(wrapper)
+        self._assert_element_still_bound(
+            wrapper,
+            element,
+            require_focus=require_focus,
+            trusted_root=snapshot.root,
+        )
+        native.assert_foreground(snapshot.hwnd)
+
+    def read_element_state(
+        self,
+        before: DesktopObservation,
+        element: DesktopElement,
+    ) -> tuple[str | None, bool | None]:
+        """Read one bound element's live value and keyboard focus without a tree walk.
+
+        A full observation of a browser window costs seconds; a deterministic
+        skill that just sent keystrokes only needs to know whether its exact
+        target has focus and what it now contains. The snapshot must still be
+        the one the caller planned against.
+        """
+
+        normalized = self._normalize_app(before.app)
+        with self._lock:
+            snapshot = self._snapshots.get(normalized)
+            if (
+                snapshot is None
+                or snapshot.observation.generation != before.generation
+                or before.app.casefold() != normalized
+                or normalized in self._pending_observation
+            ):
+                raise WindowsUiaStaleObservation("element state read used a stale observation")
+            wrapper = snapshot.wrappers.get(element.index)
+        if wrapper is None or isinstance(wrapper, _VisualTargetBinding):
+            raise WindowsUiaStaleObservation("element state read has no bound UIA target")
+        _observed, value = self._raw_value_state(wrapper, password=element.password)
+        focus = _safe_call(wrapper, "has_keyboard_focus", None)
+        return value, (bool(focus) if focus is not None else None)
+
+    def visual_region_bbox(
+        self,
+        before: DesktopObservation,
+        element: DesktopElement,
+    ) -> tuple[int, int, int, int] | None:
+        """Return the screenshot-local box of one OCR text region from this snapshot.
+
+        Deterministic skills need geometry to reason about list order (which
+        entry sits under which section header) and to click through the
+        frame-bound viewport; the planner-facing element deliberately carries
+        only the text.
+        """
+
+        normalized = self._normalize_app(before.app)
+        with self._lock:
+            snapshot = self._snapshots.get(normalized)
+            if snapshot is None or snapshot.observation.generation != before.generation:
+                raise WindowsUiaStaleObservation("visual region read used a stale observation")
+            wrapper = snapshot.wrappers.get(element.index)
+        if not isinstance(wrapper, _VisualTargetBinding) or wrapper.viewport:
+            return None
+        return wrapper.bbox
 
     def execute(
         self,
@@ -3264,7 +3483,8 @@ class WindowsUiaDriver:
             window = self._resolve_window(action.app)
             if window.hwnd != snapshot.hwnd:
                 raise WindowsUiaStaleObservation("the selected application window changed")
-            native.activate_window(snapshot.hwnd)
+            if self._activate_before_execute:
+                native.activate_window(snapshot.hwnd)
             native.assert_foreground(snapshot.hwnd)
             method = ""
             after_local_window_id: str | None = None
@@ -3490,7 +3710,11 @@ class WindowsUiaDriver:
                 if action.mouse_button not in {None, "left"} or action.click_count not in {None, 1}:
                     raise WindowsUiaDriverError("only one semantic left click is enabled")
                 assert expected_element is not None
-                self._assert_element_still_bound(wrapper, expected_element)
+                self._assert_element_still_bound(
+                    wrapper,
+                    expected_element,
+                    trusted_root=snapshot.root,
+                )
                 if element_plane(expected_element) == ElementPlane.INPUT:
                     method = self._physical_focus(
                         wrapper,
@@ -3505,7 +3729,11 @@ class WindowsUiaDriver:
             elif action.type == DesktopActionType.PERFORM_SECONDARY_ACTION:
                 assert wrapper is not None and action.action_name is not None
                 assert expected_element is not None
-                self._assert_element_still_bound(wrapper, expected_element)
+                self._assert_element_still_bound(
+                    wrapper,
+                    expected_element,
+                    trusted_root=snapshot.root,
+                )
                 method = self._secondary(
                     wrapper,
                     action.action_name,
@@ -3535,6 +3763,7 @@ class WindowsUiaDriver:
                     wrapper,
                     expected_element,
                     require_focus=True,
+                    trusted_root=snapshot.root,
                 )
                 assert action.text is not None
                 native.assert_foreground(snapshot.hwnd)
@@ -3549,7 +3778,11 @@ class WindowsUiaDriver:
                     or expected_element.editable is False
                 ):
                     raise WindowsUiaDriverError("set_value target is not a verified editable input")
-                self._assert_element_still_bound(wrapper, expected_element)
+                self._assert_element_still_bound(
+                    wrapper,
+                    expected_element,
+                    trusted_root=snapshot.root,
+                )
                 method = self._set_value(wrapper, action.value)
             elif action.type == DesktopActionType.PRESS_KEY:
                 if wrapper is None or _safe_call(wrapper, "has_keyboard_focus", None) is not True:
@@ -3566,6 +3799,7 @@ class WindowsUiaDriver:
                     wrapper,
                     expected_element,
                     require_focus=True,
+                    trusted_root=snapshot.root,
                 )
                 native.assert_foreground(snapshot.hwnd)
                 native.send_hotkey(action.key)
@@ -3573,7 +3807,11 @@ class WindowsUiaDriver:
             elif action.type == DesktopActionType.SCROLL:
                 assert wrapper is not None and action.direction is not None
                 assert expected_element is not None
-                self._assert_element_still_bound(wrapper, expected_element)
+                self._assert_element_still_bound(
+                    wrapper,
+                    expected_element,
+                    trusted_root=snapshot.root,
+                )
                 method_fn = _safe_attr(wrapper, "scroll", None)
                 if not callable(method_fn):
                     raise WindowsUiaDriverError("target element does not expose UIA scrolling")
@@ -3592,11 +3830,21 @@ class WindowsUiaDriver:
                 DesktopActionType.PERFORM_SECONDARY_ACTION,
                 DesktopActionType.PRESS_KEY,
             }:
+                same_window_browser_navigation = (
+                    self._same_window_browser_navigation_fast_path
+                    and self._is_same_window_browser_address_navigation(
+                        action,
+                        snapshot.observation,
+                        expected_element,
+                    )
+                )
                 transitioned = self._wait_for_related_foreground_transition(
                     native,
                     window,
                     timeout=(
-                        2.0
+                        0.0
+                        if same_window_browser_navigation
+                        else 2.0
                         if action.type == DesktopActionType.PRESS_KEY
                         else 0.35
                     ),

@@ -49,6 +49,32 @@ _PATH_CONTROL_CLAUSE_RE = re.compile(
     re.IGNORECASE,
 )
 _PATH_CLAUSE_PUNCTUATION_RE = re.compile(r"[，,。；;!?！？\r\n]")
+_HARD_EXECUTION_ERROR_TYPES = frozenset(
+    {
+        "DesktopUnavailableError",
+        "ForegroundIntegrityBoundary",
+        "PasswordFieldError",
+        "SensitiveVisualSurfaceError",
+    }
+)
+
+
+def _is_path_identity_change(exc: BaseException) -> bool:
+    """Recognize every path-binding race as a non-fallback hard stop."""
+
+    if isinstance(exc, PathSemanticSelectionError):
+        return True
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "identity changed",
+            "target changed",
+            "parent changed",
+            "candidates changed",
+            "selected child changed",
+        )
+    )
 
 
 class NativeRouteStatus(StrEnum):
@@ -58,6 +84,7 @@ class NativeRouteStatus(StrEnum):
     BLOCKED = "blocked"
     CONFIRMATION_REQUIRED = "confirmation_required"
     SUCCEEDED = "succeeded"
+    RETRYABLE_FAILURE = "retryable_failure"
     FAILED = "failed"
 
 
@@ -133,6 +160,7 @@ class NativeSkillRouter:
         self._path_context_lock = threading.RLock()
         self._path_context: PathIdentityBinding | None = None
         self._path_context_updated_at = 0.0
+
         self.workmap_selector = workmap_selector
         self.workmap_index = workmap_index
         if (
@@ -151,6 +179,33 @@ class NativeSkillRouter:
                 # the instruction can still fall through to the desktop loop.
                 self.workmap_index = None
 
+    def _assistive_failure_status(
+        self,
+        status: NativeRouteStatus,
+    ) -> NativeRouteStatus:
+        """Expose the new fallback contract only to the opt-in engine.
+
+        proof_v1 keeps its historical FAILED surface byte-for-byte so existing
+        controller behavior and proof tests do not change.
+        """
+
+        control = getattr(self.settings, "computer_control", None)
+        return (
+            status
+            if getattr(control, "engine", "proof_v1") == "assistive_v1"
+            else NativeRouteStatus.FAILED
+        )
+
+    def _semantic_identity_failure_status(self) -> NativeRouteStatus:
+        """Keep proof_v1's historical pre-plan MISS while assistive fails closed."""
+
+        control = getattr(self.settings, "computer_control", None)
+        return (
+            NativeRouteStatus.BLOCKED
+            if getattr(control, "engine", "proof_v1") == "assistive_v1"
+            else NativeRouteStatus.MISS
+        )
+
     def _current_path_context_binding(self) -> PathIdentityBinding | None:
         with self._path_context_lock:
             binding = self._path_context
@@ -163,13 +218,16 @@ class NativeSkillRouter:
                 self._path_context = None
                 self._path_context_updated_at = 0.0
                 return None
-            if not verify_path_identity_binding(binding):
+            identity_valid = verify_path_identity_binding(binding)
+            directory_valid = bool(identity_valid and binding.path.is_dir())
+            if not directory_valid:
                 self._path_context = None
                 self._path_context_updated_at = 0.0
-                return None
-            if not binding.path.is_dir():
-                self._path_context = None
-                self._path_context_updated_at = 0.0
+                control = getattr(self.settings, "computer_control", None)
+                if getattr(control, "engine", "proof_v1") == "assistive_v1":
+                    raise PathSemanticSelectionError(
+                        "Path context identity changed before relative navigation"
+                    )
                 return None
             return binding
 
@@ -268,6 +326,8 @@ class NativeSkillRouter:
                     raise PathSemanticSelectionError(
                         "WorkMap root changed during child resolution"
                     )
+            except PathSemanticSelectionError:
+                raise
             except PathResolutionError:
                 # A real WorkMap root matched, but the relative tail was absent
                 # or ambiguous. Do not try a stale navigation context instead.
@@ -314,6 +374,8 @@ class NativeSkillRouter:
                 raise PathSemanticSelectionError(
                     "Path context changed during child resolution"
                 )
+        except PathSemanticSelectionError:
+            raise
         except PathResolutionError:
             return None
         return Plan(
@@ -438,6 +500,8 @@ class NativeSkillRouter:
                     tuple(hints),
                     cancel_event=cancel_event,
                 )
+            except PathSemanticSelectionError:
+                raise
             except Exception:
                 return None
             if not isinstance(selected_id, str):
@@ -490,6 +554,8 @@ class NativeSkillRouter:
                     ambiguous_child_selector=chooser,
                     semantic_bindings=semantic_bindings,
                 )
+            except PathSemanticSelectionError:
+                raise
             except PathResolutionError:
                 return True, None, ()
             return (
@@ -546,11 +612,9 @@ class NativeSkillRouter:
             if PureWindowsPath(contextual_query).suffix:
                 return True, None, ()
             return False, None, ()
-        except (
-            AmbiguousPathError,
-            PathSearchBudgetExceeded,
-            PathSemanticSelectionError,
-        ):
+        except PathSemanticSelectionError:
+            raise
+        except (AmbiguousPathError, PathSearchBudgetExceeded):
             return True, None, ()
         except PathResolutionError:
             return True, None, ()
@@ -619,6 +683,7 @@ class NativeSkillRouter:
             return None
         usable: list[Mapping[str, object]] = []
         seen_ids: set[str] = set()
+        candidate_bindings: dict[str, PathIdentityBinding] = {}
         for hint in raw_hints:
             if not isinstance(hint, Mapping) or hint.get("target_available") is not True:
                 continue
@@ -627,11 +692,18 @@ class NativeSkillRouter:
                 continue
             try:
                 available_target = binder(candidate_id)
-            except (OSError, RuntimeError, ValueError, WorkMapError):
+            except (OSError, RuntimeError, ValueError, WorkMapError) as exc:
+                if _is_path_identity_change(exc):
+                    raise
                 continue
             if available_target is None:
                 continue
+            try:
+                candidate_binding = bind_path_identity(Path(available_target))
+            except PathSemanticSelectionError:
+                continue
             seen_ids.add(candidate_id)
+            candidate_bindings[candidate_id] = candidate_binding
             usable.append(hint)
         if not 2 <= len(usable) <= 5:
             return None
@@ -641,6 +713,8 @@ class NativeSkillRouter:
                 tuple(usable),
                 cancel_event=cancel_event,
             )
+        except PathSemanticSelectionError:
+            raise
         except Exception:
             # A cloud/CLI/protocol failure is always a planner miss. It must
             # never turn into a guessed path or a partially prepared action.
@@ -649,14 +723,29 @@ class NativeSkillRouter:
             return None
         try:
             target = binder(selected_id)
-        except (OSError, RuntimeError, ValueError, WorkMapError):
-            return None
+        except (OSError, RuntimeError, ValueError, WorkMapError) as exc:
+            if _is_path_identity_change(exc):
+                raise
+            raise PathSemanticSelectionError(
+                "WorkMap selected candidate identity changed during semantic selection"
+            ) from exc
         if target is None:
-            return None
+            raise PathSemanticSelectionError(
+                "WorkMap selected candidate disappeared during semantic selection"
+            )
         try:
             rebound = Path(target).resolve(strict=True)
-        except (OSError, RuntimeError):
-            return None
+        except (OSError, RuntimeError) as exc:
+            if _is_path_identity_change(exc):
+                raise
+            raise PathSemanticSelectionError(
+                "WorkMap selected candidate identity changed during semantic selection"
+            ) from exc
+        initial_binding = candidate_bindings[selected_id]
+        if rebound != initial_binding.path or not verify_path_identity_binding(initial_binding):
+            raise PathSemanticSelectionError(
+                "WorkMap selected candidate identity changed during semantic selection"
+            )
         return Plan(
             "打开由 WorkMap 候选语义选择并重新绑定的本地资源",
             [Action(ActionType.OPEN_PATH, path=str(rebound))],
@@ -727,22 +816,46 @@ class NativeSkillRouter:
         explicit_submission: bool = False,
         cancel_event: threading.Event | None = None,
     ) -> NativeSkillResult:
-        plan = self._deterministic_path_plan(text)
+        try:
+            plan = self._deterministic_path_plan(text)
+        except Exception as exc:
+            if not _is_path_identity_change(exc):
+                raise
+            return NativeSkillResult(
+                status=self._semantic_identity_failure_status(),
+                message=f"NATIVE_PREPARE_FAILED: {type(exc).__name__}: {exc}",
+            )
         semantic_path_matched = False
         semantic_path_bindings: tuple[PathIdentityBinding, ...] = ()
         if plan is None or (plan.source == "deterministic" and self._single_open_path(plan)):
-            (
-                semantic_path_matched,
-                semantic_path,
-                semantic_path_bindings,
-            ) = self._semantic_deep_path_plan(
-                text,
-                cancel_event=cancel_event,
-            )
+            try:
+                (
+                    semantic_path_matched,
+                    semantic_path,
+                    semantic_path_bindings,
+                ) = self._semantic_deep_path_plan(
+                    text,
+                    cancel_event=cancel_event,
+                )
+            except Exception as exc:
+                if not _is_path_identity_change(exc):
+                    raise
+                return NativeSkillResult(
+                    status=self._semantic_identity_failure_status(),
+                    message=f"NATIVE_PREPARE_FAILED: {type(exc).__name__}: {exc}",
+                )
             if semantic_path is not None:
                 plan = semantic_path
         if plan is None and not semantic_path_matched:
-            plan = self._semantic_workmap_plan(text, cancel_event=cancel_event)
+            try:
+                plan = self._semantic_workmap_plan(text, cancel_event=cancel_event)
+            except Exception as exc:
+                if not _is_path_identity_change(exc):
+                    raise
+                return NativeSkillResult(
+                    status=self._semantic_identity_failure_status(),
+                    message=f"NATIVE_PREPARE_FAILED: {type(exc).__name__}: {exc}",
+                )
         if plan is None:
             plan = self.parser.parse(text)
             covered = plan is not None and self._covers_full_request(text, plan)
@@ -759,7 +872,7 @@ class NativeSkillRouter:
         ):
             failed = replace(plan, risk=RiskLevel.BLOCKED, summary="语义路径身份已变化")
             return NativeSkillResult(
-                status=NativeRouteStatus.FAILED,
+                status=self._assistive_failure_status(NativeRouteStatus.BLOCKED),
                 message="NATIVE_PREPARE_FAILED: selected path identity changed",
                 plan=failed,
             )
@@ -768,7 +881,11 @@ class NativeSkillRouter:
         except Exception as exc:
             failed = replace(plan, risk=RiskLevel.BLOCKED, summary="本地目标解析失败")
             return NativeSkillResult(
-                status=NativeRouteStatus.FAILED,
+                status=self._assistive_failure_status(
+                    NativeRouteStatus.BLOCKED
+                    if _is_path_identity_change(exc)
+                    else NativeRouteStatus.RETRYABLE_FAILURE
+                ),
                 message=f"NATIVE_PREPARE_FAILED: {type(exc).__name__}: {exc}",
                 plan=failed,
             )
@@ -777,7 +894,7 @@ class NativeSkillRouter:
         ):
             failed = replace(prepared, risk=RiskLevel.BLOCKED, summary="语义路径身份已变化")
             return NativeSkillResult(
-                status=NativeRouteStatus.FAILED,
+                status=self._assistive_failure_status(NativeRouteStatus.BLOCKED),
                 message="NATIVE_PREPARE_FAILED: selected path identity changed during prepare",
                 plan=failed,
             )
@@ -822,7 +939,11 @@ class NativeSkillRouter:
                     safe_path_binding = after_classification
             except Exception as exc:
                 return NativeSkillResult(
-                    status=NativeRouteStatus.FAILED,
+                    status=self._assistive_failure_status(
+                        NativeRouteStatus.BLOCKED
+                        if _is_path_identity_change(exc)
+                        else NativeRouteStatus.RETRYABLE_FAILURE
+                    ),
                     message=f"NATIVE_PATH_BINDING_FAILED: {type(exc).__name__}: {exc}",
                     plan=evaluated,
                 )
@@ -830,7 +951,7 @@ class NativeSkillRouter:
             semantic_path_bindings
         ):
             return NativeSkillResult(
-                status=NativeRouteStatus.FAILED,
+                status=self._assistive_failure_status(NativeRouteStatus.BLOCKED),
                 message="NATIVE_PATH_BINDING_FAILED: selected path identity changed",
                 plan=evaluated,
             )
@@ -847,7 +968,7 @@ class NativeSkillRouter:
                 # full binding can be retained, never confirm a different
                 # same-named object later.
                 return NativeSkillResult(
-                    status=NativeRouteStatus.FAILED,
+                    status=self._assistive_failure_status(NativeRouteStatus.BLOCKED),
                     message=(
                         "NATIVE_PATH_BINDING_FAILED: semantic path confirmation "
                         "cannot retain intermediate identities"
@@ -879,7 +1000,11 @@ class NativeSkillRouter:
                 results = tuple(self.executor.execute_plan(evaluated))
         except Exception as exc:
             return NativeSkillResult(
-                status=NativeRouteStatus.FAILED,
+                status=self._assistive_failure_status(
+                    NativeRouteStatus.BLOCKED
+                    if _is_path_identity_change(exc)
+                    else NativeRouteStatus.RETRYABLE_FAILURE
+                ),
                 message=f"NATIVE_EXECUTION_FAILED: {type(exc).__name__}: {exc}",
                 plan=evaluated,
             )
@@ -888,9 +1013,26 @@ class NativeSkillRouter:
         if not completed:
             failure = next((result.message for result in results if not result.success), None)
             message = failure or "动作已请求，但缺少逐动作的本地后置条件证据"
+            hard_boundary = next(
+                (
+                    str(result.evidence.get("error_type"))
+                    for result in results
+                    if not result.success
+                    and result.evidence.get("error_type") in _HARD_EXECUTION_ERROR_TYPES
+                ),
+                None,
+            )
             return NativeSkillResult(
-                status=NativeRouteStatus.FAILED,
-                message=f"NATIVE_EXECUTION_FAILED: {message}",
+                status=self._assistive_failure_status(
+                    NativeRouteStatus.BLOCKED
+                    if hard_boundary is not None
+                    else NativeRouteStatus.RETRYABLE_FAILURE
+                ),
+                message=(
+                    f"NATIVE_EXECUTION_BLOCKED: {hard_boundary}: {message}"
+                    if hard_boundary is not None
+                    else f"NATIVE_EXECUTION_FAILED: {message}"
+                ),
                 plan=evaluated,
                 execution_results=results,
             )
