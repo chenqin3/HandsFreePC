@@ -233,6 +233,16 @@ PR1 复核时补上的关键修正（gpt-sol 版本之外）：
 - 浏览器：URL 目标要求页面 Document 元素的地址也是目标 URL（地址栏一回车就变，页面还没加载）；草稿技能排在导航之后，最多等 10 秒让 ChatGPT 这类重页面渲染出输入框，每次轮询重新读窗口清单（未配置的 Chrome 窗口 ID 绑定标题，标题随页面变化）。
 - 场景套件新增 `open_workmap_folder`（默认打开 Downloads，用 `HANDSFREEPC_SCENARIO_FOLDER_COMMAND` / `HANDSFREEPC_SCENARIO_FOLDER_PATH` 换成项目地图缩写和对应目录）、`chrome_chatgpt_draft`、`wechat_send_file_self`（发文件有副作用，只有 `HANDSFREEPC_SCENARIO_WECHAT_SEND_COMMAND` 给出指向本机真实文件的口语指令时才运行）。验收用例只放中性示例，本机文件名通过环境变量注入。
 
+## 方向切换：`engine: kimi_agent`（2026-09-02 深夜）
+
+用户实测 UIA 路线仍不可靠且"太笨、太多东西要自己弄"，而用 Kimi Code CLI 直接以键鼠（截图→看图算坐标→pyautogui→截图核对）操作桌面全部成功，于是把执行层整体换成 Kimi：
+
+- `handsfree_pc/desktop/kimi_agent.py`：`KimiAgentController` 实现原 `Controller` 协议，每条语音指令 → `kimi -p "<前言>\n用户指令：<转写>" --output-format stream-json`，工作目录默认用户主目录（技能、WorkMap、`gui_control` 脚本都在那里）。`-p` 模式本身免审批执行（与 `--yolo/--auto` 互斥）。流式解析 assistant/tool/meta 事件：每次工具调用写 diagnostics（`KIMI_TOOL_CALL`），最终文本里的 `RESULT: 成功|失败 - 说明` 决定成败，`SCREENSHOT:` 给出核对截图；无 verdict → `KIMI_NO_VERDICT`；超时/取消会杀掉整个进程树。
+- 前言要求代理按 `~/.kimi-code/skills/gui-control/SKILL.md`（用户那轮 Kimi 会话沉淀的技能）的"意图定位"原则对转写做模糊匹配、"不要发送"绝不回车、Claude 默认 Code 页签、找文件用 find 按 mtime（下载目录几千个文件，Glob 会超时）。
+- 配置：`computer_control.engine: kimi_agent`，`kimi_executable / kimi_working_directory / kimi_model / kimi_skills_dir / kimi_preamble_file / kimi_resume_session`；要求 `privacy.allow_cloud_planner: true`；failure_policy 默认 continue。语音前端、队列、反馈、急停全部沿用。
+- 非交互验收（6/6 通过，均由最终截图核对）：发文件到文件传输助手 223 s；Codex 找会话输入不发 94 s；Claude Code 找会话输入不发 92 s；Chrome 开 ChatGPT 新对话输入不发 78 s；打开 G 盘项目文件夹 66 s；微信找联系人打开聊天 66 s。
+- 已知代价：每条指令 1–4 分钟（每步一次视觉模型调用），比 assistive 确定性技能慢一个数量级，但覆盖面和鲁棒性远好于 UIA。proof_v1/assistive_v1 保留可选。
+
 已知缺口（进入 PR2/PR3）：
 - 微信/Codex 视觉规划器路径仍然慢而不可靠（仅作为技能失败后的兜底）；后台窗口截图会抓到叠在上面的其他窗口内容，所以观察前必须激活。
 - 会话/草稿技能踩过两个坑（已修）：① 微信搜索下拉是网络加载、布局不稳，会话已经打开时不该再搜——现在先截图看标题栏，已打开则零动作成功；② 导航后打草稿要重新观察前台窗口，否则读到的是地址栏那份旧观察（ChatGPT 输入框尚未渲染）。

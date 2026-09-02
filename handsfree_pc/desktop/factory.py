@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..computer_control import CodexComputerController, Controller
 from ..config import Settings
 from ..windows.executor import WindowsExecutor
@@ -22,6 +24,24 @@ def build_computer_controller(
     """Build the explicit controller backend; never silently fall back to legacy Codex."""
 
     control = settings.computer_control
+    if control.engine == "kimi_agent":
+        # The Kimi agent needs no UIA driver, planner, or native router: every
+        # command is handed to `kimi -p`, which drives the desktop itself.
+        from .kimi_agent import KimiAgentController
+
+        preamble = None
+        if control.kimi_preamble_file is not None:
+            preamble = Path(control.kimi_preamble_file).read_text(encoding="utf-8")
+        return KimiAgentController(
+            executable=control.kimi_executable,
+            working_directory=control.kimi_working_directory,
+            model=control.kimi_model,
+            preamble=preamble,
+            skills_dir=control.kimi_skills_dir,
+            timeout_seconds=control.timeout_seconds,
+            resume_session=control.kimi_resume_session,
+            diagnostics=diagnostics,
+        )
     if control.backend == "legacy_codex_cli":
         control.working_directory.mkdir(parents=True, exist_ok=True)
         return CodexComputerController(

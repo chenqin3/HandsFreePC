@@ -1338,8 +1338,8 @@ def live_configuration_blocker(settings: object) -> str | None:
     control = getattr(settings, "computer_control", None)
     if not bool(getattr(control, "enabled", False)):
         return "computer_control.enabled must be true"
-    if str(getattr(control, "engine", "")).casefold() != "assistive_v1":
-        return "computer_control.engine must be assistive_v1"
+    if str(getattr(control, "engine", "")).casefold() not in {"assistive_v1", "kimi_agent"}:
+        return "computer_control.engine must be assistive_v1 or kimi_agent"
     if str(getattr(control, "backend", "")).casefold() != "local_agent":
         return "computer_control.backend must be local_agent"
     if str(getattr(control, "driver", "")).casefold() != "windows_uia":

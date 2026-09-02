@@ -126,6 +126,28 @@ execution:
 
 `--draft-smoke` 只会在可唯一、安全绑定的非密码编辑框中写入一个随机测试 token，再通过 fresh observe 和 LocalVerifier 读回；**不会点击发送，也不会替你提交 prompt**。成功后只在当前字段仍精确等于本轮随机 token 时自动清空，并再次观察确认空白；若编辑框不唯一、没有可靠焦点、目标是敏感字段、界面无法读回或精确清理无法验收，命令会失败关闭。
 
+## 用 Kimi Code CLI 作为执行代理（`engine: kimi_agent`）
+
+这是目前最省事、覆盖面最广的执行方式：语音前端（唤醒、转写、`over` 分段、FIFO 队列、反馈、急停）不变，每条指令交给 [Kimi Code CLI](https://moonshotai.github.io/kimi-code/) 的非交互模式执行——Kimi 加载你自己的 `gui-control` 技能，用"截图 → 看图算坐标 → pyautogui 点击/粘贴 → 再截图核对"的方式操作任何应用，不依赖 UI Automation。
+
+前提：装好 `kimi`（`kimi login` 完成登录），本机有一个描述键鼠操作方法的用户技能（`~/.kimi-code/skills/gui-control/SKILL.md`，配套的 pyautogui venv 与脚本），`privacy.allow_cloud_planner: true`。
+
+```yaml
+privacy:
+  allow_cloud_planner: true
+computer_control:
+  enabled: true
+  engine: kimi_agent
+  kimi_executable: kimi          # 或绝对路径
+  kimi_working_directory: null   # 默认用户主目录，技能/WorkMap/脚本都在那里
+  kimi_model: null               # 默认用 Kimi 配置里的 default_model
+  timeout_seconds: 600           # 每条指令上限；发文件这类任务约 1–4 分钟
+```
+
+工作方式：`kimi -p "<前言>\n用户指令：<转写>" --output-format stream-json`（`-p` 模式免审批执行，不能再加 `--yolo/--auto`）。前言要求代理把含糊的转写当线索对真实清单做模糊匹配、"不要发送"绝不回车、最后两行输出 `RESULT: 成功|失败 - 说明` 和 `SCREENSHOT: 路径`；控制器据此判成败并把说明念/显示给你，每次工具调用都写入本地诊断日志（`KIMI_TOOL_CALL`）。取消/急停会杀掉整棵 Kimi 进程树。可用 `kimi_preamble_file` 换掉前言，`kimi_skills_dir` 指定技能目录。
+
+实测（非交互、逐条由最终截图核对）：发文件到微信文件传输助手 223 s；Codex / Claude Code 找会话并输入草稿 ~93 s；Chrome 开 ChatGPT 新对话输入草稿 78 s；打开项目文件夹 66 s；微信找联系人 66 s。代价是每步一次视觉模型调用，比下面的确定性技能慢，但几乎不用为具体应用写任何代码。
+
 ## 启用连续桌面 agent
 
 任意 UI 任务通常需要单步 planner。Codex 和 Claude 都可以规划；真正执行动作的仍是本地 `DesktopDriver`。只在被 Git 忽略的 `config.local.yaml` 中显式授权：

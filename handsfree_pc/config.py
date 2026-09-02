@@ -160,6 +160,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "open_computer_use_args": ["mcp"],
         "allow_experimental_driver": False,
         "allow_coordinate_actions": False,
+        # engine: kimi_agent hands every command to Kimi Code CLI (kimi -p),
+        # which drives the desktop with its gui-control skill.
+        "kimi_executable": "kimi",
+        "kimi_working_directory": None,
+        "kimi_model": None,
+        "kimi_skills_dir": None,
+        "kimi_preamble_file": None,
+        "kimi_resume_session": False,
     },
     "visual_ocr": {
         "enabled": False,
@@ -553,6 +561,12 @@ class ComputerControlSettings:
     open_computer_use_args: list[str]
     allow_experimental_driver: bool
     allow_coordinate_actions: bool
+    kimi_executable: str = "kimi"
+    kimi_working_directory: Path | None = None
+    kimi_model: str | None = None
+    kimi_skills_dir: Path | None = None
+    kimi_preamble_file: Path | None = None
+    kimi_resume_session: bool = False
 
 
 @dataclass(slots=True)
@@ -663,7 +677,8 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
     computer_control_raw = raw["computer_control"]
     loaded_control = loaded.get("computer_control")
     if (
-        str(computer_control_raw.get("engine", "proof_v1")).casefold() == "assistive_v1"
+        str(computer_control_raw.get("engine", "proof_v1")).casefold()
+        in {"assistive_v1", "kimi_agent"}
         and (
             not isinstance(loaded_control, dict)
             or "failure_policy" not in loaded_control
@@ -955,6 +970,26 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
                 section="computer_control",
             ),
             send_policy=send_policy,
+            kimi_executable=str(computer_control_raw.get("kimi_executable") or "kimi"),
+            kimi_working_directory=(
+                _expand_path(str(computer_control_raw["kimi_working_directory"]), base_dir=base_dir)
+                if computer_control_raw.get("kimi_working_directory")
+                else None
+            ),
+            kimi_model=_optional_string(
+                computer_control_raw, "kimi_model", section="computer_control"
+            ),
+            kimi_skills_dir=(
+                _expand_path(str(computer_control_raw["kimi_skills_dir"]), base_dir=base_dir)
+                if computer_control_raw.get("kimi_skills_dir")
+                else None
+            ),
+            kimi_preamble_file=(
+                _expand_path(str(computer_control_raw["kimi_preamble_file"]), base_dir=base_dir)
+                if computer_control_raw.get("kimi_preamble_file")
+                else None
+            ),
+            kimi_resume_session=bool(computer_control_raw.get("kimi_resume_session", False)),
             open_computer_use_executable=str(computer_control_raw["open_computer_use_executable"]),
             open_computer_use_args=_require_string_list(
                 computer_control_raw,
@@ -1106,8 +1141,16 @@ def _validate(settings: Settings) -> None:
         )
     if settings.computer_control.backend not in {"local_agent", "legacy_codex_cli"}:
         raise ValueError("computer_control.backend must be local_agent or legacy_codex_cli")
-    if settings.computer_control.engine not in {"proof_v1", "assistive_v1"}:
-        raise ValueError("computer_control.engine must be proof_v1 or assistive_v1")
+    if settings.computer_control.engine not in {"proof_v1", "assistive_v1", "kimi_agent"}:
+        raise ValueError("computer_control.engine must be proof_v1, assistive_v1, or kimi_agent")
+    if settings.computer_control.engine == "kimi_agent":
+        if not settings.privacy.allow_cloud_planner:
+            raise ValueError(
+                "computer_control.engine=kimi_agent requires privacy.allow_cloud_planner=true "
+                "because transcripts and screenshots are handled by the Kimi agent"
+            )
+        if not settings.computer_control.kimi_executable.strip():
+            raise ValueError("computer_control.kimi_executable must be a non-empty string")
     if settings.computer_control.driver not in {
         "windows_uia",
         "open_computer_use",

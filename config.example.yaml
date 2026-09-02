@@ -112,8 +112,22 @@ planner:
 computer_control:
   enabled: false
   # proof_v1 preserves the existing proof-oriented controller. assistive_v1 is
-  # the opt-in task-goal controller; keep the public default on proof_v1.
+  # the opt-in task-goal controller. kimi_agent hands every spoken command to
+  # Kimi Code CLI (`kimi -p`), which drives the desktop with its gui-control
+  # skill (screenshot -> look -> pyautogui -> verify); it needs no UIA driver
+  # and requires privacy.allow_cloud_planner: true. Keep the public default on
+  # proof_v1.
   engine: proof_v1
+  # kimi_agent settings (ignored by the other engines)
+  kimi_executable: kimi
+  # Working directory for the agent; null means the user's home so the skill,
+  # WorkMap, and helper scripts are all in reach.
+  kimi_working_directory: null
+  kimi_model: null
+  kimi_skills_dir: null
+  # Optional file whose text replaces the built-in instruction preamble.
+  kimi_preamble_file: null
+  kimi_resume_session: false
   backend: local_agent
   driver: windows_uia
   # strict requires each generic task to name exactly one configured app.
