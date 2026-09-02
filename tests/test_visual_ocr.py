@@ -172,15 +172,25 @@ def test_more_than_configured_visual_regions_fails_instead_of_truncating() -> No
         client.ocr_png(_png())
 
 
-@pytest.mark.parametrize(
-    "text",
-    ["Password", "验证码", "立即付款", "sk-proj-" + "abcdefghijklmnop"],
-)
-def test_authentication_payment_and_credential_surfaces_are_rejected(text: str) -> None:
+def test_a_visible_secret_pattern_still_blocks_ocr() -> None:
+    client = VisualOcrClient(
+        "http://127.0.0.1:8766/layout-parsing",
+        transport=lambda *_args: _response(_block("sk-proj-" + "abcdefghijklmnop")),
+    )
+
+    with pytest.raises(SensitiveVisualSurfaceError):
+        client.ocr_png(_png())
+
+
+@pytest.mark.parametrize("text", ["Password", "验证码", "立即付款", "扫码登录", "微信支付"])
+def test_chat_wording_no_longer_blocks_ocr(text: str) -> None:
+    # A chat that merely mentions login/payment words is not a credential
+    # surface; real password fields are hard-blocked at the UIA layer instead.
     client = VisualOcrClient(
         "http://127.0.0.1:8766/layout-parsing",
         transport=lambda *_args: _response(_block(text)),
     )
 
-    with pytest.raises(SensitiveVisualSurfaceError):
-        client.ocr_png(_png())
+    result = client.ocr_png(_png())
+
+    assert result.blocks[0].text == text

@@ -215,3 +215,33 @@ def test_search_after_an_app_name_is_free_form_not_an_app_name() -> None:
     task = parse_task("切换到 Chrome 搜索 北京天气")
 
     assert task.goals == (Goal(GoalKind.FREE_FORM, "切换到 Chrome 搜索 北京天气"),)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "在微信里找 sensa",
+        "打开微信 sensa",
+        "微信 sensa",
+        "微信联系人 sensa",
+        "在微信里搜索 sensa",
+        "切换到微信 找 sensa",
+        "在微信里打开和 sensa 的聊天",
+    ],
+)
+def test_natural_wechat_contact_phrasings_reach_the_conversation_skill(text: str) -> None:
+    task = parse_task(text)
+    assert task.goals == (
+        Goal(GoalKind.APP_FOREGROUND, "wechat"),
+        Goal(GoalKind.CONVERSATION_SELECTED, "sensa", app="wechat"),
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["切换到微信", "切换到微信聊天", "切换到 Claude", "打开资源管理器"],
+)
+def test_bare_app_switch_is_not_turned_into_a_conversation(text: str) -> None:
+    task = parse_task(text)
+    assert len(task.goals) == 1
+    assert task.goals[0].kind == GoalKind.APP_FOREGROUND

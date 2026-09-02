@@ -96,6 +96,63 @@ def _prompt(
     return f"{_ASSISTIVE_POLICY}\nUntrusted JSON state follows:\n{data}"
 
 
+# Fields the local DesktopAction validator accepts for each action type. The
+# planner schema forces every field to be present (most null), and coding models
+# also tend to fill plausible-but-irrelevant fields (a "clickfocus" action_name
+# on a plain click, a key on a scroll). Rather than reject an otherwise usable
+# step, keep only the fields that belong to the chosen action type.
+_ACTION_APPLICABLE_FIELDS: dict[str, tuple[str, ...]] = {
+    "click": ("element_index", "x", "y", "click_count", "mouse_button"),
+    "perform_secondary_action": ("element_index", "action_name"),
+    "scroll": ("element_index", "direction", "pages"),
+    "type_text": ("element_index", "text"),
+    "press_key": ("element_index", "key"),
+    "set_value": ("element_index", "value"),
+}
+
+
+def _coerce_action_payload(
+    raw_action: dict[str, Any],
+    *,
+    observation: DesktopObservation,
+) -> dict[str, Any]:
+    action_type = raw_action.get("type")
+    applicable = _ACTION_APPLICABLE_FIELDS.get(str(action_type), ())
+    coerced: dict[str, Any] = {"type": action_type}
+    for field in applicable:
+        value = raw_action.get(field)
+        if value is not None:
+            coerced[field] = value
+    element_index = coerced.get("element_index")
+    target = None
+    if isinstance(element_index, str):
+        target = next(
+            (item for item in observation.elements if item.index == element_index),
+            None,
+        )
+    if action_type == "click" and (coerced.get("x") is not None or coerced.get("y") is not None):
+        is_ocr_text = bool(
+            target is not None
+            and getattr(target, "visual_ocr", False)
+            and target.control_type.casefold() == "visualtext"
+        )
+        if is_ocr_text:
+            # An OCR text target is clicked at its rebound center, never at a
+            # raw point; a coordinate click is for the screenshot viewport only.
+            coerced.pop("x", None)
+            coerced.pop("y", None)
+        else:
+            # The model sees a bounded (possibly downscaled) image; the driver
+            # needs capture-pixel coordinates of the real window.
+            x, y = _planner_point_to_capture(
+                raw_action.get("x"),
+                raw_action.get("y"),
+                observation=observation,
+            )
+            coerced["x"], coerced["y"] = x, y
+    return coerced
+
+
 def _parse_decision(
     payload: Any,
     *,
@@ -129,34 +186,24 @@ def _parse_decision(
                 raise ValueError("action app must match the current observation")
             if not isinstance(raw_action, dict):
                 raise ValueError("action payload must be an object")
-            if raw_action.get("x") is not None or raw_action.get("y") is not None:
-                if raw_action.get("type") == "click":
-                    # The model sees a bounded (possibly downscaled) image; the
-                    # driver needs capture-pixel coordinates of the real window.
-                    x, y = _planner_point_to_capture(
-                        raw_action.get("x"),
-                        raw_action.get("y"),
-                        observation=observation,
-                    )
-                    raw_action = {**raw_action, "x": x, "y": y}
-                else:
-                    # Models sometimes echo a point on scroll/key actions; the
-                    # point is meaningless there and would fail validation.
-                    raw_action = {**raw_action, "x": None, "y": None}
+            raw_action = _coerce_action_payload(raw_action, observation=observation)
             action = DesktopAction.from_dict(
                 raw_action,
                 app=observation.app,
                 generation=observation.generation,
             )
-        elif raw_action is not None:
+        elif isinstance(raw_action, dict) and raw_action.get("type") is not None:
             raise ValueError("only action decisions may contain an action")
         if (
             kind in {AssistiveDecisionKind.OBSERVE, AssistiveDecisionKind.SCREENSHOT}
             and app is None
         ):
             raise ValueError("observe/screenshot requires an app")
-        if kind in {AssistiveDecisionKind.DONE, AssistiveDecisionKind.FAIL} and app is not None:
-            raise ValueError("done/fail requires app to be null")
+        if kind in {AssistiveDecisionKind.DONE, AssistiveDecisionKind.FAIL}:
+            # The schema forces every field present, so the model often echoes
+            # the current app on done/fail. It is meaningless there; clear it
+            # rather than rejecting an otherwise valid terminal decision.
+            app = None
         return AssistiveDecision(kind=kind, reason=reason, app=app, action=action)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DesktopPlannerError(f"assistive planner output failed validation: {exc}") from exc

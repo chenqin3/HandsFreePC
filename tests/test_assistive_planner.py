@@ -99,8 +99,6 @@ def test_assistive_parser_rejects_an_expectation_instead_of_rewriting_it() -> No
     "payload",
     [
         {"kind": "done", "reason": "done", "action": None},
-        {"kind": "done", "reason": "done", "app": "chrome", "action": None},
-        {"kind": "fail", "reason": "failed", "app": "chrome", "action": None},
         {"kind": "observe", "reason": "look", "app": None, "action": None},
         {"kind": "screenshot", "reason": "look", "app": None, "action": None},
         {
@@ -114,6 +112,18 @@ def test_assistive_parser_rejects_an_expectation_instead_of_rewriting_it() -> No
 def test_assistive_parser_rejects_cross_field_schema_semantic_mismatches(payload) -> None:
     with pytest.raises(DesktopPlannerError):
         _parse_decision(payload, observation=_observation())
+
+
+@pytest.mark.parametrize("kind", ["done", "fail"])
+def test_assistive_parser_clears_an_echoed_app_on_terminal_decisions(kind) -> None:
+    # The schema forces `app` to be present, so the model routinely echoes the
+    # current app on done/fail; that is tolerated and the app is cleared.
+    payload = {"kind": kind, "reason": "terminal", "app": "chrome", "action": None}
+
+    decision = _parse_decision(payload, observation=_observation())
+
+    assert decision.kind == AssistiveDecisionKind(kind)
+    assert decision.app is None
 
 
 def test_assistive_parser_preserves_exact_text_action_payload() -> None:
@@ -241,3 +251,100 @@ def test_assistive_planner_rejects_unknown_reasoning_effort() -> None:
             timeout_seconds=1,
             reasoning_effort="turbo",
         )
+
+
+def _obs_for_planner():
+    from handsfree_pc.desktop.protocol import (
+        DesktopElement,
+        DesktopElementAction,
+        DesktopObservation,
+        ElementPlane,
+    )
+
+    return DesktopObservation(
+        app="weixin-1",
+        generation=3,
+        accessibility_text="wechat",
+        window_title="微信",
+        process_name="Weixin.exe",
+        local_window_id="hwnd:9",
+        elements=(
+            DesktopElement(
+                "5",
+                "文件传输助手",
+                "VisualText",
+                plane=ElementPlane.CONTROL,
+                editable=False,
+                visual_ocr=True,
+                local_identity="a" * 64,
+                supported_actions=(DesktopElementAction.CLICK,),
+            ),
+        ),
+        screenshot_png=b"\x89PNG\r\n\x1a\n" + b"\x00" * 32,
+    )
+
+
+def test_planner_click_tolerates_a_stray_action_name_field():
+    from handsfree_pc.desktop.assistive.planner import _parse_decision
+    from handsfree_pc.desktop.protocol import DesktopActionType
+
+    payload = {
+        "kind": "action",
+        "reason": "click the search box",
+        "app": "weixin-1",
+        "action": {
+            "type": "click",
+            "element_index": "5",
+            "x": None,
+            "y": None,
+            "click_count": None,
+            "mouse_button": None,
+            "direction": None,
+            "pages": None,
+            "action_name": "clickfocus",
+            "text": None,
+            "key": None,
+            "value": None,
+        },
+    }
+    decision = _parse_decision(payload, observation=_obs_for_planner())
+    assert decision.action.type == DesktopActionType.CLICK
+    assert decision.action.action_name is None
+    assert decision.action.element_index == "5"
+
+
+def test_planner_done_with_echoed_app_is_accepted():
+    from handsfree_pc.desktop.assistive.models import AssistiveDecisionKind
+    from handsfree_pc.desktop.assistive.planner import _parse_decision
+
+    payload = {"kind": "done", "reason": "goal reached", "app": "weixin-1", "action": None}
+    decision = _parse_decision(payload, observation=_obs_for_planner())
+    assert decision.kind == AssistiveDecisionKind.DONE
+    assert decision.app is None
+
+
+def test_planner_click_on_ocr_target_drops_raw_point():
+    from handsfree_pc.desktop.assistive.planner import _parse_decision
+
+    payload = {
+        "kind": "action",
+        "reason": "click the OCR result",
+        "app": "weixin-1",
+        "action": {
+            "type": "click",
+            "element_index": "5",
+            "x": 1200,
+            "y": 800,
+            "click_count": None,
+            "mouse_button": None,
+            "direction": None,
+            "pages": None,
+            "action_name": None,
+            "text": None,
+            "key": None,
+            "value": None,
+        },
+    }
+    decision = _parse_decision(payload, observation=_obs_for_planner())
+    assert decision.action.x is None and decision.action.y is None
+    assert decision.action.element_index == "5"

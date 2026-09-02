@@ -28,43 +28,6 @@ class SensitiveVisualSurfaceError(VisualOcrError):
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_SENSITIVE_SURFACE_TERMS = (
-    "password",
-    "passcode",
-    "security code",
-    "verification code",
-    "recovery code",
-    "recovery phrase",
-    "seed phrase",
-    "private key",
-    "api key",
-    "access token",
-    "sign in",
-    "log in",
-    "login",
-    "authentication",
-    "authenticator",
-    "payment",
-    "credit card",
-    "debit card",
-    "bank transfer",
-    "密码",
-    "口令",
-    "验证码",
-    "安全码",
-    "恢复码",
-    "助记词",
-    "私钥",
-    "密钥",
-    "访问令牌",
-    "登录",
-    "身份验证",
-    "支付",
-    "付款",
-    "转账",
-    "信用卡",
-    "银行卡",
-)
 
 
 def is_loopback_visual_ocr_endpoint(endpoint: str) -> bool:
@@ -245,11 +208,17 @@ def _bbox(value: Any, *, width: int, height: int) -> tuple[int, int, int, int]:
 
 
 def _surface_is_sensitive(blocks: Sequence[VisualOcrBlock]) -> bool:
+    """Refuse OCR only for an actual visible secret, never for chat wording.
+
+    Real credential surfaces are already hard-blocked at the UIA layer (password
+    and secret-labeled fields). A broad keyword scan over chat OCR text used to
+    flag ordinary conversations that merely mention 登录/验证码/支付, disabling
+    the whole window; that false positive is worse than useless for a chat app,
+    so only a high-confidence secret pattern (keys, tokens, seed phrases) blocks.
+    """
+
     joined = "\n".join(block.text.casefold() for block in blocks)
-    return bool(
-        contains_high_confidence_credential(joined)
-        or any(term in joined for term in _SENSITIVE_SURFACE_TERMS)
-    )
+    return contains_high_confidence_credential(joined)
 
 
 class VisualOcrClient:

@@ -105,7 +105,26 @@ _COMPOUND_RE = re.compile(
 )
 _CONVERSATION_RE = re.compile(
     r"^(?:请)?在\s*(?P<app>.+?)\s*(?:里|中|内|里面|应用里|app里)\s*"
-    r"(?:找到|打开)\s*(?:会话|对话|聊天)?\s*(?P<conversation>.+)$",
+    r"(?:找到|找一?下?|打开|搜索|搜一?下?|切换到|切到|进入)\s*"
+    r"(?:联系人|会话|对话|聊天|好友)?\s*(?:和|跟|与)?\s*(?P<conversation>.+)$",
+    re.IGNORECASE,
+)
+# Chat-app + contact without the "在…里" frame: "打开微信 sensa",
+# "微信联系人 sensa", "切换到微信 找 sensa", "微信 sensa".
+_CHAT_APP_ALIASES = tuple(
+    sorted(
+        (alias for alias, family in _APP_ALIASES.items() if family in _CHAT_APPS),
+        key=len,
+        reverse=True,
+    )
+)
+_CHAT_APP_TARGET_RE = re.compile(
+    r"^(?:请)?(?:帮我|给我)?\s*(?:打开|切换到|切到|切换|进入|去)?\s*"
+    r"(?P<app>" + "|".join(re.escape(alias) for alias in _CHAT_APP_ALIASES) + r")"
+    r"\s*(?:里|中|内|里面|的|应用里|app里)?\s*"
+    r"(?:联系人|会话|对话|聊天|好友)?\s*"
+    r"(?:找到|找一?下?|打开|搜索|搜一?下?|切换到|切到|进入)?\s*"
+    r"(?:和|跟|与)?\s*(?P<conversation>\S.*)$",
     re.IGNORECASE,
 )
 _APP_RE = re.compile(
@@ -200,7 +219,8 @@ def _clean_app(value: str) -> str:
 
 def _clean_conversation(value: str) -> str:
     candidate = _nfkc(value).strip(" \t,，。;；")
-    candidate = re.sub(r"(?:会话|对话|聊天)$", "", candidate).strip()
+    candidate = re.sub(r"^(?:和|跟|与)\s*", "", candidate)
+    candidate = re.sub(r"\s*的?(?:会话|对话|聊天|好友)$", "", candidate).strip()
     return candidate
 
 
@@ -276,6 +296,10 @@ class DeterministicTaskParser:
             compound = self._parse_compound(surface, raw_text=raw_text)
             if compound is not None:
                 return compound
+
+            chat_target = self._parse_chat_app_target(surface, raw_text=raw_text)
+            if chat_target is not None:
+                return chat_target
 
             path_goal = self._parse_path(surface)
             if path_goal is not None:
@@ -445,6 +469,32 @@ class DeterministicTaskParser:
         app = _clean_app(match.group("app"))
         conversation = _clean_conversation(match.group("conversation"))
         if not app or not conversation:
+            return None
+        return DeterministicTaskParser._task(
+            raw_text,
+            (
+                Goal(GoalKind.APP_FOREGROUND, app),
+                Goal(GoalKind.CONVERSATION_SELECTED, conversation, app=app),
+            ),
+        )
+
+    @staticmethod
+    def _parse_chat_app_target(surface: str, *, raw_text: str) -> TaskSpec | None:
+        """"打开微信 sensa" / "微信联系人 sensa" → open the chat, select the contact."""
+
+        match = _CHAT_APP_TARGET_RE.fullmatch(surface)
+        if match is None:
+            return None
+        app = _clean_app(match.group("app"))
+        if _key(app) not in _CHAT_APPS:
+            return None
+        raw_conversation = match.group("conversation").strip()
+        # A trailing operation is a separate command, not a contact name; leave
+        # those to the compound/input/send-file parsers or the generic planner.
+        if re.search(r"(?:打开|进入|输入|键入|发送|提交|新建|创建|然后|接着)", raw_conversation):
+            return None
+        conversation = _clean_conversation(raw_conversation)
+        if not conversation or _key(conversation) in _APP_ALIASES:
             return None
         return DeterministicTaskParser._task(
             raw_text,
