@@ -60,6 +60,8 @@ class KimiRun:
 
     tool_calls: int = 0
     tool_names: list[str] = field(default_factory=list)
+    # (tool name, first 200 chars of its arguments) — local debugging only.
+    tool_log: list[tuple[str, str]] = field(default_factory=list)
     final_text: str = ""
     session_id: str | None = None
     stderr_tail: str = ""
@@ -110,6 +112,8 @@ def parse_stream_line(run: KimiRun, line: str) -> dict[str, Any] | None:
                 name = function.get("name") if isinstance(function, dict) else None
                 if isinstance(name, str):
                     run.tool_names.append(name)
+                    arguments = function.get("arguments") if isinstance(function, dict) else ""
+                    run.tool_log.append((name, str(arguments or "")[:200]))
         content = event.get("content")
         if isinstance(content, str) and content.strip():
             run.final_text = content

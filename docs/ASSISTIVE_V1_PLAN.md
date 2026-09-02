@@ -242,6 +242,7 @@ PR1 复核时补上的关键修正（gpt-sol 版本之外）：
 - 配置：`computer_control.engine: kimi_agent`，`kimi_executable / kimi_working_directory / kimi_model / kimi_skills_dir / kimi_preamble_file / kimi_resume_session`；要求 `privacy.allow_cloud_planner: true`；failure_policy 默认 continue。语音前端、队列、反馈、急停全部沿用。
 - 非交互验收（6/6 通过，均由最终截图核对）：发文件到文件传输助手 223 s；Codex 找会话输入不发 94 s；Claude Code 找会话输入不发 92 s；Chrome 开 ChatGPT 新对话输入不发 78 s；打开 G 盘项目文件夹 66 s；微信找联系人打开聊天 66 s。
 - 已知代价：每条指令 1–4 分钟（每步一次视觉模型调用），比 assistive 确定性技能慢一个数量级，但覆盖面和鲁棒性远好于 UIA。proof_v1/assistive_v1 保留可选。
+- WorkMap 模糊定位验收（走真实 VoiceRuntime 队列，4/4 命中，窗口标题独立核对）：同音字错误"赢商环境…不带水印的 word"→ 营商环境项目最新无水印报告 docx（72 s）；中途改口"贵阳指数，不对，是贵阳大数据…人大副委员长的汇报"（125 s）；"一代一路…最新的南宁演讲 ppt"（58 s）；中英混杂改口"BBD 下面数字经济，不是，是消费升级指数里面那个京东三级分类的表格"（338 s，25 步）。每条的工具日志都显示代理先 grep `WorkMap/out`、再读对应 `projects/*.md` 取根目录，再按 mtime 挑文件。控制器 `KimiRun.tool_log` 记录每次工具调用的名称和参数前 200 字，便于这类核对。
 
 已知缺口（进入 PR2/PR3）：
 - 微信/Codex 视觉规划器路径仍然慢而不可靠（仅作为技能失败后的兜底）；后台窗口截图会抓到叠在上面的其他窗口内容，所以观察前必须激活。
