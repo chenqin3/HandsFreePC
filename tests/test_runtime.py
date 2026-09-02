@@ -416,9 +416,9 @@ def test_continuous_microphone_reports_ready_only_after_models_and_mic_enter(
         runtime._run_continuous_microphone()
 
         messages = [text for text, _kwargs in feedback.events]
-        assert messages[0] == "正在加载本地语音模型并打开麦克风…"
+        assert messages[0] == "正在加载语音模型…"
         assert messages.index("MIC_ENTERED") < messages.index(
-            "HandsFreePC 已就绪。说开始语音操作进入持续控制。"
+            "已就绪，说「开始语音操作」即可开始"
         )
     finally:
         runtime.stop()

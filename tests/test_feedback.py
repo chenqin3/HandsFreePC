@@ -232,3 +232,14 @@ def test_sapi_failures_always_clear_speaking(monkeypatch, failure_point: str) ->
     assert not speaker.speaking.is_set()
     assert speaker._pending == 0
     assert isinstance(speaker._last_error, Exception)
+
+
+def test_overlay_box_fits_its_text_within_screen_bounds() -> None:
+    from handsfree_pc.feedback import fit_overlay_size
+
+    # A one-line status gets a compact box, not the full-width banner.
+    assert fit_overlay_size(700, 110, max_width=1843) == (700, 110)
+    # Very short text still gets a readable minimum width.
+    assert fit_overlay_size(120, 110, max_width=1843) == (360, 110)
+    # Long text wraps: width is capped, height follows the wrapped text.
+    assert fit_overlay_size(2400, 420, max_width=1843) == (1843, 420)

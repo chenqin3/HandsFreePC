@@ -21,6 +21,26 @@ _COLORS = {
 }
 
 
+_PAD_X = 36
+_PAD_Y = 20
+_MIN_WIDTH = 360
+
+
+def fit_overlay_size(
+    required_width: int,
+    required_height: int,
+    *,
+    max_width: int,
+    min_width: int = _MIN_WIDTH,
+) -> tuple[int, int]:
+    """Size the overlay window to its text: never wider than max_width, never
+    narrower than min_width, and exactly as tall as the wrapped text needs."""
+
+    width = min(max_width, max(min_width, int(required_width)))
+    height = max(1, int(required_height))
+    return width, height
+
+
 @dataclass(slots=True)
 class FeedbackEvent:
     text: str
@@ -106,22 +126,31 @@ class Overlay:
         root.attributes("-alpha", 0.94)
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
-        width = max(760, int(screen_width * 0.72))
-        height = max(170, int(screen_height * 0.18))
-        x = max(0, (screen_width - width) // 2)
+        # The box fits its text: a short status line gets a compact box, a long
+        # error report grows, and nothing is wider than about 72% of the screen.
+        max_width = max(760, int(screen_width * 0.72))
+        font_size = max(28, int(max(170, int(screen_height * 0.18)) * 0.20))
         y = max(24, int(screen_height * 0.06))
-        root.geometry(f"{width}x{height}+{x}+{y}")
         label = tk.Label(
             root,
             text="",
-            font=("Microsoft YaHei UI", max(28, int(height * 0.20)), "bold"),
-            wraplength=width - 80,
+            font=("Microsoft YaHei UI", font_size, "bold"),
+            wraplength=max_width - 2 * _PAD_X,
             justify="center",
-            padx=36,
-            pady=20,
+            padx=_PAD_X,
+            pady=_PAD_Y,
         )
         label.pack(fill="both", expand=True)
-        root.update_idletasks()
+
+        def fit_to_text() -> None:
+            root.update_idletasks()
+            width, height = fit_overlay_size(
+                label.winfo_reqwidth(), label.winfo_reqheight(), max_width=max_width
+            )
+            x = max(0, (screen_width - width) // 2)
+            root.geometry(f"{width}x{height}+{x}+{y}")
+
+        fit_to_text()
         self._make_no_activate_click_through(root)
         hide_at = 0.0
 
@@ -136,6 +165,7 @@ class Overlay:
                     background, foreground = _COLORS.get(event.kind, _COLORS["recognized"])
                     label.configure(text=event.text, bg=background, fg=foreground)
                     root.configure(bg=background)
+                    fit_to_text()
                     root.deiconify()
                     root.lift()
                     root.update_idletasks()

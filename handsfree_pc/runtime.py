@@ -1815,9 +1815,9 @@ class VoiceRuntime:
                 level="info",
             )
             self._emit_continuous(
-                f"检测到 {busy} 正在使用麦克风，已暂停监听，结束后自动恢复。",
+                f"{busy} 正在使用麦克风，已暂停监听，结束后自动恢复",
                 kind="armed",
-                duration=0,
+                duration=6,
                 allow_voice=False,
             )
         self.stop_event.wait(guard.poll_seconds)
@@ -1841,11 +1841,7 @@ class VoiceRuntime:
             *self.settings.execution.cancellation_phrases,
         ]
         base_dir = self.settings.config_path.parent
-        self._emit_continuous(
-            "正在加载本地语音模型并打开麦克风…",
-            kind="executing",
-            duration=0,
-        )
+        self._emit_continuous("正在加载语音模型…", kind="executing", duration=0)
         with LocalSpeechSession(
             self.settings.speech,
             base_dir=base_dir,
@@ -1861,10 +1857,13 @@ class VoiceRuntime:
                 safe_message="Local speech models and microphone are ready",
                 level="info",
             )
+            # A short, self-hiding notice: the listener now starts with Windows and
+            # should not leave a banner on the desktop while it waits for the wake phrase.
             self._emit_continuous(
-                "HandsFreePC 已就绪。说开始语音操作进入持续控制。",
+                "已就绪，说「开始语音操作」即可开始",
                 kind="armed",
-                duration=0,
+                duration=6,
+                voice_text="HandsFreePC 已就绪，说开始语音操作即可开始",
             )
             while not self.stop_event.is_set():
                 try:
