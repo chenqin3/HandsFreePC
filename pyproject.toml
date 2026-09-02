@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "handsfree-pc"
-version = "0.4.0"
-description = "Continuous Windows voice control with an owned, locally verified desktop agent."
+version = "0.5.0"
+description = "Always-on Chinese voice control for Windows that hands every spoken command to Kimi Code CLI."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "MIT"
 authors = [{ name = "chenqin3" }]
-keywords = ["voice-control", "windows", "accessibility", "speech-recognition", "desktop-agent", "computer-use"]
+keywords = ["voice-control", "windows", "accessibility", "speech-recognition", "kimi", "computer-use"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Win32 (MS Windows)",
@@ -35,9 +35,7 @@ audio = [
 ]
 whisper = ["faster-whisper>=1.1,<2"]
 windows = [
-  "Pillow>=10,<13; platform_system == 'Windows'",
   "pywin32>=308; platform_system == 'Windows'",
-  "pywinauto>=0.6.9,<1; platform_system == 'Windows'",
 ]
 dev = [
   "build>=1.2,<2",
@@ -53,9 +51,7 @@ all = [
   "vosk==0.3.45",
   "sherpa-onnx==1.13.6",
   "faster-whisper>=1.1,<2",
-  "Pillow>=10,<13; platform_system == 'Windows'",
   "pywin32>=308; platform_system == 'Windows'",
-  "pywinauto>=0.6.9,<1; platform_system == 'Windows'",
 ]
 
 [project.scripts]
@@ -70,9 +66,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["handsfree_pc*"]
-
-[tool.setuptools.package-data]
-handsfree_pc = ["schemas/*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"

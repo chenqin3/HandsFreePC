@@ -1,291 +1,43 @@
-# HandsFreePC 0.4 架构
+# HandsFreePC 架构
 
-HandsFreePC 是运行在当前 Windows 11 用户会话中的本地优先语音控制器。0.4 保留持续监听、`over` 分段、有界 FIFO、失败暂停、急停和双反馈，把底层桌面控制改成项目自有闭环：模型只规划一个步骤，本地代码掌握 UI 权限并独立验收。
-
-设计与 OpenAI 官方建议的自定义 computer-use harness 一致：应用负责观察、执行和安全策略，模型只返回动作建议。参考 [Computer use guide](https://developers.openai.com/api/docs/guides/tools-computer-use)。未来若把 CLI adapter 换成持久 API，可参考 [Codex SDK](https://learn.chatgpt.com/docs/codex-sdk)；0.4 当前仍用已登录的 CLI。
-
-## 总览
+一句话：本地离线的语音前端，加一个执行者（Kimi Code CLI）。
 
 ```text
-AudioCapture（单麦克风）
-  +-> Vosk control detector：开始/结束/急停/确认/恢复
-  +-> Vosk delimiter detector（small-en-us）：over
-  +-> Silero VAD + delimiter 样本区间切分
-                    -> 可配置分段 command ASR（SenseVoice / faster-whisper）
-                    -> PromptAssembler（逐 marker finalize；正文 ASR delimiter 后备）
-                    -> bounded FIFO CommandWorker
-                    -> DesktopAgentLoopController
-                         1. NativeSkillRouter
-                         2. DesktopStepPlanner（默认 Claude；Codex 仅显式 best-effort）
-                         3. DesktopDriver（默认 WindowsUiaDriver）
-                         4. fresh observe
-                         5. DesktopVerifier
+audio.py           麦克风采集、Silero VAD、Vosk 控制词与 over 检测、SenseVoice / faster-whisper 转写
+runtime.py         唤醒 -> 会话 -> over 分段 -> FIFO -> 结果反馈；控制词本地处理
+session.py         SessionState / WorkerState、PromptAssembler、单线程 FIFO CommandWorker
+kimi_agent.py      KimiAgentController：kimi -p 子进程、stream-json 解析、超时与取消
+control.py         Controller 协议与 ControlResult
+feedback.py        自适应大小的屏幕大字提示、Windows SAPI 语音
+mic_guard.py       读取 Windows 麦克风使用记录，别的程序开麦时暂停
+diagnostics.py     固定字段的本地 JSONL 事件日志
+transcripts.py     可选的识别原文记录
+config.py          app / privacy / speech / kimi 四段配置
+cli.py             run / doctor / exec / download-models / logs 等命令
+downloads.py       官方语音模型下载
+normalize.py       文本归一化与控制词匹配
 ```
 
-语音采集和任务执行在不同线程。执行第一条时，采集线程可以继续拼装并入队第二条；普通任务只由一个 worker 串行取出，因此不会同时争夺前台窗口。
+## 线程
 
-## 会话和队列
+- **麦克风线程**（`VoiceRuntime.run_microphone`）：唯一持有麦克风的线程。待命时等控制词；会话中听一句话，按 `over` 的样本边界切段并转写；语音播报只在这条线程的话语边界上播放，避免打断用户。
+- **命令线程**（`CommandWorker`）：严格 FIFO，一次只跑一条；把 `QueuedCommand` 交给 `KimiAgentController.run`，结果回到 `VoiceRuntime._on_control_outcome`。
+- **提示框线程**（`Overlay`）：tkinter 窗口，不抢焦点、鼠标穿透。
 
-状态语义：
+## 会话状态
 
-1. 平时本地监听控制词；
-2. “开始语音操作”进入连续 `ACTIVE` 会话；
-3. 所选正文 ASR fragment 进入 `PromptAssembler.feed()`；
-4. 只有独立 delimiter `over` 前的非空文本成为一条任务；
-5. 任务进入有界普通队列，严格 FIFO；
-6. 安全确认进入独立控制队列并先于后续普通任务执行，但控制项之间仍 FIFO；
-7. 普通失败令 worker `PAUSED`，需要恢复或急停；
-8. “结束语音操作”拒绝新任务、丢弃未完成半条并进入 `DRAINING`，默认排空已接受任务；
-9. 急停设置当前任务的 cooperative cancellation event 并清空待处理任务。
+`ARMED`（待命）→ 说唤醒词 → `ACTIVE`（接收指令）→ 说结束词 → `DRAINING`（排空队列）→ 队列空 → `ARMED`。停止词随时把状态置为 `PAUSED` 并取消一切，再说唤醒词或恢复词重新开始。
 
-暂停/恢复属于本地状态控制，只接受独立、完整、肯定的口令。条件式、转述/引用式或否定式暂停/恢复必须整体 fail closed；短暂停顿和 ASR 标点也不能把“如果……就暂停”“他说暂停”或“不要暂停”提升为无条件控制词。
+队列策略：`failure_policy: continue` 时一条失败不影响后面的；`pause` 时队列停在失败处，说「继续队列」才继续。
 
-取消无法撤回已经到达 Windows 或外部服务的副作用。退出进程或关闭系统麦克风权限才会停止采集；结束语音会话不是关麦。
+## Kimi 契约
 
-## `over` 的独立 KWS
+- 命令行：`kimi -p "<前言>\n用户指令：<文本>" --output-format stream-json`，可选 `--model`、`--skills-dir`、`--session`。`-p` 模式本身不需要审批，且不能与 `--yolo` 同用。
+- 前言（`DEFAULT_PREAMBLE`）要求 Kimi 用 gui-control 技能、不反问、遵守「不要发送」、Claude 默认 Code 页签，并以两行固定格式收尾：`RESULT: <成功|失败> - <说明>` 与 `SCREENSHOT: <路径>`。
+- 解析：`parse_stream_line` 从 `{"role":"assistant","tool_calls":[…]}` 统计工具调用（记录工具名和前 200 字参数），从最后一条 `assistant` 文本取结论，从 `{"role":"meta","session_id":…}` 取会话号。
+- 结果映射：`RESULT: 成功` → 成功；`RESULT: 失败` → `KIMI_REPORTED_FAILURE`；没有结论 → `KIMI_NO_VERDICT`；非零退出且无结论 → `KIMI_EXIT_ERROR`；超时 → `KIMI_TIMEOUT`（终止整棵进程树）；取消 → `CANCELLED`。
+- 进度：每次工具调用通过 `on_progress` 回调更新屏幕提示「Kimi 第 N 步：工具名」。
 
-delimiter 有两条本地路径。主路径由 Vosk small-en-us 0.15 小词表检测器请求词级及 partial 词级时间，把命中的 `over` 绑定到单调递增的麦克风样本区间；VAD 结束后，本轮内存音频按 marker 区间切成 n+1 段，marker 音频不进入正文 ASR，各段先经过低门槛分窗能量检查，明显静音不调用模型，真实有声段分别转写。每个 marker 依次 `finalize()` 它前面的 prompt，最后一段保留为下一条 pending prompt。若某次 Vosk 结果没有可用词时间，则区间退化为命中所在 audio block，不能把这个近似当成精确词边界。若 KWS 没有命中而正文 ASR 转写出独立单词 `over`，`PromptAssembler.feed()` 仍会按 ASCII 单词边界切分。中文 Vosk 不再加载它词表中不存在的英文 `over`。
+## 事件日志
 
-两套 Vosk 检测器与 VAD/ASR 都消费同一个 `MicrophoneSource` 的 block，不会各自打开麦克风：
-
-```text
-Audio block + monotonic sample counter
-  +-> control/KWS stream
-  +-> VAD stream + in-memory capture
-
-delimiter KWS hit
-  -> 继续录到本话语的 VAD 终点
-  -> 用词时间或 block fallback 得到 marker 样本区间
-  -> 按一个或多个 marker 区间切成 n+1 段
-  -> marker 音频不进 ASR；其他片段先做静音门控，再由所选正文 ASR 转写
-  -> 每个 marker finalize 前段；末段保留为下一条 pending prompt
-```
-
-KWS 命中不会抛异常中断 recorder，因此不会仅因听到 `over` 就吞掉前面的正文。当前实现支持同一 VAD 话语内的多个 marker，也会把 marker 后正文留给下一条 prompt；但 Vosk 词时间或 block fallback 都不保证在所有口音、噪声和语速下形成精确边界。短暂自然停顿是提高识别和切分稳健性的建议，不是协议强制要求，用户仍应以入队反馈确认结果。
-
-## NativeSkillRouter：本地确定性优先
-
-`handsfree_pc/desktop/native_skills.py` 复用确定性 intent parser、`WindowsExecutor.prepare_plan()` 和本地 `SafetyPolicy`：
-
-- parser miss 是唯一允许进入模型 fallback 的分支；
-- parser 只匹配请求前缀、但后面还有点击/填写/上传等未覆盖工作时，视为 miss，不能静默丢掉后半句；
-- 一旦确定性命中，先解析全部目标并完成风险分类，再执行第一个动作；
-- 受限动作直接完成，确认动作保存精确 `Plan`，被阻断或失败的确定性计划不会交给模型“再试一次”。
-
-该层没有 LLM、shell 或任意脚本 hook。它适合路径打开、激活已配置应用、固定选项卡/听写和反馈切换等可严格描述的操作。可选 `WorkMapIndex` 只读本机 `WORKMAP.md` 与关联档案头部；完整、肯定、单一的精确项目标题/alias 请求可先解析为本地 `OPEN_PATH`。歧义、否定、引号、多分句、缺失目标或越界相对路径均视为 miss；`planner_hints` 当前没有接入云 planner。
-
-`OPEN_PATH` 也遵守 false-before/true-after：执行前目标不能已经满足“当前前台已打开”。目录通过 Shell.Application 返回的 Explorer 路径做规范化精确比较；Shell dispatch 若让同一前台 Explorer HWND 精确导航到目标目录也可验收。普通文件目前仍要求新前台 HWND，并只能验证窗口标题包含精确文件名，因此是 best-effort：不能区分不同目录中的同名文件，也不能覆盖复用同一 HWND 或不显示文件名的文件查看器。
-
-`OPEN_MODE` 把 parser 产生的 canonical `tab`/`mode` 名称交给应用 profile。只有 `apps.*.mode_names` 显式列出的 canonical key 才属于 native allowlist，labels 按顺序尝试；缺少映射会在激活或点击前拒绝。执行器在任何输入前拒绝 fuzzy-only 命中，并要求最终 mode 的精确标签可验证为 selected；focus-only 不构成导航完成证据。
-
-### 兼容 `VoiceRuntime` 的旧单句云 fallback
-
-顶层 `planner.enabled` 只服务旧 one-shot `VoiceRuntime`，与下文 `computer_control.planner_backend` 的逐步 planner 不同。它仅在本地 deterministic parser 不能完整覆盖原句时运行；`SafetyPolicy` 对 source 为 `claude`/`codex`/`llm` 的 plan 只允许 `ACTIVATE_APP`、`OPEN_CONVERSATION`、`OPEN_MODE`、`ENTER_DICTATION` 和 `START_NATIVE_VOICE`。应用以及 project/conversation/tab/mode 必须在用户原句中肯定、非引号/数据引用地精确出现；听写和应用内语音还需原句明确给出对应授权词。
-
-因此旧云 fallback 不能决定 `SET_FEEDBACK_MODE`、`PAUSE`、`RESUME`、`WAIT`、`OPEN_PATH`、`TYPE_TEXT` 或 `SEND_PROMPT`。这些状态、文件和数据动作只接受本地 parser 的完整命中，云 plan 越界时在执行前阻断。
-
-该运行时的 `native-...` confirmation binding 覆盖完整 `Plan.to_dict()` 与 `plan.source`。每个 `OPEN_PATH` 目标先 `resolve(strict=True)`，再绑定规范绝对路径、mode/size/mtime/ctime/device/inode 和目录标志；普通文件还在同一文件身份稳定时计算 SHA-256。待确认计划先变成不共享 `Action` 的规范深快照；对外读取 `pending_plan` 也只返回副本。确认口令匹配后不会直接执行保存或返回给调用方的对象，而是再次 `prepare_plan`、保持风险不降级、用原用户文本重新运行 safety、重建独占执行快照并重新计算 binding。无需确认的安全 `OPEN_PATH` 在 runtime 和 deterministic native router 中同样执行 bind → 二次 safety → deep clone → rebind。Windows 上最后一次绑定、执行和后置检查由拒绝写入/删除共享的读取句柄覆盖；plan/source、路径或文件身份/内容任一变化都取消。目录句柄只保护目录自身，不递归冻结其中内容。
-
-## DesktopStepPlanner：模型只给一个步骤
-
-未命中 NativeSkillRouter 的请求才使用 `handsfree_pc/desktop/step_planner.py`。planner 每次只能返回严格 JSON Schema 中的一种决定：
-
-- `observe`：选择一个当前授权候选；`strict`/`personal_trusted` 中是已配置且明确绑定的应用，`local_unrestricted` 中是本轮 fresh 枚举的任一可见顶层窗口；
-- `action`：对当前 observation 给出一个 allow-listed 语义动作；
-- `done`：给出一个可由本地状态检查的 expectation；
-- `fail`：目标缺失、歧义、禁止或无法验证时停止。
-
-动作集合只有 `click`、`perform_secondary_action`、`scroll`、`type_text`、`press_key` 和 `set_value`。0.4 planner Schema 不含任意 shell、PowerShell、脚本或文件系统 API。`x`/`y` 只允许随 `click` 指向当前 observation 唯一的 `VisualViewport`，并在本地绑定 exact HWND、窗口矩形、截图 generation 和目标像素；其他元素、其他动作和可复用裸坐标全部拒绝。
-
-进入 planner 前，agent loop 按 profile 解析候选范围。`strict` 从用户原句提取肯定、明确命名的已配置应用，并要求每条任务恰好一个；`personal_trusted` 还可在同一控制器会话内沿用上一条已经本地验证成功的应用/窗口，但沿用前必须 fresh observe 并核对应用与窗口身份。新控制器、窗口变化、零个可验证上下文、多个应用、否定提及或说明性顺带提及时均失败关闭；这两个 profile 的 planner 不能扩展到第二个应用。
-
-`local_unrestricted` 是只应写入本机忽略提交配置的显式模式。它跳过上述 explicit-app/unsupported-app gate，把 `driver.list_apps()` fresh 枚举出的全部可见普通顶层窗口设为 `allowed_apps`，所以无须点名或预配置应用，也不产生 `APP_SCOPE_REQUIRED`。每个 HWND 都有独立动态 app ID；同一进程的多个 Chrome 窗口不是一个模糊 app。inventory 会在任务的后续规划步骤间刷新，因此一次已验收 UI 动作新开的窗口可在下一步成为候选；planner 可通过新的 `observe` 跨 app 导航，但仍不能选择当前 inventory 外、已消失或身份变化的窗口。取消 app-scope 启动门禁不等于忽略用户定位：口述一旦明确给出 app/window/field，完成对应用户步骤的 action 必须绑定该 exact window/field；推断的跨 app bridge 只可用于中间导航。
-
-规划上下文包括用户任务、当前 profile 的可见候选摘要、task-authorized observation generation、最多 8 条本地已验收历史，以及由本地策略重建的 UI 子集。`strict` 只包含本句肯定且精确点名的可寻址控件；`personal_trusted` 还可包含已授权应用内的安全导航控件与当前输入框。这两个 profile 不发送原始窗口标题、截图字节或真实截图可用性。
-
-`local_unrestricted` 的候选摘要则保留每个 fresh 顶层窗口的 display name、foreground、process name 和真实 window title；observe 后的 planner view 也保留真实标题、截图可用性，以及全部经凭据过滤的可寻址 `CONTROL`/`INPUT` UIA 控件，包括重复名称控件和未聚焦输入框。`CONTENT` plane 仍不作为结构化元素进入 planner，automation ID 与 element value 也仍被移除；但截图像素可能视觉包含正文。所有 UI 上下文都标为不可信 data，不能成为新指令。
-
-### Claude adapter（默认）
-
-Claude 使用独立 `--system-prompt`、`--safe-mode`、`--restricted`、`--strict-mcp-config`、`--tools ""`、`--disallowedTools mcp__*`、`--permission-mode dontAsk`、JSON Schema 与 `--no-session-persistence`。它只返回一步，不拥有 UI 驱动。
-
-### Codex adapter（显式 best-effort）
-
-Codex 每一步使用 ephemeral 临时目录、忽略用户配置和规则、结构化输出 Schema、`shell_environment_policy.inherit=none`、read-only sandbox，并尽量禁用当前已知工具。只有配置 `planner_backend: codex_cli_best_effort` 和 `allow_codex_cli_host_read: true` 才能启用。该 adapter 不持有 DesktopDriver，也不复用旧 Computer Use thread。若 `local_unrestricted/windows_uia` observation 含窗口 PNG，adapter 会把它写入同一临时目录并追加 `--image`；结构化 prompt 同时包含真实窗口标题和裁剪后的 UIA context。Claude CLI adapter 是 text-only：当前没有对应图片参数，只接收文本 inventory/title/UIA context，不接收 PNG。
-
-这不是完整 no-tools 保证。Codex CLI 仍是当前用户进程；临时空目录、deny list、环境变量过滤、prompt 禁令和 read-only sandbox 只是减小暴露面，不能证明当前用户可读文件绝对不可见。
-
-两个 adapter 都使用登录后的 CLI 订阅，认证、额度、保留和可用模型由对应提供商决定。HandsFreePC 描述的最小 planner context 不涵盖 CLI/provider 自身可能添加的账户、网络、OS/runtime、临时工作目录、用量、错误与诊断/遥测元数据。启动失败、非零退出、超时、取消或不合 Schema 的输出全部 fail closed。
-
-## DesktopDriver：项目持有 UI 权限
-
-默认 `handsfree_pc/desktop/windows_uia.py` 组合 Win32 和 pywinauto UIA：
-
-- `strict`/`personal_trusted` 只接受配置中声明的应用 profile，并通过进程名/标题查找可见窗口；多个窗口时只接受唯一前台匹配，否则报歧义；
-- `local_unrestricted` fresh 枚举全部可见顶层窗口，每个 HWND/PID/process/title 组合形成独立动态 binding；重复 Chrome 窗口分别列出，不要求静态 app profile；
-- `local_unrestricted` 的 observe 会先激活确切 HWND 并复核前台，再捕获该窗口 PNG；窗口消失、HWND 复用或无法解释的 PID/process/title 身份变化都使 binding 失效。同一 HWND/PID/process 在刚执行本项目动作后的标题变化可以重绑；新的 foreground HWND 则只有与旧窗口同 PID 或具有可验证父子进程关系时才可替换原动态 binding。独立 helper 进程只从其 immediate parent 的唯一 profile match 继承 profile，避免沿完整祖先链误归类。task-scoped app alias 一旦转移到关联子窗口，即使原父窗口仍可见也继续归子窗口，inventory 为父窗口另建候选 ID。通过 configured canonical app 成功观察的窗口会把 canonical alias 保留在同一 HWND 并移除同窗动态重复项。对于显式命中的视觉窗口，完整 PNG 始终提供一个 viewport，PaddleOCR 仅在 UIA 不充分时作为可选文本区域增强；
-- 每次动作前都要求 interactive `Default` desktop，激活并复核目标 HWND 为前台；
-- observation 为不可变快照，元素 index 绑定 `app + HWND + generation`；
-- 一次动作后必须重新 observe，旧 index 失效；
-- 密码元素值永不进入 observation，也不能被执行器操作；
-- UIA 元素先分为 `CONTROL`、`INPUT`、`CONTENT`、`DIALOG`；Claude/Codex profile 优先保留可操作控件，长内容节点只保留本地有界摘要/digest 或省略；单个属性读取失败和元素超限不会拖垮整个 observation；
-- planner-facing observation 按 safety profile 保留精确点名控件、安全导航控件或 `local_unrestricted` 的全部可寻址控件，但永不把 `CONTENT` 作为结构化 UIA 元素；本地原始 observation 与其 fingerprint 不被该最小化替代；
-- click 是 UIA `invoke/select/toggle`、已重新绑定的 OCR 文本区域，或当前 `VisualViewport` 上与截图/目标像素绑定的一次左键 activation；不接受可复用裸坐标；
-- 输入优先 UIA value pattern，或对唯一焦点 UIA 元素使用 Unicode `SendInput`；渲染输入只有在 exact-window Win32 focus/caret 证明后才获得一次性 Unicode `SendInput`，不使用剪贴板；
-- secondary action 只允许固定集合；drag 和普通坐标 click 默认关闭。
-
-驱动返回 `accepted` 只表示动作调用已发出，绝不表示任务完成。
-
-### 完整截图视觉 fallback
-
-`visual_ocr.enabled` 只在 `local_unrestricted/windows_uia`、Codex planner 和 `visual_ocr.apps` 所列应用上启用视觉 fallback；公开默认关闭。本机可显式使用 `apps: ["*"]` 覆盖 fresh inventory 中的全部可见动态窗口，这个通配符在其他 profile 中无效。每个命中的窗口都从完整截图建立一个 frame-bound `VisualViewport`，即使 UIA 已有 rich actionable surface 或 UIA 元素已达到 `max_elements`；语义 UIA 元素仍在 observation 中排在 viewport 之前，planner 必须优先使用其精确能力。`ocr_regions_enabled` 为 `false` 时不会调用 OCR endpoint，viewport 截图规划和 frame-bound point click 仍可用；设为 `true` 才在 UIA 不充分时调用 PaddleOCR 并增加可点击的编号文本区域。OCR 失败也只失去文本区域，不会移除完整视觉 fallback 信号。
-
-Codex 实际接收的是 exact-window PNG 的 planner canvas：若原图最大边超过 2048 px，adapter 使用统一比例等比缩小；planner 返回的 canvas `x/y` 再分别按原宽/画布宽、原高/画布高映射回原始截图像素。映射后的点必须仍在原图内，并在执行前通过 exact HWND、窗口矩形和原始分辨率 target patch 复核，所以缩放不会把 planner 坐标变成可复用裸坐标。
-
-视觉元素通常声明一次左键，viewport 另声明单页纵向 `scroll`。一次 viewport 点击之后，driver 暂存该 exact HWND、local window ID、窗口矩形和原始截图坐标；只有下一次 fresh observe 中 Win32 `GetGUIThreadInfo` 同时证明目标 process/thread、active/focus/caret HWND 仍绑定该窗口、存在可见 system caret，且 caret rectangle 与点击点在限定范围内，viewport 才临时声明一次 `type_text`。输入 payload 必须是当前口述步骤中的完整连续原文：精确查询/筛选目标，或用户明确要求写入但不发送的草稿、消息、prompt；不能来自屏幕内容，也不能是认证、凭据、付款数据或换行。
-
-输入后立即清除一次性文字能力并重截窗口。未发送草稿到此即止；精确查询/筛选文字则等待应用产生即时结果，再由 planner 从 fresh screenshot 点击精确结果。coordinate-only `VisualViewport` 永不声明或接受 `PRESS_KEY`，包括 Enter/Return：focus/caret identity 与位于窗口顶部的坐标只能证明某处可编辑，不能证明它是 SearchBox 而不是消息 composer。没有即时可点击结果时 fail closed，或改走可寻址的语义 UIA SearchBox/AddressBar；不得用 viewport 回车试探提交。
-
-step parser 保留 planner 请求的原始动作类型：截图 click 始终是 click，绝不隐式改写成 Enter。driver 的 viewport 能力列表也不包含 `PRESS_KEY`；只有语义 UIA SearchBox/AddressBar 的确切元素绑定才可走正常按键路径，并由 `SEARCH_SUBMITTED` 验证 fresh result transition。
-
-渲染搜索 helper 若提供一个且仅一个非视觉 UIA `Button`，其 exact full label 包含用户指令中的精确 destination，并以“前往”或 `Go to` 结束，local policy 可允许以**同一完整标签消失**验收这一次 click。该 `TEXT_ABSENT` 特例只证明 navigation bridge 已发生，不是任务完成证据；随后出现的同进程/关联进程窗口仍必须重新截图并由新 frame 验证。部分标签、多个同类按钮或普通元素消失都不能使用该 bridge。
-
-每个视觉动作执行前，driver 都重新截取当前绑定窗口、复核窗口矩形，并重新验证 OCR 文本区域、viewport 点击点 patch 或 focus/caret identity。agent loop 还会比较 planner frame 与执行前 fresh frame 的点击点 32 px 局部；目标局部变化即放弃旧坐标并重规划，远处动画可忽略。每次只执行一个 click、单页 scroll 或一次 exact `type_text`；之后必须取得 fresh 完整窗口截图，再从新 frame 交给 planner 重规划和本地验证。旧截图、旧区域、旧坐标、旧 caret 和已消费能力都不可复用。
-
-全窗截图可能因无关区域加载或动画而变化。agent loop 只对**非视觉 UIA target**开放窄桥：planned/fresh observation 必须仍为同一 app 与 `local_window_id`，同一 element index 必须各自唯一，目标必须仍为 non-visual、enabled、addressable，且完整 `fingerprint_payload()` 相同；这包括 `local_identity`、标签、值、焦点、capabilities 和风险分类。driver 在 dispatch 前还会再验元素。视觉 point 从不走这条桥，仍要求原图点击附近的局部 patch 稳定。
-
-视觉动作若把前台切换到新的 HWND，driver 只接受与原窗口同 PID 或具有可验证父子进程关系的 foreground transition，并把原动态 app binding 原子更新到新 HWND/PID/process/title 后继续。微信主窗切换到 `WeChatAppEx` 搜一搜属于预期例子；无关联进程、非前台窗口、身份变化或无法唯一重绑都会失败关闭。把 `wechat` 放进应用列表仍不代表支持任意微信文字或发送。详见 [VISUAL_OCR.md](VISUAL_OCR.md)。
-
-## Agent loop
-
-`DesktopAgentLoopController` 对每条任务执行：
-
-```text
-NativeSkillRouter
-  hit -> 本地 prepare/safety/execute/verify -> terminal result
-  miss
-    -> driver.list_apps
-    -> planner.decide
-       observe -> driver.observe -> local surface inspection -> loop
-       action  -> fresh before -> local safety
-               -> expectation 必须为 false
-               -> driver.execute
-               -> driver.observe(fresh generation)
-               -> verifier.verify_action + 同一 expectation 必须为 true -> loop
-        done    -> fresh observe same HWND -> verifier.verify_completion -> terminal result
-       fail    -> terminal failure
-```
-
-循环有 `max_steps` 和总 timeout。任一步失败都会停止这条任务，不会静默切换到 `legacy_codex_cli`，也不会让模型通过另一工具绕过阻断。
-
-上述 false-before/true-after 对每个通用动作都强制执行；如果后置条件在动作前已经成立，系统不会把无变化操作误记为成功，也不会继续盲点一次。
-
-视觉 `DONE` 另有本地双帧协议。云端 planner view 不含原始 HWND/`local_window_id`；第一条视觉 `DONE` 返回后，controller 才在未最小化的本地 observation 上计算绑定 app、local window、generation 与完整 screenshot bytes 的 `VISUAL_STATE_VERIFIED` token，模型不能提交或猜这个 token。controller 随后强制重新 observe 同一 exact window，要求 generation/capture time 更新，并把第二张 fresh screenshot 交给 planner；只有同一 app/window 在更新 generation 上再次返回视觉 `DONE` 才进入本地 completion verifier。
-
-## LocalVerifier
-
-`handsfree_pc/desktop/verifier.py` 不读取 planner/driver 的完成 prose 作为证据。动作级检查至少要求：
-
-- receipt 对应同一动作和 before generation；
-- after observation 属于同一应用且 generation 严格增加；
-- after 不早于 before，Unicode 没有 replacement character；
-- before/after fingerprint 不同；
-- UIA `type_text`/`set_value` 的**精确文本**出现在新 UIA 状态中；渲染输入（包括未发送草稿）则要求同一 Win32 focus/caret binding、fresh 截图 transition 和下一次视觉复核，不能伪称获得了 UIA value read-back；
-- UIA 自然搜索使用独立 `SEARCH_SUBMITTED` 证据链：动作前语义 SearchBox/AddressBar 必须精确等于查询文本，Enter/Return 后还要看到非焦点变化的 fresh 结果语义 transition。渲染查询没有 Enter 路径，只能在 exact payload 输入后等待即时结果，并从 fresh screenshot 点击结果；未发送草稿在输入后停止。只填入文本、子串命中或没有新结果都不算完成。
-
-动作还必须携带任务相关 expectation。agent loop 在执行前确认它为 false，执行和 fresh observe 后确认它为 true；动作级 receipt/fingerprint 变化与任务后置条件两项缺一不可。
-
-任务级 `done` 只能使用有限 expectation：应用当前可观察、文本存在/不存在、焦点元素包含文本，或上一个动作已由同一 generation 的本地 verifier 验收。`local_unrestricted` 在验收 `done` 前还会重新 observe 并复核同一 HWND；多段明确动作会与推断的 navigation bridge 分开计数，只有口述步骤依次完成且最后条件属于最后一步才可结束。只有这一步通过才产生 `LOCAL_VERIFIED_COMPLETION`。
-
-这是比 0.2 自报状态更强的证据，但仍不是形式化证明：UIA 树可能缺失业务状态，应用可能在验收后立即变化，外部网络副作用也可能延迟。高价值任务仍需人工监督。
-
-## 本地安全策略与 typed confirmation
-
-本地策略把三类判断分开：planner 数据最小化、当前敏感 surface 分类、具体动作风险。聊天正文等 `CONTENT` plane 即使讨论 password、terminal、payment 或示例 token，也不会把整个窗口判成敏感 surface，并且不会作为结构化元素进入 planner。私钥头、已知服务 key、结构有效 JWT、明确 Bearer 等高置信度凭据会被删除/脱敏；普通 40--512 字符不透明标识只记为低置信度并从 planner view 排除，绝不单独阻断整窗。
-
-`strict`/`personal_trusted` 在发送 planner view 前阻断已识别的密码属性、聚焦 secret/API-key、认证、UAC/Windows Security 和付款 surface。`local_unrestricted` 在 observe 前阻断终端/Run/UAC/认证身份、聚焦 secret 字段和 planner view 中的高置信凭据；付款/隐私/账户目标在具体 action 风险评估时硬阻断，但全窗口 title inventory 和 Codex 选中窗口像素可能早于 action 阻断离机。每个 planner action 在执行前都会对目标元素和 fresh snapshot 重新分类。
-
-`strict`/`personal_trusted` 的本地有限语法还要求 planner 动作与用户下一步逐字段一致：动作类型、完整目标边界、完整口述输入 payload、按键、单次左键、secondary `invoke`、滚动方向和显式页数都不能由 outcome 文本、后续文本动词的 payload、口述文本子串或较长标签的短前缀借出授权。`type/input/输入/键入` 只匹配 `type_text`，`fill/write/填写/写入` 只匹配 `set_value`；文本动作后若还有 payload 外的独立非空肯定 clause，payload-presence 特例整体关闭，必须验证真正的用户结果；明确否定的“不发送”等 side clause 不会被误当成结果。尚未实现本地条件求值的 `if/when/unless` 等条件命令整体 fail closed；不支持的 drag/hover/move/resize/double-click/right-click/download/copy/rename 等尾随动作仍计入用户步骤，不能被 planner 提前 `DONE` 隐去。同目标 `ELEMENT_SELECTED` 只可证明用户明确说出的 select/choose/switch；open/click/send/delete/close 等需要用户原句中独立、可观察的结果条件。
-
-公开默认 `strict` 对通用 `type_text`/`set_value` 要求确认。只在本机忽略提交的配置中显式启用的 `personal_trusted`，可以免确认执行安全导航，以及把本句完整口述草稿写入唯一、聚焦、非密码输入框；它不会自动发送。点击/按键上下文命中本地已知的发送、提交、删除、安装、上传、共享、关闭等词形时，两种 profile 都要求确认。该词表不是完整语义证明，未知语言/同义词、自绘控件或伪装文案可能漏分，重要副作用必须人工监督。需要确认的动作会产生由动作类型、应用、参数、包含本地 HWND identity 的 observation fingerprint 和 expectation 绑定的 ID。generation 在确认前 fresh observe 后重新绑定，不直接进入 digest。runtime 另外生成随机四位挑战码并提示“确认执行 4 8 2 7”这类一次性口令；只说静态“确认执行”永远不授权，也不会重新让模型解释确认意图。
-
-`local_unrestricted` 有意绕过 app-scope 启动门禁、逐字段**中间导航**语法和普通低风险导航确认：planner 可以推断必要的跨 app bridge，窗口/选项卡切换、菜单导航、Toggle，以及未命中风险分类的通用 OK/Continue 对话框可以在绑定当前 observation、目标元素和 expectation 后直接执行。这里的“无需逐字段口述”不适用于用户明确定位的最终步骤：一旦原句说出 app/window/field，最终输入、搜索或其他用户 action 必须落在该 exact window/field。
-
-自然“搜索 X”无需另说“输入”：UIA 已确认语义 SearchBox/AddressBar 为空时可用精确 `type_text`，字段非空或旧值不明时必须用 `set_value` 精确替换为用户原文 `X`，然后按 Enter/Return；本地 verifier 随后要求 fresh `SEARCH_SUBMITTED` 结果 transition。渲染查询只能走上一节的 `GetGUIThreadInfo` 单次输入链，随后等待即时结果并在 fresh screenshot 上点击精确结果；coordinate-only viewport 永不按 Enter/Return。向聊天/普通编辑框写入、把 `X` 追加到已有文字、字段值只是包含 `X`、或者只填文字不出现结果都不能算完成。识别到的发送/提交、删除、安装、上传、共享和关闭等高影响动作仍进入 typed confirmation。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、未绑定/可复用坐标和任意 shell 仍被本地阻断；key 仍受固定 allowlist，文本不能由 planner 发明。
-
-通用 UI confirmation 摘要若原文显示 UI 标签，只使用从用户原句验证出的 exact target label。未授权 sibling/window label 的原文和语义仍保留在本地完整快照中做风险分类，不进入摘要；摘要中的短 digest 只是不可逆绑定元数据。输入 payload 则只来自用户亲口给出的 exact span。
-
-确认执行前还会：
-
-1. 重新 observe；
-2. 要求界面 fingerprint 与确认时一致；
-3. 把同一动作 rebind 到新 generation；
-4. 重新运行本地安全分类；
-5. 只执行原动作一次，再进入 fresh observe/LocalVerifier。
-
-ID/四位码不匹配、重复使用、超时、界面变化或风险分类变化全部拒绝。同一 `VoiceRuntime` 进程运行期内，已签发四位码在成功、取消或超时后都不回收；有界重抽耗尽时 fail closed。该集合不持久化，重启后不保证绝对不复用，因此随机码不是持久化防重放凭证或说话人认证，也无法阻止旁人、扬声器或实时转述/重放在本轮有效期内代说口令。
-
-## 实验 Open Computer Use driver
-
-`PersistentOpenComputerUseDriver` 是对 [Qwen open-computer-use](https://github.com/QwenLM/open-computer-use) **0.2.3** MCP server 的可选持久 stdio adapter：初始化一次、校验 9 个所需工具、串行复用同一子进程，并在每个动作后强制 fresh observe。
-
-它不是默认依赖，只有 `driver: open_computer_use` 与 `allow_experimental_driver: true` 同时设置才可加载。0.2.3 在中文 Windows 有未解决的 PowerShell/UTF-8 边界问题：[Issue #5](https://github.com/QwenLM/open-computer-use/issues/5)、[PR #6](https://github.com/QwenLM/open-computer-use/pull/6)。因此它不作为中文默认驱动，也不自动安装。详见 [OPEN_COMPUTER_USE.md](OPEN_COMPUTER_USE.md)。
-
-当前 0.2.3 adapter 从 `get_app_state` 得不到可安全绑定的结构化元素列表；原始 accessibility text 和截图只可能由本地 MCP/driver 接触，safety 重建的云 planner view 会移除它们及真实截图可用性。通用 planner 因此得不到可用 element index：基于元素的点击/导航受限，`type_text`/`set_value` 也会因没有可验证的焦点元素而失败关闭。它不等价于默认 `windows_uia`。
-
-## 旧兼容 controller
-
-`handsfree_pc/computer_control.py` 中基于 `codex exec/resume` 和 Computer Use plugin 的 controller 仍可通过 `backend: legacy_codex_cli` 显式选择，以免破坏已有私有配置。
-
-该路径由同一个 agent 执行动作并输出 `VERIFIED_COMPLETION`/`NEEDS_CONFIRMATION`/`FAILURE`，没有 0.4 的项目自有 Driver 与 LocalVerifier。除 `backend: legacy_codex_cli` 外还必须同时设置 `allow_codex_cli_host_read: true` 和 `allow_legacy_codex_computer_use: true`。它的状态行只是协议，不是可信屏幕证据。factory 不会自动选择或回退到它；0.4 新安装应使用 `local_agent`。
-
-## 静态 doctor 与 live doctor
-
-普通 `doctor` 检查依赖、模型、音频设备、配置和 CLI 线索，只设置 `static_control_preflight_passed`；它总把 `live_control_verified` 与 `ready_for_live_control` 保持为 `false`。
-
-`computer-doctor --live` 仅支持 `local_agent/windows_uia`。它打开本项目自有 fixture，对唯一文本字段执行含中文随机 token 的 `set_value`，重新 observe 并调用同一 `DesktopVerifier`。这证明一次 UIA + Unicode + fresh-observation round-trip，不覆盖 planner、声音、第三方应用或业务后置条件。
-
-## 配置与模块边界
-
-默认公开配置：
-
-```yaml
-computer_control:
-  enabled: false
-  backend: local_agent
-  driver: windows_uia
-  planner_backend: claude
-  safety_profile: strict
-  allow_screen_context_to_cloud: false
-  allow_codex_cli_host_read: false
-  allow_legacy_codex_computer_use: false
-  allow_experimental_driver: false
-  allow_coordinate_actions: false
-
-execution:
-  dry_run: true
-
-workmap:
-  enabled: false
-  out_directory: null
-  aliases: {}
-```
-
-本机 `local_unrestricted` 不是公开默认：它必须在 Git 忽略的 `config.local.yaml` 中显式设置 `driver: windows_uia`、`safety_profile: local_unrestricted`，并在使用云 planner 时同时设置两项云/屏幕许可；Codex 还要求独立 host-read consent。WorkMap 同理只在本地填入导出目录和精确 aliases，当前不会把 `planner_hints` 附加到云 context。
-
-主要模块：
-
-- `session.py`：delimiter、队列和 worker；
-- `runtime.py`：语音状态机、反馈、队列与 controller 集成；
-- `desktop/native_skills.py`：确定性本地路由；
-- `desktop/step_planner.py`：Codex/Claude 单步规划；
-- `desktop/protocol.py`：严格 observation/action/decision 类型；
-- `desktop/windows_uia.py`：默认自有驱动；
-- `desktop/safety.py`：界面/动作风险策略与 typed confirmation；
-- `desktop/verifier.py`：动作和完成条件本地验收；
-- `desktop/agent_loop.py`：持久 controller；
-- `workmap.py`：只读 WorkMap 索引与精确本地 alias 解析；
-- `desktop/open_computer_use.py`、`desktop/mcp_client.py`：实验 MCP 驱动；
-- `live_fixture.py`：自有 live doctor fixture。
-
-任何新的 driver 都必须保持同样的 observation generation、单动作、fresh observe、local verification 和 typed confirmation 契约，不能通过“模型说成功”降低验收强度。
+阶段只有 `runtime`、`transcribe`、`kimi_agent`。常见错误码：`MICROPHONE_READY`、`VOICE_SESSION_STARTED`、`COMMAND_ENQUEUED`、`CONTROL_STARTED`、`KIMI_STARTED`、`KIMI_TOOL_CALL`、`KIMI_COMPLETED`、`CONTROL_COMPLETED`、`KIMI_TIMEOUT`、`MICROPHONE_GUARD_PAUSED`、`MICROPHONE_GUARD_RESUMED`。

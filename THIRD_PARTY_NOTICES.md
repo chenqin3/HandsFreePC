@@ -8,7 +8,7 @@ HandsFreePC 源代码使用根目录 `LICENSE` 中的 MIT License。默认模型
 
 - Model name: `vosk-model-small-cn-0.22`
 - Upstream / author: Alpha Cephei, Vosk
-- Purpose in HandsFreePC: local limited-grammar wake and stop phrase recognition
+- Purpose in HandsFreePC: local limited-grammar recognition of the wake, end, stop and resume phrases
 - Source: https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip
 - Model listing and license: https://alphacephei.com/vosk/models
 - License: Apache License 2.0
@@ -45,7 +45,7 @@ Required attribution for use, copying, modification or sharing:
 
 > SenseVoiceSmall by Alibaba DAMO Academy / FunASR, packaged as `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17` for sherpa-onnx.
 
-The FunASR Model License requires users to attribute the source and author information and to retain relevant model names. It also contains responsibility, conduct, termination and revision terms. Do not describe these weights merely as “MIT” or “Apache-2.0”; the model weights and the surrounding runtime code are separate licensed works. Recheck the official model license before redistribution because its revision clause allows later updates.
+The FunASR Model License requires users to attribute the source and author information and to retain relevant model names. It also contains responsibility, conduct, termination and revision terms. Do not describe these weights merely as "MIT" or "Apache-2.0"; the model weights and the surrounding runtime code are separate licensed works. Recheck the official model license before redistribution because its revision clause allows later updates.
 
 ## Silero VAD v6.2.1 ONNX
 
@@ -58,22 +58,14 @@ The FunASR Model License requires users to attribute the source and author infor
 
 The MIT License requires the copyright notice and permission notice to be included in copies or substantial portions of the software. The model installer saves the upstream `LICENSE` beside the downloaded ONNX file.
 
-## Optional Qwen Open Computer Use 0.2.3
+## Kimi Code CLI
 
-- Package: `@qwen-code/open-computer-use@0.2.3`
-- Upstream: QwenLM
-- Source: https://github.com/QwenLM/open-computer-use
-- Purpose in HandsFreePC: optional experimental MCP desktop driver
-- License: MIT License
-
-HandsFreePC does not bundle, auto-install, or auto-update this package. Users who explicitly select `driver: open_computer_use` must install the exact supported version separately and set `allow_experimental_driver: true`. A redistributor must retain the upstream MIT copyright and permission notice and should lock and review the exact npm artifact it ships.
-
-Version 0.2.3 has an unresolved Windows Chinese encoding boundary documented in [upstream Issue #5](https://github.com/QwenLM/open-computer-use/issues/5); [PR #6](https://github.com/QwenLM/open-computer-use/pull/6) is not part of the supported release. This is a compatibility and correctness warning, not a change to the MIT license. See [docs/OPEN_COMPUTER_USE.md](docs/OPEN_COMPUTER_USE.md).
+HandsFreePC does not bundle, install, or update [Kimi Code CLI](https://moonshotai.github.io/kimi-code/). It runs the copy the user installed and logged in to, under Moonshot's own terms of service. Everything Kimi sends to its model (instruction text, screenshots it takes, tool output) is governed by those terms, not by this project's license.
 
 ## Runtime packages
 
-HandsFreePC also depends on separately distributed Python packages such as Vosk, sherpa-onnx, PyYAML, psutil, sounddevice, NumPy, pywin32 and pywinauto. Those packages remain under their own licenses as published in their distributions. A binary redistributor should generate and review a complete dependency license inventory for the exact locked build rather than treating this model notice as exhaustive.
+HandsFreePC also depends on separately distributed Python packages such as Vosk, sherpa-onnx, PyYAML, psutil, sounddevice, NumPy and pywin32. Those packages remain under their own licenses as published in their distributions. A binary redistributor should generate and review a complete dependency license inventory for the exact locked build rather than treating this model notice as exhaustive.
 
-The default installer does **not** install the optional [faster-whisper](https://github.com/SYSTRAN/faster-whisper) extra. `install.ps1 -WithWhisper` installs its Python package and transitive dependencies, but does not install model weights. Constructing `WhisperModel("large-v3-turbo")` resolves to the separately hosted [mobiuslabsgmbh/faster-whisper-large-v3-turbo](https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo) repository and may download/cache those weights during an explicit preload or the first configured use, whether selected as the command backend or as an exception fallback.
+The default installer does **not** install the optional [faster-whisper](https://github.com/SYSTRAN/faster-whisper) extra. `install.ps1 -WithWhisper` installs its Python package and transitive dependencies, but does not install model weights. Constructing `WhisperModel("large-v3-turbo")` resolves to the separately hosted [mobiuslabsgmbh/faster-whisper-large-v3-turbo](https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo) repository and may download/cache those weights during the first configured use, whether selected as the command backend or as an exception fallback.
 
 These optional weights are not one of HandsFreePC's four default model assets. They are outside `handsfreepc download-models`, its pinned SHA-256 list, and its per-model `HANDSFREEPC_MODEL_SOURCE.txt` / license-copy workflow. Review and retain the exact code, repository and model terms that apply when you download or redistribute them; do not infer that the default-model notices above cover this optional cache.

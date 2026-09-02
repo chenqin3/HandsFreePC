@@ -208,106 +208,6 @@ def test_command_worker_continue_policy_runs_later_fifo_after_ordinary_failure()
     assert worker.stop(cancel_pending=False, timeout=1)
 
 
-def test_command_worker_continue_policy_still_pauses_for_confirmation() -> None:
-    calls: list[int] = []
-
-    def handler(command: QueuedCommand, _cancel: threading.Event) -> JobOutcome:
-        calls.append(command.sequence)
-        return JobOutcome(
-            command,
-            success=False,
-            error_type="NeedsConfirmation",
-        )
-
-    worker = CommandWorker(handler, failure_policy="continue")
-    worker.start()
-    assert worker.enqueue(QueuedCommand("confirm first", sequence=1))
-    assert worker.enqueue(QueuedCommand("must wait", sequence=2))
-
-    wait_for_state(worker, WorkerState.PAUSED)
-    assert calls == [1]
-    assert worker.unfinished_count == 1
-    assert worker.stop(timeout=1)
-
-
-def test_command_worker_continue_policy_pauses_only_when_hard_block_is_reached() -> None:
-    calls: list[int] = []
-
-    def handler(command: QueuedCommand, _cancel: threading.Event) -> JobOutcome:
-        calls.append(command.sequence)
-        if command.sequence == 1:
-            return JobOutcome(
-                command,
-                success=False,
-                error_code="ASSISTIVE_PLANNER_FAILED",
-            )
-        if command.sequence == 2:
-            return JobOutcome(
-                command,
-                success=False,
-                error_code="ASSISTIVE_HARD_BLOCK",
-            )
-        return JobOutcome(command, success=True)
-
-    worker = CommandWorker(handler, failure_policy="continue")
-    worker.start()
-    try:
-        assert worker.enqueue(QueuedCommand("ordinary failure continues", sequence=1))
-        assert worker.enqueue(QueuedCommand("hard block pauses", sequence=2))
-        assert worker.enqueue(QueuedCommand("must wait", sequence=3))
-
-        wait_for_state(worker, WorkerState.PAUSED)
-        assert calls == [1, 2]
-        assert worker.unfinished_count == 1
-        assert worker.resume()
-        assert worker.drain(timeout=1)
-        assert calls == [1, 2, 3]
-    finally:
-        worker.stop(timeout=1)
-
-
-def test_control_command_runs_before_ordinary_fifo_after_confirmation_pause() -> None:
-    calls: list[str] = []
-
-    def handler(command: QueuedCommand, _cancel: threading.Event) -> JobOutcome:
-        calls.append(command.text)
-        return JobOutcome(command, success=command.text != "needs confirmation")
-
-    worker = CommandWorker(handler)
-    worker.start()
-    assert worker.enqueue(QueuedCommand("needs confirmation", sequence=1))
-    assert worker.enqueue(QueuedCommand("ordinary second", sequence=2))
-    wait_for_state(worker, WorkerState.PAUSED)
-
-    assert worker.enqueue_control(QueuedCommand("confirmation", sequence=3))
-    assert worker.control_pending_count == 1
-    assert worker.resume()
-    assert worker.drain(timeout=1)
-    assert worker.stop(cancel_pending=False, timeout=1)
-
-    assert calls == ["needs confirmation", "confirmation", "ordinary second"]
-
-
-def test_control_queue_is_bounded_independently_while_paused() -> None:
-    worker = CommandWorker(successful, max_queue_size=1, max_control_queue_size=1)
-    worker.start()
-    assert worker.pause()
-
-    normal = QueuedCommand("normal")
-    control = QueuedCommand("control")
-    assert worker.enqueue(normal)
-    assert worker.enqueue_control(control)
-    assert not worker.enqueue(QueuedCommand("normal overflow"))
-    assert not worker.enqueue_control(QueuedCommand("control overflow"))
-    assert worker.pending_count == 2
-    assert worker.control_pending_count == 1
-
-    cancelled = worker.cancel_pending()
-    assert cancelled == (control, normal)
-    assert worker.unfinished_count == 0
-    assert worker.stop(timeout=1)
-
-
 def test_manual_pause_during_active_job_holds_the_next_command() -> None:
     started = threading.Event()
     release = threading.Event()
@@ -467,7 +367,7 @@ def test_graceful_stop_before_start_cancels_because_no_worker_can_drain() -> Non
     outcomes: list[JobOutcome] = []
     worker = CommandWorker(successful, on_outcome=outcomes.append)
     command = QueuedCommand("cannot run before start")
-    assert worker.enqueue_control(command)
+    assert worker.enqueue(command)
 
     assert worker.stop(timeout=0.1, cancel_pending=False)
 

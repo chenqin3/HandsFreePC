@@ -229,11 +229,7 @@ class VoskWakeDetector:
             phrase = str(raw_phrase).strip()
             key = phrase.casefold()
             compact_key = compact_text(phrase).casefold()
-            if (
-                phrase
-                and key not in seen_grammar
-                and compact_key not in seen_compact_grammar
-            ):
+            if phrase and key not in seen_grammar and compact_key not in seen_compact_grammar:
                 grammar_items.append(phrase)
                 seen_grammar.add(key)
                 seen_compact_grammar.add(compact_key)
@@ -328,16 +324,15 @@ class VoskWakeDetector:
         else:
             partial = str(text)
             partial_tokens = tokens
-        rolling_text = " ".join(
-            [*(value for _, value, _ in self._rolling_finals), partial]
-        ).strip()
+        rolling_text = " ".join([*(value for _, value, _ in self._rolling_finals), partial]).strip()
         matched = phrase_in_text(rolling_text, self.phrases)
         if matched:
-            rolling_tokens = tuple(
-                token
-                for _, _, final_tokens in self._rolling_finals
-                for token in final_tokens
-            ) + partial_tokens
+            rolling_tokens = (
+                tuple(
+                    token for _, _, final_tokens in self._rolling_finals for token in final_tokens
+                )
+                + partial_tokens
+            )
             span = self._phrase_sample_span(rolling_tokens, matched)
             if span is None:
                 span = (block_start, block_end)
@@ -377,9 +372,7 @@ class VoskWakeDetector:
         return tuple(result)
 
     @staticmethod
-    def _phrase_sample_span(
-        tokens: tuple[_TimedToken, ...], phrase: str
-    ) -> tuple[int, int] | None:
+    def _phrase_sample_span(tokens: tuple[_TimedToken, ...], phrase: str) -> tuple[int, int] | None:
         compact_parts: list[str] = []
         token_by_character: list[int] = []
         for index, token in enumerate(tokens):
@@ -883,9 +876,7 @@ class LocalSpeechSession:
                     detection = marker_detector.accept_detection(block)
                 else:  # Compatibility with simple injected/test detectors.
                     marker = marker_detector.accept(block)
-                    detection = (
-                        PhraseDetection(marker, block_start, block_end) if marker else None
-                    )
+                    detection = PhraseDetection(marker, block_start, block_end) if marker else None
                 if detection is None or not phrase_in_text(detection.phrase, list(markers)):
                     return
                 # A prompt delimiter is a marker, not an emergency interrupt.

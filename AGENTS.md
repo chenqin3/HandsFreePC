@@ -1,19 +1,16 @@
 # Contributor instructions
 
 - Target Windows 11 and Python 3.11 or 3.12.
-- Keep deterministic parsers and allow-listed actions ahead of LLM fallback.
-- Never add arbitrary shell execution to the voice action schema.
+- The design is deliberately small: a local, offline speech front-end (wake phrase, `over`
+  delimiter, FIFO queue, feedback, stop) and one executor, Kimi Code CLI. Do not add a second
+  execution path, a UI Automation driver, a planner, or a rule engine in front of Kimi.
+- Everything Kimi needs to know goes into the preamble in `handsfree_pc/kimi_agent.py` or the
+  user's `gui-control` skill, not into Python code.
+- Control phrases (wake, end, stop, resume, feedback mode) must be recognised locally and must
+  never be forwarded to Kimi. Every phrase must also appear in `speech.wake.grammar`.
+- On-screen notices are short and self-hiding; only "in progress" notices may use `duration=0`,
+  and they must be replaced by the outcome.
 - Never commit audio, transcripts, local paths, model weights, tokens, logs, or `config.local.yaml`.
-- Before keyboard or mouse input, bind the action to one exact visible, non-sensitive window and
-  target.
-- After input, poll for task progress or the final task goal. If one micro-step cannot yet be
-  proved, use bounded waiting, retry, an alternate supported action, or one replan instead of
-  automatically failing the entire task.
-- Final success in `assistive_v1` is decided only by the task-level `GoalVerifier`.
-- Navigation and unsent draft entry may run automatically. Sending, submitting, deleting,
-  overwriting, installing, uploading, sharing, or discarding unsaved work requires an
-  action-bound spoken confirmation.
-- Passwords, authentication, payments, UAC, terminals, and Windows security/privacy surfaces
-  remain blocked.
-- Add or update tests for every new command phrase and safety rule.
-- Live tests must be opt-in and clearly marked with `@pytest.mark.live`.
+  Test fixtures and docs use neutral example names, never names from a contributor's machine.
+- Add or update tests for every new phrase and every runtime state change; live tests are opt-in
+  and marked `@pytest.mark.live`.

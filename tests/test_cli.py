@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +11,45 @@ import yaml
 
 import handsfree_pc.cli as cli
 from handsfree_pc.config import DEFAULT_CONFIG
-from handsfree_pc.models import RuntimeState
-from handsfree_pc.runtime import TurnOutcome
-from handsfree_pc.windows.native import ForegroundIntegrityBoundary
+from handsfree_pc.control import ControlResult
+
+
+def _prepare_windows_doctor(monkeypatch, *, kimi_path=None, skill=None) -> None:
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
+    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
+    monkeypatch.setattr(cli, "resolve_kimi", lambda _executable: kimi_path)
+    monkeypatch.setattr(cli, "gui_control_skill_path", lambda _kimi: skill)
+    monkeypatch.setattr(cli, "kimi_version", lambda _path: "kimi 9.9.9")
+
+
+def _write_complete_models(tmp_path: Path) -> None:
+    for directory in ("wake/am", "wake/conf", "delimiter/am", "delimiter/conf", "command"):
+        (tmp_path / "models" / directory).mkdir(parents=True, exist_ok=True)
+    for relative in (
+        "wake/am/final.mdl",
+        "wake/conf/model.conf",
+        "delimiter/am/final.mdl",
+        "delimiter/conf/model.conf",
+        "command/tokens.txt",
+        "command/model.int8.onnx",
+        "vad.onnx",
+    ):
+        (tmp_path / "models" / relative).touch()
+
+
+_MODEL_CONFIG = """
+speech:
+  wake:
+    model_path: models/wake
+  delimiter:
+    model_path: models/delimiter
+  command:
+    model_path: models/command
+  vad:
+    model_path: models/vad.onnx
+"""
 
 
 def test_init_falls_back_to_packaged_defaults_when_repo_template_is_absent(
@@ -28,100 +65,71 @@ def test_init_falls_back_to_packaged_defaults_when_repo_template_is_absent(
     assert yaml.safe_load(destination.read_text(encoding="utf-8")) == DEFAULT_CONFIG
 
 
-def test_simulate_returns_nonzero_when_a_command_fails(tmp_path, monkeypatch) -> None:
-    class FakeRuntime:
-        def __init__(self, *_args, **_kwargs):
-            self.state = RuntimeState.ARMED
-            self.pending_plan = None
-
-        def handle_text(self, _command, *, require_wake):
-            del require_wake
-            return TurnOutcome(True, RuntimeState.ARMED, "目标不存在", success=False)
-
-        def stop(self):
-            pass
-
-    monkeypatch.setattr("handsfree_pc.runtime.VoiceRuntime", FakeRuntime)
-    monkeypatch.setattr(cli, "_build_executor", lambda _settings: object())
-    args = SimpleNamespace(
-        config=str(tmp_path / "missing.yaml"),
-        text=["打开不存在的文件"],
-        file=None,
-        independent=False,
-        require_wake=False,
-    )
-
-    assert cli.command_simulate(args) == 2
-
-
-def test_doctor_strict_requires_complete_runtime(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
-    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
-    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
+def test_doctor_strict_fails_without_models_or_kimi(tmp_path, monkeypatch, capsys) -> None:
+    _prepare_windows_doctor(monkeypatch)
     config = tmp_path / "config.yaml"
     config.write_text("{}\n", encoding="utf-8")
 
     exit_code = cli.command_doctor(
-        SimpleNamespace(config=str(config), check_planner_auth=False, strict=True)
+        SimpleNamespace(config=str(config), check_kimi=False, strict=True)
     )
 
-    report = yaml.safe_load(capsys.readouterr().out)
+    report = json.loads(capsys.readouterr().out)
     assert exit_code == 1
     assert report["ready_for_run"] is False
+    assert report["ready_for_control"] is False
     assert set(report["models"]) == {"wake", "delimiter", "command", "vad"}
+    assert report["kimi"]["found"] is False
+    assert report["kimi"]["gui_control_skill"] is None
 
 
 def test_doctor_requires_a_complete_delimiter_model(tmp_path, monkeypatch, capsys) -> None:
     config = tmp_path / "config.yaml"
-    config.write_text(
-        """
-speech:
-  wake:
-    model_path: models/wake
-  delimiter:
-    model_path: models/delimiter
-  command:
-    model_path: models/command
-  vad:
-    model_path: models/vad.onnx
-""",
-        encoding="utf-8",
-    )
-    for directory in ("wake/am", "wake/conf", "delimiter/am", "command"):
-        (tmp_path / "models" / directory).mkdir(parents=True, exist_ok=True)
-    (tmp_path / "models/wake/am/final.mdl").touch()
-    (tmp_path / "models/wake/conf/model.conf").touch()
-    (tmp_path / "models/delimiter/am/final.mdl").touch()
-    (tmp_path / "models/command/tokens.txt").touch()
-    (tmp_path / "models/command/model.int8.onnx").touch()
-    (tmp_path / "models/vad.onnx").touch()
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
-    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
-    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
-    monkeypatch.setattr(cli, "_check_command", lambda *_args, **_kwargs: {"found": False})
+    config.write_text(_MODEL_CONFIG, encoding="utf-8")
+    _write_complete_models(tmp_path)
+    (tmp_path / "models/delimiter/conf/model.conf").unlink()
+    _prepare_windows_doctor(monkeypatch)
 
-    cli.command_doctor(
-        SimpleNamespace(config=str(config), check_planner_auth=False, strict=False)
-    )
+    cli.command_doctor(SimpleNamespace(config=str(config), check_kimi=False, strict=False))
     incomplete = json.loads(capsys.readouterr().out)
-
     assert incomplete["models"]["delimiter"]["ready"] is False
     assert incomplete["ready_for_run"] is False
 
-    (tmp_path / "models/delimiter/conf").mkdir()
     (tmp_path / "models/delimiter/conf/model.conf").touch()
-    cli.command_doctor(
-        SimpleNamespace(config=str(config), check_planner_auth=False, strict=False)
-    )
+    cli.command_doctor(SimpleNamespace(config=str(config), check_kimi=False, strict=False))
     complete = json.loads(capsys.readouterr().out)
-
     assert complete["models"]["delimiter"]["ready"] is True
     assert complete["ready_for_run"] is True
 
 
-def test_doctor_reports_faster_whisper_command_backend_without_sensevoice_weights(
+def test_doctor_strict_passes_when_models_kimi_and_skill_are_ready(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(_MODEL_CONFIG + "kimi:\n  executable: kimi\n", encoding="utf-8")
+    _write_complete_models(tmp_path)
+    skill = tmp_path / "skills" / "gui-control" / "SKILL.md"
+    _prepare_windows_doctor(monkeypatch, kimi_path="C:/kimi/kimi.exe", skill=skill)
+
+    exit_code = cli.command_doctor(
+        SimpleNamespace(config=str(config), check_kimi=True, strict=True)
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["ready_for_control"] is True
+    assert report["kimi"] == {
+        "executable": "kimi",
+        "path": "C:/kimi/kimi.exe",
+        "found": True,
+        "version": "kimi 9.9.9",
+        "gui_control_skill": str(skill),
+        "working_directory": str(Path.home()),
+        "timeout_seconds": 600.0,
+    }
+
+
+def test_doctor_reports_faster_whisper_backend_without_sensevoice_weights(
     tmp_path, monkeypatch, capsys
 ) -> None:
     config = tmp_path / "config.yaml"
@@ -140,24 +148,11 @@ speech:
 """,
         encoding="utf-8",
     )
-    for directory in ("wake/am", "wake/conf", "delimiter/am", "delimiter/conf"):
-        (tmp_path / "models" / directory).mkdir(parents=True, exist_ok=True)
-    for relative in (
-        "wake/am/final.mdl",
-        "wake/conf/model.conf",
-        "delimiter/am/final.mdl",
-        "delimiter/conf/model.conf",
-        "vad.onnx",
-    ):
-        (tmp_path / "models" / relative).touch()
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
-    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
-    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
-    monkeypatch.setattr(cli, "_check_command", lambda *_args, **_kwargs: {"found": False})
+    _write_complete_models(tmp_path)
+    _prepare_windows_doctor(monkeypatch, kimi_path="C:/kimi/kimi.exe", skill=tmp_path / "s")
 
     exit_code = cli.command_doctor(
-        SimpleNamespace(config=str(config), check_planner_auth=False, strict=True)
+        SimpleNamespace(config=str(config), check_kimi=False, strict=True)
     )
 
     report = json.loads(capsys.readouterr().out)
@@ -169,7 +164,34 @@ speech:
         "weights_may_download_on_first_run": True,
     }
     assert report["modules"]["faster_whisper"] is True
-    assert report["ready_for_run"] is True
+    assert report["kimi"]["version"] is None
+
+
+def test_gui_control_skill_is_looked_up_in_configured_then_default_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    kimi = SimpleNamespace(skills_dir=tmp_path / "custom")
+    assert cli.gui_control_skill_path(kimi) is None
+
+    default_skill = tmp_path / "home" / ".kimi-code" / "skills" / "gui-control" / "SKILL.md"
+    default_skill.parent.mkdir(parents=True)
+    default_skill.write_text("---\nname: gui-control\n---\n", encoding="utf-8")
+    assert cli.gui_control_skill_path(kimi) == default_skill
+
+    custom_skill = tmp_path / "custom" / "gui-control" / "SKILL.md"
+    custom_skill.parent.mkdir(parents=True)
+    custom_skill.write_text("---\nname: gui-control\n---\n", encoding="utf-8")
+    assert cli.gui_control_skill_path(kimi) == custom_skill
+
+
+def test_resolve_kimi_accepts_a_full_path_or_a_name_on_path(tmp_path, monkeypatch) -> None:
+    exe = tmp_path / "kimi.exe"
+    exe.write_bytes(b"")
+    assert cli.resolve_kimi(str(exe)) == str(exe)
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda name: "C:/on/path/kimi.exe" if name == "kimi" else None
+    )
+    assert cli.resolve_kimi("kimi") == "C:/on/path/kimi.exe"
+    assert cli.resolve_kimi("missing") is None
 
 
 def test_json_fallback_remains_valid_on_legacy_console(monkeypatch) -> None:
@@ -198,162 +220,57 @@ def test_json_fallback_remains_valid_on_legacy_console(monkeypatch) -> None:
     assert parsed == {"device": "麦克风 👶"}
 
 
-def test_command_check_uses_shared_executable_resolver(monkeypatch) -> None:
-    monkeypatch.setattr(
-        cli,
-        "resolve_executable",
-        lambda name: "C:/resolved/codex.exe" if name == "codex" else None,
-    )
+def test_exec_hands_one_instruction_to_kimi(tmp_path, monkeypatch, capsys) -> None:
+    import handsfree_pc.kimi_agent as kimi_module
 
-    assert cli._check_command("codex") == {
-        "found": True,
-        "path": "C:/resolved/codex.exe",
-    }
-    assert cli._check_command("missing") == {"found": False, "path": None}
+    class FakeController:
+        def __init__(self) -> None:
+            self.calls = []
+            self.closed = False
+            self.last_run = SimpleNamespace(
+                tool_calls=3,
+                tool_names=["Skill", "Bash", "Bash"],
+                screenshot="C:/shots/final.png",
+                session_id="session_x",
+                returncode=0,
+            )
 
+        def run(self, instruction, *, cancel_event=None):
+            del cancel_event
+            self.calls.append(instruction)
+            return ControlResult(True, "已打开记事本", error_code="KIMI_COMPLETED")
 
-def test_doctor_never_claims_live_control_from_static_checks(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
-    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
-    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
+        def close(self):
+            self.closed = True
+
+    controller = FakeController()
+    built = []
+
+    def fake_build(kimi_settings, *, diagnostics=None, on_progress=None):
+        built.append((kimi_settings.executable, diagnostics is not None, callable(on_progress)))
+        return controller
+
+    class FakeDiagnostics:
+        path = tmp_path / "events.jsonl"
+
+        def event(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(kimi_module, "build_kimi_controller", fake_build)
+    monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
     config = tmp_path / "config.yaml"
-    config.write_text("{}\n", encoding="utf-8")
+    config.write_text("kimi:\n  executable: kimi-test\n", encoding="utf-8")
 
-    cli.command_doctor(SimpleNamespace(config=str(config), check_planner_auth=False, strict=False))
-
-    report = json.loads(capsys.readouterr().out)
-    assert report["live_control_verified"] is False
-    assert report["ready_for_live_control"] is False
-    assert report["computer_control"]["preflight_is_static_only"] is True
-
-
-def test_doctor_uses_desktop_planner_executables_and_accepts_codex_best_effort(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        """
-privacy:
-  allow_cloud_planner: true
-computer_control:
-  enabled: true
-  backend: local_agent
-  driver: windows_uia
-  planner_backend: codex_cli_best_effort
-  allow_screen_context_to_cloud: true
-  allow_codex_cli_host_read: true
-  codex_executable: desktop-codex
-  claude_executable: desktop-claude
-execution:
-  dry_run: false
-""",
-        encoding="utf-8",
-    )
-    checked: list[str] = []
-
-    def fake_check(name, *_args, **_kwargs):
-        checked.append(name)
-        return {"found": True, "path": f"C:/tools/{name}.exe"}
-
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cli.platform, "platform", lambda: "Windows-test")
-    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _name: object())
-    monkeypatch.setattr(cli, "list_audio_devices", lambda: [{"index": 0}])
-    monkeypatch.setattr(cli, "_check_command", fake_check)
-
-    exit_code = cli.command_doctor(
-        SimpleNamespace(config=str(config), check_planner_auth=False, strict=False)
-    )
+    exit_code = cli.command_exec(SimpleNamespace(config=str(config), text="打开记事本"))
 
     report = json.loads(capsys.readouterr().out)
     assert exit_code == 0
-    assert report["computer_control"]["planner_backend"] == "codex_cli_best_effort"
-    assert "desktop-codex" in checked
-    assert "desktop-claude" in checked
-
-
-def test_computer_doctor_live_uses_owned_fixture_result(tmp_path, monkeypatch, capsys) -> None:
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        """
-privacy:
-  allow_cloud_planner: false
-computer_control:
-  enabled: true
-  backend: local_agent
-  driver: windows_uia
-  planner_backend: none
-execution:
-  dry_run: false
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(
-        cli,
-        "_run_windows_uia_live_smoke",
-        lambda _settings: {
-            "driver": "windows_uia",
-            "fresh_observation": True,
-            "text_round_trip_verified": True,
-            "unicode_round_trip_verified": True,
-            "live_control_verified": True,
-        },
-    )
-
-    exit_code = cli.command_computer_doctor(SimpleNamespace(config=str(config), live=True))
-
-    report = json.loads(capsys.readouterr().out)
-    assert exit_code == 0
-    assert report["live_control_verified"] is True
-    assert report["unicode_round_trip_verified"] is True
-
-
-def test_computer_doctor_live_refuses_disabled_control(tmp_path, monkeypatch, capsys) -> None:
-    config = tmp_path / "config.yaml"
-    config.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-
-    exit_code = cli.command_computer_doctor(SimpleNamespace(config=str(config), live=True))
-
-    report = json.loads(capsys.readouterr().out)
-    assert exit_code == 2
-    assert report["error_type"] == "ComputerControlDisabled"
-
-
-def test_computer_doctor_reports_foreground_integrity_boundary_without_details(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        """
-privacy:
-  allow_cloud_planner: false
-computer_control:
-  enabled: true
-  backend: local_agent
-  driver: windows_uia
-  planner_backend: none
-execution:
-  dry_run: false
-""",
-        encoding="utf-8",
-    )
-
-    def fail_closed(_settings):
-        raise ForegroundIntegrityBoundary("private diagnostic details")
-
-    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cli, "_run_windows_uia_live_smoke", fail_closed)
-
-    exit_code = cli.command_computer_doctor(SimpleNamespace(config=str(config), live=True))
-
-    report = json.loads(capsys.readouterr().out)
-    assert exit_code == 2
-    assert report["live_control_verified"] is False
-    assert report["error_type"] == "ForegroundIntegrityBoundary"
-    assert "private diagnostic details" not in json.dumps(report)
+    assert controller.calls == ["打开记事本"]
+    assert controller.closed
+    assert built == [("kimi-test", True, True)]
+    assert report["success"] is True
+    assert report["tool_calls"] == 3
+    assert report["screenshot"] == "C:/shots/final.png"
 
 
 def test_logs_tail_outputs_only_bounded_diagnostic_events(tmp_path, capsys) -> None:
@@ -363,9 +280,9 @@ def test_logs_tail_outputs_only_bounded_diagnostic_events(tmp_path, capsys) -> N
             {
                 "timestamp": "2026-08-31T00:00:00.000Z",
                 "level": "error",
-                "stage": "observe_driver",
-                "error_code": "UIA_READ_FAILED",
-                "safe_message": "UI Automation could not read the target app",
+                "stage": "kimi_agent",
+                "error_code": "KIMI_TIMEOUT",
+                "safe_message": "Kimi timed out",
                 "prompt": "private prompt",
             }
         )
@@ -382,7 +299,7 @@ def test_logs_tail_outputs_only_bounded_diagnostic_events(tmp_path, capsys) -> N
     assert "prompt" not in report["events"][0]
 
 
-def test_diagnose_last_reports_newest_failure_without_raw_fields(tmp_path, capsys) -> None:
+def test_diagnose_last_reports_newest_failure(tmp_path, capsys) -> None:
     path = tmp_path / "handsfreepc.jsonl"
     path.write_text(
         "\n".join(
@@ -391,9 +308,9 @@ def test_diagnose_last_reports_newest_failure_without_raw_fields(tmp_path, capsy
                     {
                         "timestamp": "2026-08-31T00:00:00.000Z",
                         "level": "error",
-                        "stage": "plan",
-                        "error_code": "PLANNER_FAILED",
-                        "safe_message": "Planner returned no safe next step",
+                        "stage": "kimi_agent",
+                        "error_code": "KIMI_REPORTED_FAILURE",
+                        "safe_message": "Kimi reported the task failed",
                     }
                 ),
                 json.dumps(
@@ -416,8 +333,8 @@ def test_diagnose_last_reports_newest_failure_without_raw_fields(tmp_path, capsy
     report = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert report["found"] is True
-    assert report["event"]["stage"] == "plan"
-    assert report["event"]["error_code"] == "PLANNER_FAILED"
+    assert report["event"]["stage"] == "kimi_agent"
+    assert report["event"]["error_code"] == "KIMI_REPORTED_FAILURE"
 
 
 def test_diagnostic_subcommands_accept_tail_and_empty_log(tmp_path, capsys) -> None:
@@ -437,25 +354,30 @@ def test_diagnostic_subcommands_accept_tail_and_empty_log(tmp_path, capsys) -> N
     }
 
 
+def test_parser_exposes_only_the_current_commands() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(["exec", "打开记事本"])
+    assert args.func is cli.command_exec
+    assert args.text == "打开记事本"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["simulate", "x"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["computer-doctor"])
+
+
 def test_transcripts_tail_outputs_raw_text_and_absolute_path(tmp_path, capsys) -> None:
     path = (tmp_path / "asr-transcripts.jsonl").resolve()
     raw = "  切换到 Claude，打开 Chat and Cowork  "
     path.write_text(
         json.dumps(
-            {
-                "timestamp": "2026-09-01T00:00:00.000Z",
-                "source": "command_utterance",
-                "text": raw,
-            },
+            {"timestamp": "2026-09-01T00:00:00.000Z", "source": "command_utterance", "text": raw},
             ensure_ascii=False,
         )
         + "\n",
         encoding="utf-8",
     )
 
-    exit_code = cli.command_transcripts(
-        SimpleNamespace(config=None, path=str(path), tail=10)
-    )
+    exit_code = cli.command_transcripts(SimpleNamespace(config=None, path=str(path), tail=10))
 
     report = json.loads(capsys.readouterr().out)
     assert exit_code == 0
@@ -464,25 +386,25 @@ def test_transcripts_tail_outputs_raw_text_and_absolute_path(tmp_path, capsys) -
     assert report["entries"][0]["text"] == raw
 
 
+class _FakeDiagnostics:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.events = []
+
+    def event(self, **kwargs) -> None:
+        self.events.append(kwargs)
+
+
 def test_run_prints_diagnostic_and_transcript_locations(
-    settings,
-    tmp_path,
-    monkeypatch,
-    capsys,
+    settings, tmp_path, monkeypatch, capsys
 ) -> None:
     diagnostic_path = (tmp_path / "diagnostics.jsonl").resolve()
     transcript_path = (tmp_path / "transcripts.jsonl").resolve()
-
-    class FakeDiagnostics:
-        path = diagnostic_path
-
-        @staticmethod
-        def event(**_kwargs):
-            pass
+    constructed = []
 
     class FakeRuntime:
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, passed_settings, *, diagnostics, transcript_journal):
+            constructed.append((passed_settings, diagnostics, transcript_journal))
 
         @staticmethod
         def run_microphone() -> None:
@@ -492,76 +414,55 @@ def test_run_prints_diagnostic_and_transcript_locations(
         def stop() -> None:
             pass
 
-    monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+    diagnostics = _FakeDiagnostics(diagnostic_path)
+    monkeypatch.setattr(cli, "configure_diagnostics", lambda: diagnostics)
     monkeypatch.setattr(cli, "_acquire_single_instance_lock", lambda: tmp_path / "run.lock")
     monkeypatch.setattr(cli, "load_settings", lambda _config: settings)
-    monkeypatch.setattr(cli, "_build_executor", lambda _settings: object())
     monkeypatch.setattr(cli, "default_transcript_path", lambda: transcript_path)
     monkeypatch.setattr("handsfree_pc.runtime.VoiceRuntime", FakeRuntime)
 
-    assert cli.command_run(SimpleNamespace(config=None)) == 0
+    exit_code = cli.command_run(SimpleNamespace(config=None))
 
     report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
     assert report == {
         "diagnostics_file": str(diagnostic_path),
         "transcripts_enabled": False,
         "transcript_file": str(transcript_path),
-        "audio_saved": False,
     }
+    assert constructed == [(settings, diagnostics, None)]
+    assert [event["error_code"] for event in diagnostics.events] == [
+        "RUNTIME_STARTED",
+        "RUNTIME_STOPPED",
+    ]
 
 
-def test_run_records_runtime_lifecycle_without_transcript_content(monkeypatch, tmp_path) -> None:
-    events: list[dict[str, object]] = []
+def test_run_refuses_a_second_listener(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_acquire_single_instance_lock", lambda: None)
 
-    class FakeDiagnostics:
-        def event(self, **kwargs):
-            events.append(kwargs)
+    exit_code = cli.command_run(SimpleNamespace(config=None))
 
-    class FakeRuntime:
-        stopped = False
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 3
+    assert "already running" in report["error"]
 
-        def __init__(self, *_args, **_kwargs):
-            pass
 
-        @staticmethod
-        def run_microphone() -> None:
-            pass
-
-        def stop(self) -> None:
-            self.stopped = True
-
-    monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
+def test_run_records_initialization_failure_by_exception_type_only(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    diagnostics = _FakeDiagnostics(tmp_path / "diagnostics.jsonl")
+    monkeypatch.setattr(cli, "configure_diagnostics", lambda: diagnostics)
     monkeypatch.setattr(cli, "_acquire_single_instance_lock", lambda: tmp_path / "run.lock")
-    monkeypatch.setattr(cli, "load_settings", lambda _config: object())
-    monkeypatch.setattr(cli, "_build_executor", lambda _settings: object())
-    monkeypatch.setattr("handsfree_pc.runtime.VoiceRuntime", FakeRuntime)
 
-    assert cli.command_run(SimpleNamespace(config=None)) == 0
-    assert [event["error_code"] for event in events] == ["RUNTIME_STARTED", "RUNTIME_STOPPED"]
-    assert all("prompt" not in event and "uia_text" not in event for event in events)
+    def broken_settings(_config):
+        raise RuntimeError("private detail C:\\Users\\someone\\secret.yaml")
 
+    monkeypatch.setattr(cli, "load_settings", broken_settings)
 
-def test_run_records_initialization_failure_by_exception_type_only(monkeypatch, tmp_path) -> None:
-    events: list[dict[str, object]] = []
-
-    class FakeDiagnostics:
-        def event(self, **kwargs):
-            events.append(kwargs)
-
-    monkeypatch.setattr(cli, "configure_diagnostics", lambda: FakeDiagnostics())
-    monkeypatch.setattr(cli, "_acquire_single_instance_lock", lambda: tmp_path / "run.lock")
-    monkeypatch.setattr(
-        cli,
-        "load_settings",
-        lambda _config: (_ for _ in ()).throw(RuntimeError("private configuration detail")),
-    )
-
-    with pytest.raises(RuntimeError, match="private configuration detail"):
+    with pytest.raises(RuntimeError):
         cli.command_run(SimpleNamespace(config=None))
 
-    assert len(events) == 1
-    assert events[0]["stage"] == "runtime"
-    assert events[0]["error_code"] == "RUNTIME_INITIALIZATION_FAILED"
-    assert events[0]["safe_message"] == "HandsFreePC voice runtime could not initialize"
-    assert isinstance(events[0]["exception_type"], RuntimeError)
-    assert "private configuration detail" not in str(events[0]["safe_message"])
+    capsys.readouterr()
+    assert diagnostics.events[-1]["error_code"] == "RUNTIME_INITIALIZATION_FAILED"
+    assert isinstance(diagnostics.events[-1]["exception_type"], RuntimeError)
+    assert "secret" not in diagnostics.events[-1]["safe_message"]

@@ -18,21 +18,7 @@ LOG_BACKUP_COUNT = 5
 DEFAULT_TAIL_COUNT = 50
 MAX_TAIL_COUNT = 500
 
-DIAGNOSTIC_STAGES = frozenset(
-    {
-        "native_route",
-        "list_apps",
-        "plan",
-        "observe_driver",
-        "observe_safety",
-        "action_safety",
-        "execute",
-        "reobserve",
-        "verify_action",
-        "verify_completion",
-        "runtime",
-    }
-)
+DIAGNOSTIC_STAGES = frozenset({"runtime", "transcribe", "kimi_agent"})
 
 _ALLOWED_LEVELS = frozenset({"debug", "info", "warning", "error"})
 _SAFE_EVENT_FIELDS = (
@@ -67,9 +53,7 @@ _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\."
     r"[A-Za-z0-9_-]{6,}(?![A-Za-z0-9_-])"
 )
-_OPAQUE_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])[A-Za-z0-9_+/=.-]{40,512}(?![A-Za-z0-9_])"
-)
+_OPAQUE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9_+/=.-]{40,512}(?![A-Za-z0-9_])")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SPACE_RE = re.compile(r"\s+")
 
@@ -81,100 +65,10 @@ class DiagnosticStatus:
     safe_message: str
 
 
-_CONTROL_FAILURE_RULES: tuple[tuple[tuple[str, ...], DiagnosticStatus], ...] = (
-    (
-        ("native_", "确定性本机", "本机动作"),
-        DiagnosticStatus(
-            "native_route",
-            "NATIVE_ROUTE_FAILED",
-            "确定性本机操作没有完成",
-        ),
-    ),
-    (
-        ("桌面驱动不可用", "应用清单", "app inventory", "list_apps"),
-        DiagnosticStatus(
-            "list_apps",
-            "APP_INVENTORY_FAILED",
-            "无法建立当前可见应用清单",
-        ),
-    ),
-    (
-        ("规划器", "planner", "plan failed"),
-        DiagnosticStatus(
-            "plan",
-            "DESKTOP_PLAN_FAILED",
-            "单步规划器没有返回可执行的安全步骤",
-        ),
-    ),
-    (
-        ("安全策略阻止读取", "安全策略阻止观察", "界面不能发送给规划器"),
-        DiagnosticStatus(
-            "observe_safety",
-            "OBSERVATION_SAFETY_BLOCKED",
-            "本地界面安全检查未通过",
-        ),
-    ),
-    (
-        ("桌面观察失败", "observe failed", "observation failed"),
-        DiagnosticStatus(
-            "observe_driver",
-            "DESKTOP_OBSERVE_FAILED",
-            "桌面驱动未能建立可用的界面观察",
-        ),
-    ),
-    (
-        ("安全策略阻止动作", "安全分类", "action safety"),
-        DiagnosticStatus(
-            "action_safety",
-            "ACTION_SAFETY_BLOCKED",
-            "本地动作安全检查未通过",
-        ),
-    ),
-    (
-        ("动作后本地验收", "verify_action", "action verification"),
-        DiagnosticStatus(
-            "verify_action",
-            "ACTION_VERIFICATION_FAILED",
-            "动作后的本地界面变化未通过验收",
-        ),
-    ),
-    (
-        (
-            "动作后任务条件",
-            "本地完成条件",
-            "全部桌面步骤",
-            "达到最大单步数",
-            "verify_completion",
-            "completion verification",
-        ),
-        DiagnosticStatus(
-            "verify_completion",
-            "COMPLETION_VERIFICATION_FAILED",
-            "用户要求的最终界面条件尚未得到本地证明",
-        ),
-    ),
-    (
-        ("桌面动作", "执行失败", "execute failed", "刷新失败"),
-        DiagnosticStatus(
-            "execute",
-            "DESKTOP_EXECUTION_FAILED",
-            "桌面动作或动作后的刷新没有完成",
-        ),
-    ),
-)
-
 _STAGE_DISPLAY_NAMES = {
-    "native_route": "本机指令路由",
-    "list_apps": "可见应用检查",
-    "plan": "单步规划",
-    "observe_driver": "桌面观察",
-    "observe_safety": "界面安全检查",
-    "action_safety": "动作安全检查",
-    "execute": "桌面执行",
-    "reobserve": "动作后刷新",
-    "verify_action": "动作验收",
-    "verify_completion": "完成条件验收",
     "runtime": "运行时",
+    "transcribe": "语音转写",
+    "kimi_agent": "Kimi 执行",
 }
 
 
@@ -188,28 +82,17 @@ def classify_control_failure(
 ) -> DiagnosticStatus:
     """Convert a controller failure to a fixed, non-content-bearing status.
 
-    Structured controller fields win when valid. The legacy message is used only for literal
-    category matching and is never copied into the returned status or diagnostics log.
+    Structured controller fields win when valid.  The raw message is never
+    copied into the returned status or the diagnostics log.
     """
 
+    del message, error_type
     if isinstance(stage, str) and stage in DIAGNOSTIC_STAGES:
         code = _safe_code(error_code, fallback="CONTROL_COMMAND_FAILED")
         summary = sanitize_safe_message(safe_message) if isinstance(safe_message, str) else ""
         if not summary or summary == "Diagnostic detail unavailable":
             summary = "电脑控制指令在本地处理期间失败"
         return DiagnosticStatus(stage, code, summary)
-
-    normalized_error = _safe_exception_type(error_type)
-    if normalized_error == "ConfirmationChallengeUnavailable":
-        return DiagnosticStatus(
-            "runtime",
-            "CONFIRMATION_CHALLENGE_UNAVAILABLE",
-            "无法签发唯一的语音确认口令，操作已取消",
-        )
-    normalized = message.casefold() if isinstance(message, str) else ""
-    for needles, status in _CONTROL_FAILURE_RULES:
-        if any(needle.casefold() in normalized for needle in needles):
-            return status
     return DiagnosticStatus(
         "runtime",
         "CONTROL_COMMAND_FAILED",

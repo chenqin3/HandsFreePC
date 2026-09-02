@@ -6,7 +6,7 @@ import unicodedata
 _PUNCTUATION_RE = re.compile(r"[，。！？；、,:：;!?]+")
 _SPACE_RE = re.compile(r"\s+")
 _WAKE_SUFFIX_TRIM = " \t\r\n,，.。;；!！?？:：、"
-_WAKE_CLOSING_QUOTES = frozenset('"\'”’」』》〉】)]}')
+_WAKE_CLOSING_QUOTES = frozenset("\"'”’」』》〉】)]}")
 
 
 def normalize_text(text: str) -> str:

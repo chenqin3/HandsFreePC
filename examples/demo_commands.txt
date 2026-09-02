@@ -1,5 +1,0 @@
-# Deterministic, non-destructive commands used by `handsfreepc simulate`.
-打开C盘的Windows文件夹
-切换到屏幕反馈
-切换到桌面上的codex app，打开其中的演示项目下的语音设计对话，打开语音输入
-打开claude app，到chat选项卡里面，开启一个design，接下来我会语音输入

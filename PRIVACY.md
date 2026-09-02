@@ -1,235 +1,35 @@
-# HandsFreePC 0.4 隐私说明
+# HandsFreePC 隐私说明
 
-HandsFreePC 是本地优先、常开麦克风的 Windows 辅助工具。公开配置默认不保存录音或转写，不启用云 planner，不启用电脑控制，不允许屏幕上下文离机，并保持 `execution.dry_run: true`。
+## 什么留在本机
 
-“默认不保存”不等于声音从未被处理：运行期间音频、预卷、转写 fragment、pending prompt 和 FIFO 任务会短暂存在内存中。Windows 音频驱动、杀毒软件、调试器、你安装的其他程序以及 Codex/Claude CLI 有各自的数据边界。
+- **语音识别全部离线**：VAD、控制词检测、`over` 检测和指令正文转写都在本机运行，麦克风音频只在内存里处理，不会写盘。
+- **事件日志**只有固定字段（时间、级别、阶段、错误码、一句安全说明、会话/指令编号），不含指令原文、路径、窗口标题或屏幕内容。位置：`%LOCALAPPDATA%\HandsFreePC\logs\`。
+- **识别原文**默认不保存。`privacy.save_transcripts: true` 时才写到 `%LOCALAPPDATA%\HandsFreePC\transcripts\`，用于你自己排查听错的词。
 
-## 默认本地数据流
+## 什么离开本机
 
-```text
-麦克风 PCM block（内存）
-  +-> 本地中文 Vosk：开始/结束/急停/确认/恢复等控制词
-  +-> 本地英文 Vosk：检测 over，并绑定本地样本区间
-  +-> 本地 Silero VAD：形成完整话语
-      -> 按每个 over 样本区间把本轮原始捕获切成 n+1 段（marker 音频不进入正文 ASR）
-      -> 本地正文 ASR：SenseVoice（默认）或显式启用的 faster-whisper
-      -> PromptAssembler：每个 marker 完成其前一段 prompt，尾段留作下一条
-      -> 本地有界 FIFO
-```
+每条指令都交给 Kimi Code CLI 执行，Kimi 是云端模型（Moonshot）。因此：
 
-中文控制词 Vosk、英文 `over` Vosk、Silero VAD 和所选正文 ASR 复用同一个麦克风采集流中的内存音频 block；英文 detector 不会另开麦克风，也不会因此保存音频。项目固定下载器只会在用户运行 `scripts/install.ps1 -DownloadModels`、`handsfreepc download-models` 或 `scripts/download-models.ps1` 时下载所列 Vosk/Silero/SenseVoice 工件并核对固定哈希、文件和许可元数据。若用户另行把正文 backend 设为 `faster-whisper`，上游库可能在第一次构造模型时从模型托管站下载权重；这项额外网络与缓存边界必须单独知情启用。
+- **指令文本**（本地转写的结果）和运行时附加的前言会发送给 Kimi。
+- **Kimi 在执行中自己截的屏幕截图、读取的文件和工具输出**都会作为模型上下文发送给 Kimi。屏幕上当时有什么，模型就可能看到什么。
+- Kimi 的会话记录由 Kimi CLI 按它自己的规则保存在本机，本项目不额外保存。
 
-默认：
+本项目不做任何内容过滤：不会识别密码框、支付页或聊天内容并阻止发送。
 
-- `privacy.save_audio: false`；
-- `privacy.save_transcripts: false`；
-- `privacy.allow_cloud_planner: false`；
-- `computer_control.enabled: false`；
-- `computer_control.safety_profile: strict`；
-- `computer_control.allow_screen_context_to_cloud: false`；
-- `workmap.enabled: false`；
-- `execution.dry_run: true`；
-- `speech.fallback.backend: none`。
+## Kimi 会做什么
 
-`privacy.save_audio` 当前没有受支持的录音持久化器，设置为 `true` 也不会保存 PCM。`privacy.save_transcripts` 则是独立的显式 opt-in：为 `true` 时，送入会话层的本地 ASR 文本会写入 `%LOCALAPPDATA%\HandsFreePC\transcripts\asr-transcripts.jsonl`。内容、标点和大小写不再经过 prompt 归一化，但模型 adapter 会去掉首尾空白。它包括 wake utterance、普通 command utterance，以及按 `over` 样本边界形成的每个 segment；调用 ASR 后返回空和被静音门控跳过都会记录，后者带 `transcribed: false` 与 `skip_reason: silence_energy_gate`。记录带 UTC timestamp、source，可带 session ID 和 segment index/count；单文件最大 5 MiB，保留 5 个备份。
+- `kimi -p` 模式下 Kimi 不经确认就执行工具调用，包括点击、输入、发送消息、发送文件。
+- 运行时前言要求 Kimi：不要反问；说了「不要发送」的内容不按 Enter、不点发送；拿不准就选最像的一个。这些是对模型的要求，不是硬性保证。
+- 说「电脑停止」会终止 Kimi 进程树并清空队列，但已经发生的点击和输入无法撤销。
 
-原文日志与 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl` 的隐私受限诊断事件完全分开，后者仍不接受 prompt/transcript 字段。运行时启动会打印两者的绝对路径及原文启用状态；`handsfreepc transcripts --tail 50` 会原样显示最近记录。原文可能包含口述的姓名、路径、对话或其他敏感内容，启用前应确认本机账户、备份和同步目录的访问边界。该开关不保存 PCM，也不会补录启用前的内容。
+## 常开麦克风
 
-## 连续语音会话
-
-说“开始语音操作”后，所选本地正文 ASR 的转写被拼到内存。只有识别到独立 `over` 后，完整 prompt 才进入队列。说“结束语音操作”会丢弃未完成半条并排空已接受任务；它不会关闭麦克风。急停会请求取消当前任务并清队列，也不会删除已经送往 provider 的数据或撤回外部副作用。
-
-0.4.0 使用独立的本地英文 Vosk small-en-us 0.15 小词表 detector 识别 `over`，同时保留所选正文 ASR 的独立单词识别作为后备。运行时请求 Vosk 的词级及 partial 词级时间，把每次命中绑定为当前麦克风流中的单调样本区间；若某次识别结果没有可用词时间，则只退回到命中所在音频 block 的区间，不把这个近似写成精确词边界。
-
-detector 命中不会用异常提前截断 VAD。VAD 返回后，程序使用本轮保存在内存中的原始捕获，按一个或多个 marker 区间切成 n+1 段；marker 区间本身不送入正文 ASR，其他片段先经过保守的分窗能量门控，明显静音返回空串，真实有声段再在本地转写。每个 marker 依次调用 `PromptAssembler.finalize()` 完成它前面的 prompt，最后一段则保留为下一条 pending prompt，因此同一 VAD 话语中的多个 `over` 可以按顺序形成多条 FIFO 任务。样本边界减少了把 marker 或后一条正文混入前一条的风险，但仍不保证所有口音、噪声、设备和语速下都能正确识别或精确切分，用户仍应以入队反馈确认结果。
-
-安装或从 0.3.x 或更早版本升级到 0.4.0 后需要重新运行 `download-models`，否则本地语音会话会因缺少英文 delimiter 模型而无法初始化；可用 `doctor --strict` 检查 `models.delimiter.ready`。这是一次显式的本地模型下载，不表示运行时会后台联网，也不改变默认“不保存音频或转写”的设置。
-
-## NativeSkillRouter
-
-确定性本地命令在完整命中时不会调用 Codex/Claude。它会把转写留在当前进程内，使用本地路径/应用配置、WindowsExecutor 和安全策略。
-
-但“本地”不等于“无旁观风险”：overlay 可能显示识别文本，SAPI 可能朗读路径、项目名、错误和确认摘要。使用前按旁观/旁听环境选择 `overlay`、`voice`、`both` 或 `silent`。
-
-### 旧单句 cloud fallback 的单独边界
-
-顶层 `planner.enabled` 属于兼容 `VoiceRuntime` 的 one-shot fallback，不是下面的 0.4 desktop step planner。确定性 parser miss 时，它接收用户完成的原句，以及只含 runtime state、已配置应用名和当前 feedback mode 的 `current_non_sensitive_context`；HandsFreePC 不为这条路径附加窗口标题、UIA tree、截图或路径目录清单。它仍会把原句发送给所选 CLI/provider，且下文所述账户、网络、runtime 与诊断元数据边界同样适用。
-
-该云输出只可提出用户原句中肯定、非引号/数据引用且精确授权的应用 UI 导航（激活应用、打开明确项目/对话/tab/mode、进入明确听写或应用内语音）。反馈切换、暂停、恢复、等待、路径打开、文本输入和发送 prompt 不能由它决定；这些动作只接受本地确定性 parser 的完整命中。
-
-## 启用 0.4 云单步 planner 后发送什么
-
-只有同时设置以下许可，`local_agent` 的 Codex/Claude planner 才可用于真实电脑控制：
-
-```yaml
-privacy:
-  allow_cloud_planner: true
-
-computer_control:
-  enabled: true
-  backend: local_agent
-  planner_backend: claude
-  safety_profile: strict
-  allow_screen_context_to_cloud: true
-  allow_codex_cli_host_read: false
-  allow_legacy_codex_computer_use: false
-
-execution:
-  dry_run: false
-```
-
-NativeSkillRouter miss 后，每个 planner step 当前可能收到：
-
-- 用户完成的一条语音 prompt；
-- 当前 task-authorized observation generation；
-- 最近最多 8 条本地验收历史；
-
-随后按 profile 扩展：
-
-- `strict`：用户原句中唯一明确授权、当前可见的 app 摘要，以及仅由本句肯定、精确点名的可寻址 UIA 控件；
-- `personal_trusted`：同一已本地验收 app/window 的摘要、安全导航控件和当前输入框；
-- `local_unrestricted`：本轮 fresh 枚举、并可在后续步骤间动态刷新的**全部可见普通顶层窗口**，每个窗口独立包含动态 app ID、display name、foreground 状态、process name 和真实窗口标题。planner 选择一个窗口并 observe 后，还会收到该窗口的真实标题，以及经凭据过滤的全部可寻址 `CONTROL`/`INPUT` UIA 控件（index、名称、control type、selected/focused/enabled 等）。同一进程的多个 Chrome 顶层窗口也是不同候选。
-
-`strict`/`personal_trusted` 仍要求一条任务只绑定一个明确应用或已 fresh-verified 的继承窗口；零个、多个、否定或顺带提及时不会让 planner 猜目标。`local_unrestricted` 刻意取消这项 app-scope 门禁，planner 可从上述 fresh inventory 自选窗口并跨应用导航，因此不会产生 `APP_SCOPE_REQUIRED`。这不表示忽略用户明确的定位词：若口述明确指定 app、窗口或字段，完成该用户步骤的动作仍须精确绑定所说 window/field；只是无需为了启动 planner 先提供 app scope。
-
-三种 profile 都**不发送**原始 PCM、未由 `over` 完成的 pending 半条、剪贴板、全量目录清单、元素 value/automation ID、密码字段值，或名称含常见 API key/token/secret/password/credential 标记的环境变量。`CONTENT` plane 节点不会作为结构化 UIA 元素进入 planner；高置信度凭据节点会被删除/脱敏，普通不透明长标识也会从 planner view 排除。
-
-截图边界按 profile 和 adapter 不同：`strict`/`personal_trusted` 不把截图字节、真实截图可用性或原始窗口标题放进 planner view。`local_unrestricted/windows_uia` 会在 observe 时捕获**选中窗口**而非全桌面的完整 PNG，并保留真实标题；使用 `codex_cli_best_effort` 时，超过 planner canvas 上限的全窗截图会在保持宽高比的前提下缩小到最大边 2048 px，缩放后的 PNG 写入本轮一次性临时目录并通过 `codex exec --image` 发送给 Codex。原始分辨率截图留在本地用于窗口、坐标和 target patch 复核；planner 返回的 canvas 坐标按两轴比例映射回原始截图像素。Claude adapter 当前不接收 PNG 字节，但会接收文本化的窗口 inventory、真实标题和 UIA context。截图可能视觉呈现聊天正文、文件名、通知或其他内容，即使这些内容没有作为结构化 `CONTENT` 节点发送。
-
-显式视觉 fallback 以这张完整 PNG 为主规划信号；PaddleOCR 不是前置条件。`visual_ocr.enabled: true`、`ocr_regions_enabled: false` 时不会调用 OCR endpoint，截图 viewport 仍可规划。只有 `ocr_regions_enabled: true` 时，同一 exact-window PNG 才会另送到配置的 PaddleOCR endpoint 以生成文本区域；默认只接受 numeric loopback，非 loopback 必须额外设置 `allow_remote_screen_ocr: true`。项目附带的 loopback server 不保留 PNG 并关闭 access log，但自选 endpoint 的存储、日志和传输政策不由 HandsFreePC 控制。
-
-视觉动作是逐步重截图的：每次 planner 只返回一个动作；执行前在本地重截并重绑目标，执行后取得一张 fresh 窗口截图，再把新 frame 用于下一步 Codex 规划和本地验证。因此一个多步视觉任务可能向 Codex/provider 发送多张同一选中窗口在不同状态下的 PNG，而不是只发送首帧。
-
-渲染搜索输入只在本机 Win32 `GetGUIThreadInfo` 证明 exact target HWND/process/thread 仍为 active/focus owner、存在可见 system caret 且 caret 与刚才点击的位置相符后，才在下一张 fresh observation 中开放一次。可输入内容只能是用户本句中的精确搜索/目标文字，不得从截图抄取、改写或扩展为消息正文、prompt、身份/付款信息。输入后会重新截图；若相同 focus/caret 绑定仍有效且画面没有出现结果，可再执行一次 Enter/Return 作为搜索转换，并立即 fresh observe。该能力不开放 Send、Submit 或任意消息发送。Win32 HWND/TID/caret rectangle 等原始证明只在本地绑定和复核，不作为 planner 的结构化文本字段发送。
-
-`visual_ocr.apps` 中包含 `wechat` 会扩大这种受限截图、点击、滚动和搜索范围，但不表示支持任意微信输入或发送。若一次已绑定动作把前台切到同一进程或父子进程树中的关联窗口，例如微信的 `WeChatAppEx` 搜一搜窗口，driver 只有在精确核验新 HWND/PID/process/title 并更新动态 app binding 后才继续截图；新窗口的像素也可能进入后续 Codex/provider context。无关联、身份不唯一或 foreground 变化无法解释时停止。
-
-完整原始 UIA 快照仍可能包含病历、学生信息、客户数据、聊天内容、文件名或页面里的无关私人信息，并留在本地做 fingerprint、目标重绑定和 after-state 验收；`local_unrestricted` 发送的是凭据过滤后的可寻址控件子集和真实标题，而不是完整原始 tree。该最小化不是完整 DLP，截图尤其可能绕过结构化节点分类，所以仍要求独立屏幕上下文许可，并应先关闭无关窗口、使用非敏感测试账户验收。
-
-密码元素值不会进入 observation。敏感 surface 分类依据顶层窗口/对话框身份、密码属性、当前聚焦输入框、相邻标签和具体目标元素；聊天正文中出现 password、terminal、payment 或凭据示例不会单独阻断整窗。`strict`/`personal_trusted` 会在发送 planner view 前阻断已识别的认证、密码、UAC/Windows Security、付款和聚焦 secret/API-key surface。`local_unrestricted` 在 observe 前阻断已识别的终端/Run/UAC/认证身份、聚焦 secret 字段和高置信凭据，付款/隐私/账户目标则在动作评估时硬阻断；但全窗口标题 inventory 已发送，选中窗口像素也可能在动作阻断前交给 Codex。规则无法识别所有语言、同义词、自绘控件或伪装界面，因此这不是完整 DLP。
-
-通用 UI confirmation 摘要若需要原文显示一个目标标签，只回显用户原句中已经验证的 exact target label。未授权 sibling/window label 的原文和语义只在本地分类，不进入摘要；摘要中的短 digest 只是不可逆绑定元数据。文本 payload 只取用户亲口给出的 exact span；确定性 native path 摘要可能另行显示已解析路径，因此 overlay/SAPI 的路径旁观风险仍适用。
-
-以上列表只描述 **HandsFreePC 主动构造的 planner 输入**，不是 CLI/provider 的完整数据清单。即使项目过滤环境变量并使用临时工作目录，Codex/Claude CLI 及其提供商仍可能处理账户/组织、认证、网络地址、CLI 与 OS/runtime 版本、调用时间、用量、错误和诊断/遥测等自身元数据，也可能构造自己的系统级 runtime context。HandsFreePC 不能查看、删除或承诺这些数据为零；应按所用 CLI 版本、账户类型和提供商当前政策单独审查。
-
-## Claude planner 边界
-
-Claude 是 0.4 的默认 desktop planner。adapter 使用独立 system policy、safe/restricted 模式、空工具列表、严格 MCP 配置、非交互权限模式、JSON Schema 和无会话持久化。它仍会把上述 prompt/context 发送给 Anthropic，并需要本机登录。
-
-`--no-session-persistence` 只描述本次 CLI 的本地会话行为，不等于 provider 零保留。消费者、商业账户和组织设置可能不同；使用前阅读 Anthropic 当前数据使用说明并核对账户设置。
-
-## Codex planner 边界
-
-Codex 不是默认 planner。只有显式设置 `planner_backend: codex_cli_best_effort` 和 `allow_codex_cli_host_read: true` 后，0.4 单步 adapter 才可使用 ephemeral 临时目录、忽略用户配置/规则、结构化输出、environment filtering 与 read-only sandbox。它没有 HandsFreePC 的 DesktopDriver，也不复用旧 Computer Use thread。在 `local_unrestricted/windows_uia` 下，HandsFreePC 会把本轮选中窗口的 PNG 暂存到该 ephemeral 目录并通过 `--image` 交给 Codex；临时文件清理不等于 provider 未处理或未保留图像。
-
-项目会尽量禁用当前已知工具，但订阅版 Codex CLI 没有可由本项目证明的完整 no-tools 模式。read-only sandbox 也不是主机保密容器：CLI 仍以当前用户身份运行；空目录、deny list 和 prompt 禁令不证明当前用户可读文件绝对不可访问。不要在包含高敏感文件的主机上仅凭这些参数开启 planner。
-
-Codex 的认证、传输、服务端留存、训练/数据控制、错误报告和缓存由当前账户与 OpenAI 产品政策决定。HandsFreePC 不代理或删除这些数据。参考 [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data)；使用订阅登录的用户还应检查当前 ChatGPT/Codex 账户设置。
-
-## 项目自有 Windows UIA driver
-
-默认 `strict`/`personal_trusted` 的 `windows_uia` 在本机读取已配置目标应用的窗口标题、进程元数据和 accessibility tree；执行 UIA semantic action 或 Unicode `SendInput`，并重新读取状态做本地验证。`local_unrestricted` 改为 fresh 枚举全部可见顶层 HWND，observe 时先激活并核验选中的确切 HWND/PID/process/title，再读取 UIA 与窗口截图。渲染搜索框不因“看起来像输入框”就获得输入权；driver 还会在本地通过 `GetGUIThreadInfo` 读取 active/focus/caret HWND、目标 PID/TID 和映射到屏幕坐标的可见 caret rectangle，并把它们绑定到刚才的 exact-window 点击。
-
-启用云 planner 时，进入 planner 的范围以本节前述 profile 差异为准；完整原始 UIA 元数据仍只在本地 verifier 使用。使用 `planner_backend: none` 时不发送给 Codex/Claude，但 generic miss 无法规划，只能运行确定性 native skill。
-
-driver 不使用剪贴板，不读取 password value，也不建立 screenshot 或 PCM 音频历史。`local_unrestricted` 截图在内存中形成；Codex adapter 需要时只写入本轮临时目录，随后由临时目录生命周期清理。ASR 原文只有在 `privacy.save_transcripts: true` 时由独立本机 journal 保存；driver 自身不另建 transcript 文件。操作会占用前台窗口，并可能让旁人看到输入或使目标应用自己产生历史、草稿、审计日志和云同步；这些外部持久化不受 `save_transcripts` 控制。
-
-公开默认 `strict` 中，通用 agent 的 `type_text`/`set_value` 即使只写草稿，也必须先显示/播报本轮随机四位一次性确认口令。仅在本机忽略提交配置中显式启用的 `personal_trusted`，可把本句完整口述草稿免确认写入唯一聚焦、非密码输入框，但不会自动发送；发送、提交及其他副作用仍需确认。单独说静态“确认执行”无效。同一 `VoiceRuntime` 进程内已签发码在确认、取消或超时后都不回收，有界重抽耗尽时拒绝；去重集合不持久化，重启后不保证绝对不复用。挑战码不是持久化防重放凭证或说话人认证，也不能阻止同一房间的人、扬声器或实时转述/重放获取本轮口令后代说。
-
-`local_unrestricted` 不保留上述 app-scope、普通导航目标点名与普通低风险导航确认限制；窗口/选项卡切换、菜单导航、Toggle 和未命中风险分类的通用 OK/Continue 对话框可由 planner 推断并直接进入本地验收。UIA 可寻址的自然“搜索 X”必须把搜索/地址字段设为精确原文 `X`、按 Enter/Return，并用 fresh result transition 验收，而不是只验证文字写入。渲染搜索遵循更窄的 focus/caret 单次输入链；只有相同绑定在输入后仍有效且画面没有结果时，才可按一次 Enter/Return，绝不把它解释成聊天发送或任意 submit。明确口述的 app/window/field 仍需 exact binding。识别到的发送/提交、删除、安装、上传/分享和关闭等高影响动作仍要求本轮确认。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、未绑定/可复用坐标与任意 shell 仍被阻断；所有允许动作仍需 fresh bind、fresh after 和本地后置验证。
-
-## 可选 WorkMap 的本地边界
-
-启用 `workmap` 后，HandsFreePC 只读本机导出目录中的项目索引和关联档案头部，并用本机配置中的精确 alias/唯一项目标题解析完整、肯定、单一的“打开/进入/查看”请求。命中结果成为本地 `OPEN_PATH`，不会把本机绝对路径附加给云 planner；歧义、否定、引号、多分句、目标不存在或相对路径越界均不会执行。
-
-代码中虽有生成去路径候选的 `planner_hints` 接口，当前生产 agent loop **没有把它接入 Codex/Claude prompt**。WorkMap 导出路径、别名、项目标题和相对目录仍可能属于私人工作信息，必须只保存在不提交的 `config.local.yaml`；公开 `config.example.yaml` 保持 `workmap.enabled: false`、空 alias 和空目录。
-
-## Qwen open-computer-use 实验 driver
-
-[Qwen open-computer-use](https://github.com/QwenLM/open-computer-use) 0.2.3 是可选、本机 MCP stdio 进程，不随默认安装下载。它可能在本地取得目标窗口 accessibility text 和 screenshot PNG，但上游 0.2.3 当前没有向适配器提供可安全绑定的结构化 elements。HandsFreePC 的 safety 会重建 task-authorized planner view，移除原始 accessibility text、截图 bytes 和真实截图可用性；由于没有结构化元素，这个 driver 的云 UI 子集通常为空。上游进程本身仍能在本机访问屏幕内容。
-
-中文 Windows 有未解决的编码边界：[Issue #5](https://github.com/QwenLM/open-computer-use/issues/5)、[PR #6](https://github.com/QwenLM/open-computer-use/pull/6)。只有显式 `allow_experimental_driver: true` 才可启用。不要把它部署到包含敏感中文内容的目标窗口，除非已在同版本上验证 Unicode round-trip 并接受残余风险。
-
-上游进程的日志、缓存和未来版本网络行为不由 HandsFreePC 0.4 保证；安装或升级前应检查锁定版本和上游源码。详见 [docs/OPEN_COMPUTER_USE.md](docs/OPEN_COMPUTER_USE.md)。
-
-## legacy_codex_cli 边界
-
-旧 `legacy_codex_cli` 会让 Codex Computer Use plugin/thread 直接观察和操作目标应用，屏幕内容、截图、可见文字、thread context 和 agent 输出可能由 OpenAI 处理。该路径保留用户 Codex 配置/plugin，并可产生 Codex 自身的历史或 app approval。
-
-它没有 0.4 LocalVerifier；`VERIFIED_COMPLETION` 是同一 agent 的自报状态。正常 drain、急停、退出 HandsFreePC 或删除 `config.local.yaml` 都不会自动删除 Codex/提供商历史、缓存或持久 app approval。该 backend 只用于显式兼容，不建议新部署。
-
-启用它还必须同时设置 `allow_codex_cli_host_read: true` 与 `allow_legacy_codex_computer_use: true`；这两项分别表示接受 Codex CLI 主机读取边界和旧 controller 更宽的 Computer Use/无本地 verifier 边界。
-
-## 反馈模式与旁观者
-
-- `overlay`/`both` 可能显示完整识别文本、队列状态、错误和确认摘要；
-- `voice`/`both` 可能朗读同样内容；
-- `silent` 隐藏普通反馈，但确认/错误仍可能强制显示；
-- SAPI 播放期间采用半双工，输入缓冲可能被清除，且播放中的声音不能用语音急停；
-- 反馈不是审计日志，也不能证明操作成功。
-
-敏感环境优先使用不含具体文本的短反馈，并保持屏幕不被旁人看到。不要口述密码、验证码、token、病历、学生/客户标识或不应外发的草稿。
-
-## 常开麦克风、儿童与旁人
-
-即使默认不保存，麦克风仍会短暂处理房间中所有声音，包括儿童、访客、会议和扬声器回放。HandsFreePC 没有说话人识别，也不区分用户与旁人。
-
-使用者应：
-
-- 遵守告知、同意和当地录音/隐私法律；
-- 在访客、医疗、教育、保密会议或远程通话时退出；
-- 不用本项目识别、推断或记录儿童/旁人身份；
-- 留意 Windows 麦克风指示；
-- 扬声器播放可能含控制词时暂停；
-- 需要彻底停止时退出进程或关闭 Windows 麦克风权限。
-
-结束语音会话、队列 drain、`silent` 和急停都不是关麦。
-
-## 本地持久化
-
-HandsFreePC 可能在本地保留：
-
-- 用户自己创建的 `config.local.yaml` 或本地应用配置；
-- 下载的 ASR/VAD 模型、来源与许可文件；
-- 显式设置 `privacy.save_transcripts: true` 后的轮转 ASR 原文日志；
-- Python/Windows/CLI 自己的安装缓存和诊断数据；
-- 用户主动重定向保存的 doctor/test 输出。
-
-HandsFreePC 不建立 PCM 音频历史库。公开默认也不建立转写历史；显式 opt-in 后只保留上述会话层 ASR 文本 journal 与静音跳过标记，不保存 PromptAssembler 的归一化文本、planner context、UIA 内容或动作结果。prompt assembler、FIFO、confirmation ID 和 local agent task state 在进程内存中；退出后不会由本项目恢复。目标应用、Codex/Claude CLI、provider 和 optional MCP server 可能各自持久化数据。
-
-`doctor`、`test-asr`、pytest failure 或手工 UIA 检查输出可能包含路径、设备名或窗口内容。重定向、复制或上传后就形成新的持久副本；分享前人工脱敏。
-
-不得提交到 Git：音频、转写、本机绝对路径、UIA dump、截图、模型权重、token、登录缓存、日志或 `config.local.yaml`。
-
-## 可选 faster-whisper
-
-默认 `speech.command.backend: sensevoice` 且 `speech.fallback.backend: none`，普通安装不包含 faster-whisper。显式安装并把 command backend 设为 `faster-whisper` 后，`large-v3-turbo` 可作为正文主 ASR；第一次构造可能访问模型托管站并产生 GB 级缓存。若仅把它配置为 fallback，仍只在已成功构造的主转写器某次 `transcribe()` 抛异常时触发，不处理空/低置信度结果，也不能补救主转写器启动/模型加载失败。
-
-若不接受首次触发联网、模型缓存或额外资源占用，保持 `none`。模型权重有独立许可与数据边界，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- 监听常开时，房间里的所有声音（家人、孩子、访客、远程通话）都会经过本机识别；只有匹配控制词或处于会话中的话语会被转写，转写结果只在你说了「开始语音操作」之后才会交给 Kimi。
+- 别的程序使用麦克风时（会议、通话），运行时自动释放麦克风并暂停，结束后恢复。
+- 静默模式、结束会话或停止都不等于关闭麦克风；完全停止采集要退出进程（`Stop-ScheduledTask HandsFreePC`）或关闭 Windows 麦克风权限。
 
 ## 删除与停用
 
-- 停止采集：退出 HandsFreePC 或关闭 Windows 麦克风权限；
-- 删除本地配置：核对后删除项目中的 `config.local.yaml` 和你明确创建的本地配置；
-- 删除 ASR 原文：先退出 HandsFreePC，再核对并删除 `%LOCALAPPDATA%\HandsFreePC\transcripts\asr-transcripts.jsonl` 及同目录下它的 `.1` 至 `.5` 轮转备份；
-- 删除模型：仅删除你明确配置的 `models` 目录；下次使用需重新下载；
-- 撤销 Codex/Claude 登录、历史、缓存、app approval 和云端数据：使用各自产品的设置/命令；
-- 清理 optional Qwen 安装和缓存：按上游安装方式处理；HandsFreePC 不自动安装也不自动卸载。
-
-删除前核对绝对路径；不要对用户目录、磁盘根或未知变量运行递归删除。
-
-## 本项目不做什么
-
-- 不出售音频或转写；
-- 不提供广告追踪；
-- 不默认上传原始音频；
-- 不在后台自动启用云 planner、电脑控制或实验 driver；
-- 不用本项目采集的数据训练模型；
-- 不承诺第三方 CLI、MCP server、模型或 provider 具有相同隐私政策；
-- 不把本地 `doctor` 或 planner prose 当成 live 屏幕证明。
-
-普通问题可在公开 issue 中提供脱敏的最小复现。涉及漏洞或个人数据时，请按 [SECURITY.md](SECURITY.md) 使用私密渠道。
-
----
-
-**English summary:** Audio recognition is local by default; HandsFreePC never persists PCM through the current `save_audio` setting and does not save transcripts by default. Cloud planning, live control, WorkMap, and `local_unrestricted` remain disabled by public defaults. In the optional visual fallback, the complete exact-window capture is the primary signal and PaddleOCR is only an optional region enhancement. Oversized captures are proportionally reduced to a bounded planner canvas; returned points are mapped back to the original pixels locally. Exactly one action runs before a fresh screenshot, replan, and verification. Rendered search typing requires exact local `GetGUIThreadInfo` focus and visible-caret evidence, accepts only an exact user-authored target, and may use one Enter/Return only when the same binding survives and no result appeared; it never authorizes message sending or arbitrary submit. A related WeChat window such as `WeChatAppEx` may be observed only after exact same-process/process-tree rebinding. Structured content-plane nodes, element values, automation IDs, PCM, clipboard data, and raw focus/caret handles remain excluded, but screenshots may visibly contain private content. CLI/provider account, host, connection, runtime, image, and diagnostic metadata remain separate boundaries.
+- 注销开机自启并结束进程：`pwsh scripts/uninstall_autostart.ps1`。
+- 删除本机数据：删除 `%LOCALAPPDATA%\HandsFreePC\`（日志、识别原文、锁文件）。
+- Kimi 侧的会话记录按 Kimi CLI 的文档处理。

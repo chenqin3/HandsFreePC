@@ -1,377 +1,164 @@
 # HandsFreePC
 
-HandsFreePC 让 Windows 11 在双手被占用时继续接受语音操作：说“开始语音操作”进入连续会话，每条指令以英文 `over` 结束并按 FIFO 排队，说“结束语音操作”停止接收新指令并排空已接受队列。
-
-0.4.0 的关键变化是：**Codex 或 Claude 只负责规划下一步，本项目自己持有鼠标键盘权限，并在每个通用 planner 动作后重新观察、在本地验收。** `over` 另由独立英文离线模型检测，不再依赖中文词表或正文转写碰巧识别成功。
-
-> [!WARNING]
-> 这是面向 **Windows 11、64 位 Python 3.11/3.12** 的 alpha。公开配置默认关闭电脑控制、云规划和真实执行。即使通过自有 fixture 的 live test，也只证明本机 UIA 基础链路可用，不证明任意第三方应用或高风险任务安全可控。
-
-## 现在的底层
+抱着孩子、双手腾不出来的时候，用嘴控制 Windows：本地离线听懂你说的话，把每一条指令交给 [Kimi Code CLI](https://moonshotai.github.io/kimi-code/) 在桌面上做完，屏幕大字或语音告诉你结果。
 
 ```text
 麦克风
-  -> 中文 Vosk 控制词 + 英文 Vosk `over` 检测 + Silero VAD
-  -> SenseVoice（快速默认）或 faster-whisper（中英专名高精度）正文转写
-  -> “开始语音操作”会话 / over 分段 / 有界 FIFO
-  -> NativeSkillRouter（确定性命令优先）
-  -> StepPlanner（默认 Claude CLI；Codex CLI 仅为显式 best-effort 备选）
-  -> DesktopDriver（默认项目自有 Windows UIA/Win32 驱动）
-  -> fresh observe
-  -> LocalVerifier（本地比较动作前后状态和任务完成条件）
+  -> Silero VAD + 中文 Vosk 控制词检测（开始 / 结束 / 停止 / 恢复）+ 英文 Vosk「over」检测
+  -> SenseVoice 或 faster-whisper 转写指令正文（全部本地）
+  -> 「开始语音操作」进入会话；每条指令以 over 结束，进入有界 FIFO 队列
+  -> kimi -p "<前言 + 指令>"：Kimi 加载你的 gui-control 技能，截图 -> 看图 -> pyautogui 点击/粘贴 -> 再截图核对
+  -> 屏幕大字 / 语音播报反馈；「结束语音操作」排空队列，「电脑停止」立即取消
 ```
 
-核心约束：
+项目里没有 UI Automation 驱动、没有规则解析器、没有确认口令：怎么找窗口、怎么点、怎么核对，全部由 Kimi 用它的技能决定。这个仓库只负责三件事：把话听准、按顺序交给 Kimi、把结果告诉你。
 
-- 持续监听、独立 `over` 检测、执行期间继续收音、FIFO、结束后 drain 和急停均保留；公开配置在普通失败后暂停，本机 `failure_policy: continue` 可让后续已入队指令继续；
-- 确定性解析命中时，`NativeSkillRouter` 先解析目标并走本地白名单执行器，不调用模型；
-- 公开默认 `strict` 要求普通桌面任务在口述中明确且肯定地只指定一个目标应用；`personal_trusted` 只可沿用同一控制器中刚刚本地验收的窗口。只在本机忽略提交配置中显式启用的 `local_unrestricted` 会改为重新枚举全部可见顶层窗口，让 planner 自选窗口并跨应用导航，不再产生 `APP_SCOPE_REQUIRED`；
-- 通用 agent 的每个 planner 动作都执行 `fresh before -> 任务后置条件此时必须为 false -> 一个动作 -> fresh after -> 同一后置条件必须为 true`，再交给 LocalVerifier；确定性 native skill 使用各动作自己的本地证据，精确目标状态已成立时可幂等成功；
-- planner 没有鼠标键盘能力，也不能把 shell 命令放入动作 Schema；UI 文本一律按不可信数据处理；
-- 默认 `windows_uia` 驱动把元素索引绑定到应用、窗口和本次 observation generation；动作后旧索引立即失效。`local_unrestricted` 还把每个可见顶层 HWND（包括同一进程的多个 Chrome 窗口）作为独立候选，observe 时激活并复核 planner 选中的确切 HWND；
-- `strict`/`personal_trusted` 的本地有限语法把动作类型、目标完整短语、完整口述输入 payload、按键、左右键/点击次数、secondary action、滚动方向/页数逐项绑定到当前用户步骤；`type/input` 只授权键入，`fill/write` 才授权直接设置字段值；不能把“Open settings”缩成当前唯一可见的“Open”，不能只输入口述文本的子串，也不能借用同句后续输入动作的 payload；若文本动作后还有独立、非空且肯定的 clause，payload 出现不能自证完成，必须验证用户给出的真实结果；条件句在没有本地条件求值器时整体拒绝，尚不支持的尾随桌面动作也会计入步骤数，不能被提前 `DONE` 掩盖；
-- 只有本地 verifier 通过才返回 `LOCAL_VERIFIED_COMPLETION`。驱动“已接受动作”或 planner “done”都不是证据；`local_unrestricted` 的 `done` 还会重新观察并复核同一 HWND，多段明确动作必须按口述顺序全部完成，不能用中间结果提前结束；
-- 公开配置默认使用 `strict`：通用 agent 的 `type_text`/`set_value` 文本输入使用绑定到**确切动作与确切界面快照**的确认。仅在本机忽略提交的配置里显式使用 `personal_trusted` 时，才可免确认执行安全导航，以及把用户本句完整口述的草稿写入唯一、已聚焦、非密码输入框；它不会自动点击发送。两种模式下，被本地已知词形识别为发送/提交、删除、安装/卸载、上传/共享、关闭等副作用仍要求确认；认证、密码、付款、UAC 和 Windows Security 界面仍直接阻断。每次确认提示会生成新的随机四位口令；只说静态“确认执行”、口令不匹配、已使用、超时或界面变化都会拒绝；
-- `local_unrestricted` 会取消上述 `APP_SCOPE_REQUIRED`、普通导航目标必须由用户预先点名以及普通低风险导航确认限制，允许 planner 从全部 fresh 可见普通顶层窗口中选择并动态跨应用推断中间导航；普通切换、菜单/选项卡导航、Toggle，以及没有命中风险分类的通用 OK/Continue 对话框动作可直接进入本地验收。用户若明确说出 app/window/field，真正完成该口述步骤的动作仍必须精确绑定到所说窗口和字段，不能在其他窗口或近似输入框“完成”。UIA 可寻址的语义搜索框/地址栏仍要求精确查询、Enter/Return 和 fresh 结果转换。coordinate-only `VisualViewport` 则只在 exact-window Win32 focus/caret 绑定后输入用户本句中的精确查询、筛选文字或明确要求的不发送草稿；它永不获得 Enter/Return，因为 focus/caret 加顶部坐标不能证明该位置是 SearchBox 而不是消息 composer。视觉查询输入后必须等待 fresh screenshot 中的即时结果并点击结果；没有可点击结果就 fail closed。识别到的发送/提交、删除、安装、上传/分享和关闭等高影响动作仍要求本轮确认。它仍不是任意电脑权限：终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款和隐私/账户设置继续硬阻断，动作 Schema 仍无任意 shell、文件系统 API 或可复用的裸坐标动作；视觉点和视觉文字都是绑定当前窗口、fresh frame 与本地证据的一次性能力；
-- 风险词表和上下文规则不是完整语义证明：未知语言、同义词、自绘控件或伪装文案仍可能漏分。重要外发、删除、安装、分享或不可逆任务必须有人看屏幕监督；
-- 所有 profile 对被已知词形/元素属性识别为密码、凭据、付款/转账、认证、隐私/公开链接设置、终端/shell、Windows Run、UAC 或 Windows Security 的操作 fail closed；纯坐标点击默认阻断。`local_unrestricted` 的窗口 inventory/截图可能早于具体 action 风险分类离机，未识别 surface 也仍是残余风险；
-- 通用 UI 确认摘要若原文显示目标标签，只显示已由用户原句精确授权并再次验证的 exact target label；未授权 sibling/window 标签的原文和语义只在本地参与分类，不进入摘要，摘要中的不可逆短 digest 仅是绑定元数据；
+> [!WARNING]
+> 这是给自己电脑用的个人工具。Kimi 是云端模型：指令文本会离开本机，Kimi 自己截的图和工具输出也会发给模型；Kimi 在 `-p` 模式下不经确认就执行工具调用。只在你自己的账号、自己的电脑上使用，并在 [PRIVACY.md](PRIVACY.md) 里了解边界。
 
-完整设计见 [架构说明](docs/ARCHITECTURE.md) 和 [安全模型](docs/SECURITY_MODEL.md)。
+## 需要什么
 
-## 快速开始
+- Windows 11，64 位 Python 3.11 或 3.12，一个麦克风。NVIDIA GPU 可选，用于 faster-whisper。
+- 已登录的 Kimi Code CLI（`kimi.exe`），模型要能看图（默认的 `kimi-code/k3` 可以）。
+- Kimi 的用户技能目录里有一个 `gui-control` 技能（`%USERPROFILE%\.kimi-code\skills\gui-control\SKILL.md`），教 Kimi 怎么用截图和 pyautogui 操作桌面。见下面「gui-control 技能」。
+
+## 安装
 
 ```powershell
-git clone https://github.com/chenqin3/HandsFreePC.git
-Set-Location HandsFreePC
-Set-ExecutionPolicy -Scope Process Bypass
-./scripts/install.ps1 -DownloadModels
+pwsh scripts/install.ps1 -WithWhisper -DownloadModels
 ```
 
-安装脚本会创建 `.venv`、安装本地语音和 Windows 依赖，并复制一份不会提交的 `config.local.yaml`。默认不会安装 faster-whisper，也不会启用电脑控制。
-
-如果命令经常夹杂 `Claude`、`Codex`、`Chat and Cowork` 等英文专名，推荐安装可选的高精度 ASR：
+脚本会创建 `.venv`、安装依赖、把 `config.example.yaml` 复制成 `config.local.yaml`（不会提交）、下载本地语音模型，最后跑一次 `doctor`。手动等价步骤：
 
 ```powershell
-./scripts/install.ps1 -WithWhisper -DownloadModels
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[audio,windows,whisper,dev]"
+.venv\Scripts\python.exe -m handsfree_pc init
+.venv\Scripts\python.exe -m handsfree_pc --config config.local.yaml download-models --directory models
+.venv\Scripts\python.exe -m handsfree_pc --config config.local.yaml doctor --strict --check-kimi
 ```
 
-然后在不会提交的 `config.local.yaml` 中把 `speech.command.backend` 改为 `faster-whisper`。`model: large-v3-turbo` 支持 `initial_prompt` 和 `hotwords`；有可用的 NVIDIA CUDA 环境可设 `device: cuda`、`compute_type: float16`，否则保留 `auto`。模型权重第一次使用时会下载约 GB 级缓存，之后启动无需重复下载。完整字段见 `config.example.yaml`。
+`doctor --strict` 只有在模型齐全、有输入设备、找得到 `kimi.exe`、找得到 `gui-control` 技能时才返回 0。
 
-先运行无桌面副作用检查：
+## 配置
 
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor --strict
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml simulate --independent --file ./examples/demo_commands.txt
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml overlay-demo --text "我在听"
-```
-
-`doctor` 是**静态预检**。它会报告依赖、模型、音频输入、CLI 和配置是否看起来齐全，但始终令：
-
-```text
-live_control_verified = false
-ready_for_live_control = false
-```
-
-它不会因为发现某个 CLI、plugin 或 UIA 包就声称真实控制已经验收。
-
-## 先验证项目自有的桌面驱动
-
-`computer-doctor --live` 是 opt-in 测试。它只打开 HandsFreePC 自己的无害 fixture，把含中文的随机 token 写入唯一文本框，重新读取 UIA，并通过本地 verifier 检查 Unicode round-trip。它会抢占一次前台焦点，但不会操作 Codex、Claude 或用户文件。
-
-若当前前台属于更高完整性进程，Windows 可能返回 `ForegroundIntegrityBoundary`。数位板/输入法 helper 留下的不可见 foreground HWND 会先被明确识别并跳过；若目标仍不能成为精确前台，则返回 `WindowActivationError`。项目不会自动提权、结束该进程或跳过前台 HWND 验证；处理方法见 [故障排查](docs/TROUBLESHOOTING.md)。
-
-在本地配置中临时使用不联网的测试组合：
+只有四个段，完整默认值见 [config.example.yaml](config.example.yaml)，缺省键沿用默认，旧版本多出来的段会被忽略。
 
 ```yaml
+app:
+  wake_phrases: ["开始语音操作"]
+  end_session_phrases: ["结束语音操作"]
+  stop_phrases: ["立即停止所有操作", "取消所有操作", "停止所有操作", "电脑停止"]
+  resume_phrases: ["恢复语音操作", "恢复监听", "继续队列", "恢复队列"]
+  prompt_delimiters: ["over"]
+  feedback_mode: overlay        # overlay | voice | both | silent
+  failure_policy: continue      # 一条失败后，后面的继续（continue）还是等你说「继续队列」（pause）
+  max_queue_size: 8
+  auto_pause_when_microphone_busy: true
+
 privacy:
-  allow_cloud_planner: false
+  save_transcripts: false       # true 时把本地识别原文写到 %LOCALAPPDATA%\HandsFreePC\transcripts
 
-computer_control:
-  enabled: true
-  backend: local_agent
-  driver: windows_uia
-  planner_backend: none
-  allow_screen_context_to_cloud: false
+speech:
+  command:
+    backend: faster-whisper     # 或 sensevoice（更快，默认）
+    model: large-v3-turbo
+    device: cuda                # 没有 NVIDIA 就保留 auto
+    compute_type: float16
 
-execution:
-  dry_run: false
+kimi:
+  executable: kimi              # 或 kimi.exe 的完整路径
+  working_directory: null       # Kimi 的工作目录，null 是你的主目录
+  model: null                   # null 用 CLI 默认模型
+  timeout_seconds: 600          # 一条指令的上限；发文件这类任务实测 2 到 4 分钟
+  preamble_file: null           # 想改 Kimi 收到的前言就指向一个文本文件
 ```
 
-然后运行：
+控制词改了之后，要把新词按「字 词 之间 加 空格」的形式加进 `speech.wake.grammar`，离线检测器只认词表里的话。
+
+## 运行
 
 ```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml computer-doctor --live
+.venv\Scripts\python.exe -m handsfree_pc --config config.local.yaml run
 ```
 
-只有输出中 `live_control_verified: true` 才表示这次 fixture 验收通过。该结果仍不覆盖麦克风、云 planner、应用选择器、第三方窗口或业务任务；详见 [测试指南](docs/TESTING.md)。
+或者 `pwsh scripts/run.ps1`（先跑 `doctor --strict` 再启动）。同一时间只会有一个监听进程，第二个会直接退出。
 
-### 观察 Claude / Codex 的真实界面
-
-在 fixture 通过后，可用 `app-doctor` 对已经打开的目标应用做受控检查。先把目标 Claude 或 Codex 窗口置于当前桌面，再运行只读观察：
-
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --observe-only
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --observe-only
-```
-
-`--observe-only` 不点击、不输入，只输出元素数量、控件类型、截断/省略统计和不可逆摘要等脱敏信息；不会输出聊天正文、输入值、窗口完整文本或截图。它用于确认应用 profile、窗口选择和 UIA tree 是否可用，不代表业务流程已经完成。
-
-确认观察结果正常后，可显式运行草稿 smoke：
-
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app claude --draft-smoke
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml app-doctor --app codex --draft-smoke
-```
-
-`--draft-smoke` 只会在可唯一、安全绑定的非密码编辑框中写入一个随机测试 token，再通过 fresh observe 和 LocalVerifier 读回；**不会点击发送，也不会替你提交 prompt**。成功后只在当前字段仍精确等于本轮随机 token 时自动清空，并再次观察确认空白；若编辑框不唯一、没有可靠焦点、目标是敏感字段、界面无法读回或精确清理无法验收，命令会失败关闭。
-
-## 用 Kimi Code CLI 作为执行代理（`engine: kimi_agent`）
-
-这是目前最省事、覆盖面最广的执行方式：语音前端（唤醒、转写、`over` 分段、FIFO 队列、反馈、急停）不变，每条指令交给 [Kimi Code CLI](https://moonshotai.github.io/kimi-code/) 的非交互模式执行——Kimi 加载你自己的 `gui-control` 技能，用"截图 → 看图算坐标 → pyautogui 点击/粘贴 → 再截图核对"的方式操作任何应用，不依赖 UI Automation。
-
-前提：装好 `kimi`（`kimi login` 完成登录），本机有一个描述键鼠操作方法的用户技能（`~/.kimi-code/skills/gui-control/SKILL.md`，配套的 pyautogui venv 与脚本），`privacy.allow_cloud_planner: true`。
-
-```yaml
-privacy:
-  allow_cloud_planner: true
-computer_control:
-  enabled: true
-  engine: kimi_agent
-  kimi_executable: kimi          # 或绝对路径
-  kimi_working_directory: null   # 默认用户主目录，技能/WorkMap/脚本都在那里
-  kimi_model: null               # 默认用 Kimi 配置里的 default_model
-  timeout_seconds: 600           # 每条指令上限；发文件这类任务约 1–4 分钟
-```
-
-工作方式：`kimi -p "<前言>\n用户指令：<转写>" --output-format stream-json`（`-p` 模式免审批执行，不能再加 `--yolo/--auto`）。前言要求代理把含糊的转写当线索对真实清单做模糊匹配、"不要发送"绝不回车、最后两行输出 `RESULT: 成功|失败 - 说明` 和 `SCREENSHOT: 路径`；控制器据此判成败并把说明念/显示给你，每次工具调用都写入本地诊断日志（`KIMI_TOOL_CALL`）。取消/急停会杀掉整棵 Kimi 进程树。可用 `kimi_preamble_file` 换掉前言，`kimi_skills_dir` 指定技能目录。
-
-实测（非交互、逐条由最终截图核对）：发文件到微信文件传输助手 223 s；Codex / Claude Code 找会话并输入草稿 ~93 s；Chrome 开 ChatGPT 新对话输入草稿 78 s；打开项目文件夹 66 s；微信找联系人 66 s。代价是每步一次视觉模型调用，比下面的确定性技能慢，但几乎不用为具体应用写任何代码。
-
-## 启用连续桌面 agent
-
-任意 UI 任务通常需要单步 planner。Codex 和 Claude 都可以规划；真正执行动作的仍是本地 `DesktopDriver`。只在被 Git 忽略的 `config.local.yaml` 中显式授权：
-
-```yaml
-privacy:
-  allow_cloud_planner: true
-
-computer_control:
-  enabled: true
-  backend: local_agent
-  driver: windows_uia
-  planner_backend: claude
-  safety_profile: personal_trusted
-  allow_screen_context_to_cloud: true
-  allow_codex_cli_host_read: false
-  allow_legacy_codex_computer_use: false
-  allow_experimental_driver: false
-  allow_coordinate_actions: false
-
-execution:
-  dry_run: false
-```
-
-公开仓库的 `config.example.yaml` 始终使用 `safety_profile: strict`。上面的 `personal_trusted` 只适合写入不会提交的 `config.local.yaml`，用于本人看着屏幕、目标应用和 Windows 会话都受信任的电脑：它允许 planner 逐步完成安全导航，并把**本句完整口述、未发送的草稿**写入唯一聚焦编辑框，减少抱娃场景下反复念确认码。它不是“关闭全部安全”；发送/提交、删除、上传/分享、安装/卸载、关闭等副作用仍要求本轮随机码，密码/令牌/认证/付款/UAC/Windows Security 仍阻断，纯坐标和 shell 仍不可用。
-
-若希望 planner 接受不点名应用的自然语言、在多个应用或多个 Chrome 顶层窗口之间自行选择并推断中间导航，可只在同一份本机配置中显式改为：
-
-```yaml
-computer_control:
-  driver: windows_uia
-  safety_profile: local_unrestricted
-
-visual_ocr:
-  enabled: true
-  ocr_regions_enabled: false
-  apps: ["*"]
-```
-
-`local_unrestricted` 每条任务都会 fresh 枚举当前可见的全部普通顶层窗口；每个窗口都有独立动态 app ID，后续步骤还会刷新 inventory，planner 因此可以动态跨应用，也不会再因没有预先配置/点名应用而返回 `APP_SCOPE_REQUIRED`。上面的显式 `apps: ["*"]` 只在 `visual_ocr.enabled + local_unrestricted` 中有效：它让每个被选择的可见窗口都保留一份 exact-window `VisualViewport`；即使 UIA 已经很丰富或达到元素上限，语义 UIA 控件仍排在前面并优先使用，截图视口作为补充。planner 选择 `observe` 后，driver 会激活并复核确切 HWND/PID/process/title，再读取 UIA 和该窗口截图。窗口消失、HWND 被复用、无法解释的身份变化或无法成为前台都会停止，而不是向近似窗口发送输入；只有刚执行的动作产生同 PID 或可验证父子进程关系的新前台窗口时，原动态 app 才能精确重绑并继续。通过 `claude`、`wechat`、`explorer` 等 configured canonical 名称完成一次 fresh observe 后，该名称会保留并精确绑定同一 HWND，后续 inventory 不会再把它换成同窗的哈希动态 ID。没有点名 app 时 planner 可以自行选择；一旦用户明确说出 app、窗口或字段，完成相应口述步骤的 action 仍必须绑定该 exact window/field，中间跨 app bridge 不能把最终输入或搜索落到别处。
-
-独立 helper 进程只有在其**直接父进程**唯一匹配某个已配置 profile 时才继承该 profile；不会沿整条祖先进程链猜测。若已验收动作把当前动态 app 重绑到关联子窗口，这个 task-scoped app ID 会继续留在子窗口上；即使原父窗口仍可见，下一次 inventory 也只会给父窗口分配另一个候选 ID，不会把 active alias 抢回去。
-
-这个模式还允许 planner 推断必要的菜单、选项卡、搜索框等中间步骤。普通切换、菜单/选项卡、Toggle 和未命中风险分类的通用 OK/Continue 对话框不要求确认，但每一步仍必须绑定 fresh semantic target。对于 UIA 已确认的语义 SearchBox/AddressBar，若字段为空可用精确 `type_text`，字段非空或旧值不明时必须用 `set_value` 精确替换为用户原文 `X`；随后按 Enter/Return，并用 fresh result transition 验收 `SEARCH_SUBMITTED`。渲染输入使用另一条更窄的链：先在截图中点选候选输入框，下一次 fresh observe 必须由 Win32 `GetGUIThreadInfo` 证明 exact HWND/process/thread 仍为 active/focus owner、存在可见系统 caret 且 caret 与点击点相符，之后只可单次输入当前口述步骤中的完整连续原文；它可以是精确查询/筛选文字，也可以是用户明确要求写入但不发送的草稿、消息或 prompt。coordinate-only `VisualViewport` 绝不声明或接受 `PRESS_KEY`，包括 Enter/Return；焦点、caret 和顶部坐标只能证明编辑位置，不能证明它不是聊天 composer。草稿在输入后的 fresh verification 即停止；视觉查询则等待即时结果、fresh screenshot 后点击精确结果。若没有即时可点击结果，必须保守失败或改走语义 UIA SearchBox/AddressBar，不能用回车试探。已有 `X` 的较长字符串、追加输入或只看到字段值都不能冒充完成。识别到的发送/提交、删除、安装、上传/分享和关闭等高影响动作仍要求本轮确认。终端/shell、Windows Run、UAC/安全桌面、认证、密码/凭据、付款、隐私/账户设置、未绑定/可复用坐标和任意 shell 仍是硬边界；每个实际动作仍必须经过 fresh bind、执行后重新观察和本地后置条件验收。
-
-渲染结果只有一个窄的确定性 bridge：若搜索 helper 暴露唯一 semantic `Button`，其**完整标签**同时包含用户的精确目标且以“前往”或 `Go to` 结尾，可以用该完整标签消失来验收这一次点击 navigation bridge；这只证明已离开该结果按钮，关联窗口转场后仍必须依靠 fresh screenshot 判断最终页面，不能据此宣称任务完成。parser 不会把任何截图 click 改写为 Enter，driver 也不会向 coordinate-only viewport 暴露按键能力。
-
-实际口述时，渲染界面需要多次点击，或指令含“不要发送”“不要按回车”等显式否定时，建议按**每个 rendered target/完整原子操作用一个 `over`** 分段，并把否定语与它限定的 payload 留在同一段。例如：“切换到 Claude `over`”、“打开 Chat and Cowork `over`”、“点击新对话 `over`”、“在输入框输入这是测试，不要发送 `over`”。这些 prompt 仍按 FIFO 保序；前一条执行时可继续说下一条，每段都会从 fresh screenshot 重新绑定和规划。
-
-若要复现公开项目的最保守行为，改回：
-
-```yaml
-computer_control:
-  safety_profile: strict
-```
-
-`strict`/`personal_trusted` 会把完成的语音 prompt、唯一授权的可见应用摘要、observation generation、经裁剪的可寻址 UIA 控件和最近的本地验收摘要发送给选定 planner；原始窗口标题、截图字节和未授权控件不进入这两个 profile 的 planner view。`local_unrestricted` 的边界更宽：planner 先收到全部 fresh 可见顶层窗口的 display name、process name 和窗口标题；观察某个窗口后还会收到真实窗口标题和经凭据过滤的可寻址 UIA 控件。`CONTENT` 节点、元素 value/automation ID、原始音频和 PCM 仍不作为结构化 planner 字段发送。
-
-在 `local_unrestricted` 中使用 `codex_cli_best_effort` 时，当前窗口截图还会写入一次性临时目录并通过 `codex exec --image` 交给 Codex；它是选中窗口的截图，不是全桌面截图，但仍可能显示聊天、文件名或其他敏感画面。Claude adapter 当前只接收文本化窗口标题/UIA context，不接收这份 PNG。临时文件由本轮 planner 临时目录清理，但 Codex CLI/provider 已处理的数据受其自身政策约束。三种 profile 只要启用云 planner 都必须设置 `allow_screen_context_to_cloud: true`。
-
-可另行显式设置 `visual_ocr.enabled: true`，为命中的每个窗口保留完整截图 viewport；rich UIA 控件仍排在前面并优先使用。`visual_ocr.ocr_regions_enabled` 只控制是否在 UIA 不充分时调用可选 PaddleOCR 服务来添加文本区域，关闭它或 OCR 暂时失败都不取消截图 viewport。过大的全窗 PNG 会等比缩小到最大边 2048 px 的 planner canvas；planner 的 canvas 坐标在本地按宽高比例映射回原始截图像素，边界与目标 patch 再验后才点击。系统每次只执行一个 click、单页 scroll 或一次 exact 视觉输入，随后重截同一 exact window、重新规划并验证。视觉文字仅在 `GetGUIThreadInfo` 提供 exact focus 与可见 caret 证据后开放：查询/筛选只能用用户原句中的精确目标，未发送草稿只能用当前口述步骤的完整 payload；两者都不建立 viewport Enter 能力。视觉查询要等待即时结果并在 fresh screenshot 上点击结果。若微信的搜索动作把前台切换到同一进程或父子进程树中的关联窗口（例如 `WeChatAppEx` 搜一搜），driver 会把动态 app 重新绑定到新的精确 HWND/PID/process/title 后继续观察；无关联或身份不唯一即停止。配置与边界见 [截图优先的视觉 fallback](docs/VISUAL_OCR.md)。
-
-发给云端 planner 的 observation 不包含本地 `local_window_id` 或原始 HWND。视觉 planner 返回 `DONE` 后，controller 才用未离机的完整 observation 在本地生成绑定 app、窗口、generation 与截图 bytes 的 token；同一 exact window 还必须取得更新一代截图并再次得到视觉完成判断，两张独立 fresh screenshot 的判断一致后才可完成。全窗其他区域的加载动画只可在非视觉 UIA 动作中忽略，而且同一 exact window 中目标的完整元素 fingerprint 必须原样保持，包括 `local_identity`、标签、值、焦点、能力与风险元数据；视觉点无此例外，点击附近的局部 patch 仍须稳定。
-
-先登录相应 CLI，再运行：
-
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml doctor --check-planner-auth --strict
-./scripts/run.ps1
-```
-
-普通 PowerShell 不必额外继承 Codex App 的临时 `PATH`。当配置使用裸 `codex`/`codex.exe` 时，项目会在 Windows 上自动回退到 `%LOCALAPPDATA%\OpenAI\Codex\bin` 下最新的版本目录；doctor 与真实 planner 使用同一个解析结果。显式配置的路径或自定义命令名仍完全按原值解析。
-
-Claude CLI 是默认规划器，使用独立 system policy、safe/restricted 模式、空工具列表、严格 MCP 配置和非持久会话。它仍是联网 CLI，不是本地模型。
-
-若明确要用订阅版 Codex CLI，只能写 `planner_backend: codex_cli_best_effort`，并额外设置 `allow_codex_cli_host_read: true`。项目会尽量禁用已知工具并使用临时目录、结构化单步输出和 read-only sandbox，但 Codex CLI 没有可由本项目证明的完整 no-tools 模式；这个开关表示你接受它仍可能读取当前 Windows 账户可见的其他主机文件。两条路径都不获得 HandsFreePC 的桌面驱动。参考 [OpenAI Computer Use 自定义 harness 指南](https://developers.openai.com/api/docs/guides/tools-computer-use)、[Codex SDK](https://learn.chatgpt.com/docs/codex-sdk) 和 [Responses API tool choice](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)。
-
-不要把 `computer_control.planner_backend` 与顶层 `planner.enabled` 混淆。后者只是兼容旧单句 `VoiceRuntime` 的云 fallback：模型只能提出 `ACTIVATE_APP`、`OPEN_CONVERSATION`、`OPEN_MODE`、`ENTER_DICTATION` 或 `START_NATIVE_VOICE`，并且应用及项目/对话/tab/mode 必须由用户原句肯定、非引号/数据引用地精确授权。它不能决定反馈模式、暂停/恢复/等待，也不能打开路径、输入文本或发送 prompt；这些能力只能由完整命中的本地确定性 parser 决定。
-
-旧单句运行时若需要确认，`native-...` ID 会绑定完整 plan（含 source）及每个已解析路径的规范绝对路径与 stat 身份；普通文件还绑定 SHA-256。说出本轮随机码后会重新 prepare 目标、重新运行 safety 并重新计算 binding；计划、来源、路径身份或文件内容任一变化都会取消，不会执行替换后的目标。即使 `OPEN_PATH` 被判定为安全目录而无需口令，runtime 和 deterministic native router 也都会在 safety 前后重新绑定目标，并从最后绑定一直持有防替换句柄到本地执行返回。
-
-Electron 应用的可访问标签会随版本变化。`apps.*.mode_names` 同时是 native 模式 allowlist：只有显式 key 可执行，并映射到当前版本的精确 UIA 标签（如 Claude 的 `Chat and Cowork`）；缺少映射会在任何点击前拒绝。执行器只接受精确匹配，并在动作后验证 `selected`。单纯获得键盘焦点只证明点击到控件，不证明页面已经切换。若 Codex/Claude 应用只暴露一个空 Pane、没有可操作子元素，或模式控件不暴露可验证的选中状态，UIA 路径会失败关闭，不能靠模糊匹配或坐标猜测。
-
-### 可选的本地 WorkMap 精确别名
-
-如果本机已经有 WorkMap 导出的 `WORKMAP.md` 和 `projects/`，可以在不提交的 `config.local.yaml` 中为常用项目或项目内相对目录建立精确别名：
-
-```yaml
-workmap:
-  enabled: true
-  out_directory: "<local-workmap-out-directory>"
-  aliases:
-    资料库:
-      project: "<unique-project-title-or-id>"
-      relative_path: "<relative-folder>"
-```
-
-当前生产路由只接受完整、肯定、单一的精确打开请求，例如“打开资料库”；引号、否定、多分句、歧义、目标不存在或相对路径逃出项目根目录都会 miss，并继续走其他路由，而不会做模糊猜测。命中后生成确定性的本地 `OPEN_PATH`，仍走路径绑定、安全策略和本地后置验证。WorkMap 的搜索候选/`planner_hints` 目前**没有接入云 planner**；WorkMap 导出目录、别名和任何本机路径都应只留在 `config.local.yaml`，不要提交到公开仓库。
-
-## 语音协议
-
-```text
-开始语音操作
-打开 Claude 并切换到 Chat 选项卡 over
-在 Claude 点击新对话，并在输入框写入测试内容 over
-结束语音操作
-```
-
-- 唤醒词现在是“开始语音操作”；结束词是“结束语音操作”；
-- 每个独立英文单词 `over` 完成一条 prompt；`mouseover` 和 `voiceover` 不会切分；
-- 一条正在执行时可以继续说下一条，普通任务严格 FIFO；队列满会明确拒绝，不会静默丢弃；
-- “结束语音操作”丢弃尚未由 `over` 完成的半条，并默认排空已接受任务；
-- “立即停止所有操作”“取消所有操作”等急停词请求取消当前任务并清空队列，但不能撤回已经发生的点击、输入或外部副作用；
-- 公开默认 `failure_policy: pause` 会在普通失败或待确认时暂停队列；本机设为 `continue` 后普通失败不再卡住后续指令，但待确认仍暂停。确认提示会给出随机四位挑战码，例如“确认执行 4 8 2 7”；只有本轮准确口令会携带运行时保存的 confirmation ID。单独说“确认执行”无效，也不会作为新 prompt 交回模型猜测。
-- 暂停/恢复只接受独立、完整、肯定的本地控制口令。条件式（“如果……就暂停”）、转述/引用式（“他说暂停”“输入‘暂停语音操作’”）和否定式（“不要暂停”）一律 fail closed，不能改变会话或队列状态；它们也不能靠短暂停顿或 ASR 标点被拆成无条件控制词。
-- 同一 `VoiceRuntime` 进程运行期内，已经签发的四位码持续保持占用：确认、取消或超时都不回收到抽样池；有界重抽仍找不到新码时 fail closed。该集合不持久化，进程重启后不保证绝对不复用，所以四位码不是持久化防重放凭证。
-
-### `over` 的独立本地检测
-
-`over` 现在由独立的英文 Vosk small-en-us 0.15 小词表检测器识别，不再要求中文 Vosk 词表或正文 ASR 必须转写出这个短词。中文控制词检测、英文 delimiter 检测、Silero VAD 和正文 ASR 都消费同一次麦克风采集的音频 block；程序不会为 `over` 再打开一个麦克风，也不会保存原始音频。
-
-英文 detector 会请求 Vosk 的词级和 partial 词级时间，把命中的 `over` 绑定到当前麦克风流的样本区间；若没有可用词时间，则保守退回到命中所在音频 block 的近似区间。命中不会用异常截断 VAD，而是在话语结束后按 marker 区间切分本轮内存音频：marker 本身不送入正文 ASR，前后片段先经过独立的分窗能量门控，明显静音不会再送给模型产生“嗯”等幻听；真实有声片段分别转写。每个 marker 完成它前面的 prompt，最后一段保留为下一条 pending prompt。因此同一个 VAD 话语中的多个 `over` 也可依次入队；若 KWS 漏掉，正文 ASR 自己识别出的独立单词 `over` 仍是后备路径。安装或升级后必须重新运行 `download-models`；`doctor` 的 `models.delimiter.ready` 应为 `true`。样本边界不等于所有口音和噪声下都精确的词边界，清晰说出 `over` 并留一个很短的自然停顿仍有助于识别；最终以“已入队”反馈为准。
-
-## 屏幕与语音反馈
-
-`app.feedback_mode` 支持：
-
-- `overlay`：默认，高对比置顶大字，不抢焦点；
-- `voice`：本机 Windows SAPI 朗读短反馈；
-- `both`：两者同时；
-- `silent`：隐藏普通反馈，但安全确认/错误仍可能强制显示。
-
-可以说“切换到屏幕反馈”“切换到语音反馈”“大字和语音两种都开”或“切换到静默模式”。SAPI 播放期间采用半双工处理，播报结束前说的话可能被丢弃，且语音急停不能打断正在播放的 SAPI；需要连续快速输入时优先用 `overlay`。
-
-提示框的大小随文字自适应：一行状态就是一个紧凑的小框，只有多行的错误报告才会变高，最宽不超过屏幕宽度的 72%。开机自启后的“已就绪”提示只显示 6 秒，别的程序占用麦克风时的提示也只显示 6 秒，桌面上不会留下常驻横幅。
-
-## 开机自启与麦克风避让
-
-想让它随 Windows 登录自动开始监听：
+**开机自启**：
 
 ```powershell
 pwsh scripts/install_autostart.ps1 -StartNow
 ```
 
-这会注册一个用户登录触发的计划任务 `HandsFreePC`（延迟 20 s，运行在交互桌面会话里，退出后自动重启），任务动作是 `.venv\Scripts\pythonw.exe -m handsfree_pc.cli --config config.local.yaml run`，没有控制台窗口，stdout/stderr 追加到 `%LOCALAPPDATA%\HandsFreePC\logs
-un.log`。用 `-Config` 指定别的配置文件。`Stop-ScheduledTask HandsFreePC` / `Start-ScheduledTask HandsFreePC` 可随时停止和重新开始；`pwsh scripts/uninstall_autostart.ps1` 注销任务并结束监听进程。`run` 带单实例锁（`logs
-un.lock`），第二个实例会直接退出，所以手动再开一个也不会抢麦克风。
+注册一个登录触发的计划任务 `HandsFreePC`（延迟 20 秒，运行在桌面会话里，退出后自动重启），动作是 `.venv\Scripts\pythonw.exe -m handsfree_pc.cli --config config.local.yaml run`，没有窗口，输出追加到 `%LOCALAPPDATA%\HandsFreePC\logs\run.log`。`Stop-ScheduledTask HandsFreePC` / `Start-ScheduledTask HandsFreePC` 随时停止和重新开始；`pwsh scripts/uninstall_autostart.ps1` 注销任务并结束监听进程。
 
-监听常开时，一旦别的程序（Zoom、Teams、腾讯会议、微信通话、浏览器里的会议……）开始采集麦克风，运行时会在约 3 秒内释放麦克风并暂停转写和语音播报，屏幕上显示"检测到 X 正在使用麦克风，已暂停监听"；对方释放后 3 秒内自动恢复。它靠读取 Windows 自己的麦克风使用记录（`CapabilityAccessManager\ConsentStore\microphone` 注册表，`LastUsedTimeStop == 0` 即正在采集）判断，不会去探测或占用别的设备。相关配置在 `app` 段：`auto_pause_when_microphone_busy`（默认 `true`）、`microphone_guard_poll_seconds`（默认 `3`）、`microphone_guard_ignore`（不算作抢占的程序名或完整路径列表，例如 `["obs64.exe"]`）。程序自身的解释器始终不算抢占。
+## 怎么说
 
-## 本地诊断日志
+| 说什么 | 发生什么 |
+|---|---|
+| 开始语音操作 | 进入会话，开始接收指令。也可以一口气说「开始语音操作 打开微信 over」 |
+| …… over | 一条指令结束，进入队列。over 由独立的英文离线模型检测，不依赖正文转写 |
+| 结束语音操作 | 不再接收新指令，已入队的继续做完；没说 over 的半条丢弃 |
+| 立即停止所有操作 / 电脑停止 | 立刻终止正在执行的 Kimi、清空队列 |
+| 继续队列 / 恢复语音操作 | 队列因失败暂停时继续；或从停止状态重新开始 |
+| 切换到语音反馈 / 切换到屏幕反馈 / 大字和语音两种都开 / 切换到静默模式 | 换反馈方式，不经过 Kimi |
 
-运行时会写入有界轮转的 JSONL 诊断事件。任务失败后先看最近事件，再看最近一次失败：
+指令本身怎么说都行，Kimi 会拿转写文本当线索去对真实清单（窗口标题、侧栏会话名、目录里的文件名、你的项目地图），比如：
 
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml logs --tail 50
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml diagnose-last
-```
+- 「切换到微信，找到文件传输助手 over」
+- 「把下载文件夹里最新的那个 html 发给微信文件传输助手 over」
+- 「去 Chrome 打开 ChatGPT，开一个新对话，输入一个测试问题，但是不要发送 over」
+- 「打开 Claude，在 Code 页签里找到那个写论文的会话 over」
 
-默认文件位于 `%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl`，单文件最大 2 MiB，保留 5 个备份。事件只保留 `stage`、`error_code`、异常类型、应用代号、observation generation 和短安全说明等白名单字段；不记录原始语音 prompt、完整转写、UIA 正文/值、截图、provider stderr、绝对路径或凭据。它是定位 `plan`、`observe_driver`、`action_safety`、`execute`、`reobserve`、`verify_action`、`verify_completion` 等阶段的诊断线索，不是完整操作审计。
+说了「不要发送」的内容 Kimi 绝不会按 Enter；Kimi 不会反问，拿不准就选最像的一个做到发送前。执行期间麦克风继续开着，可以接着说下一条，也可以随时说「电脑停止」。
 
-### 可选的 ASR 原文日志
+## 屏幕与语音反馈
 
-如果需要排查正文 ASR 是否听对，可在本机配置中显式设置 `privacy.save_transcripts: true`。运行时会把送入会话层的 ASR 文本写入独立的 UTF-8 JSONL 轮转文件，包括唤醒话语、普通命令话语，以及按 `over` 样本边界切开的每个 segment；内容、标点和大小写不再经过 prompt 归一化，模型 adapter 只会去掉首尾空白。空 segment 也记录；若它因静音能量门控而根本没有调用 ASR，会明确带 `transcribed: false` 和 `skip_reason: silence_energy_gate`，从而与“调用了 ASR 但返回空”区分。它不会保存 PCM 音频，也不会把原文混进上述隐私受限诊断日志。
+`app.feedback_mode`：`overlay` 在屏幕上方显示大字，不抢焦点也不挡点击；`voice` 用 Windows 语音朗读；`both` 两者都开；`silent` 只显示错误。语音播报会等你这句话说完再放，不会打断你。
 
-启动时会打印诊断文件、原文文件的完整绝对路径及启用状态。也可直接查看最近原文：
+提示框的大小随文字自适应，一行状态是一个紧凑的小框，最宽不超过屏幕的 72%。启动提示只显示 6 秒；「第 N 条已交给 Kimi 执行」会随着 Kimi 每一步工具调用更新，完成或失败后换成结果，桌面上不会留下常驻横幅。
 
-```powershell
-./.venv/Scripts/handsfreepc.exe --config ./config.local.yaml transcripts --tail 50
-```
+## 麦克风避让
 
-默认原文文件是 `%LOCALAPPDATA%\HandsFreePC\transcripts\asr-transcripts.jsonl`，单文件最大 5 MiB，保留 5 个备份。公开默认和 `config.example.yaml` 仍为 `false`；原文可能包含口述路径、姓名、聊天内容或其他敏感信息，启用者应自行控制该 Windows 用户账户和文件备份/同步范围。
+监听常开时，一旦别的程序（Zoom、Teams、腾讯会议、微信通话、浏览器里的会议……）开始采集麦克风，运行时会在约 3 秒内释放麦克风、暂停转写和语音播报，屏幕提示「X 正在使用麦克风，已暂停监听」；对方释放后 3 秒内自动恢复。判断依据是 Windows 自己的麦克风使用记录（`CapabilityAccessManager\ConsentStore\microphone` 注册表），不探测也不占用别的设备。`app.microphone_guard_ignore` 里可以列出不算抢占的程序名，例如 `["obs64.exe"]`。
 
-## 可选 Qwen Open Computer Use 驱动
-
-[Qwen open-computer-use](https://github.com/QwenLM/open-computer-use) 0.2.3 的 MCP server 可作为持久连接的实验驱动，但**不是默认依赖，也不会自动安装**。0.4 固定适配 0.2.3，并要求同时设置：
-
-```yaml
-computer_control:
-  driver: open_computer_use
-  allow_experimental_driver: true
-```
-
-Windows 中文环境存在尚未合并修复的 UTF-8/PowerShell 边界问题：[Issue #5](https://github.com/QwenLM/open-computer-use/issues/5)、[PR #6](https://github.com/QwenLM/open-computer-use/pull/6)。适配器发现 Unicode replacement character、前后空白会被 0.2.3 截断、过期 observation 或变更请求结果未知时会 fail closed。不要把 ASCII smoke 当作中文可用证明。完整说明见 [Open Computer Use 适配说明](docs/OPEN_COMPUTER_USE.md)。
-
-此外，0.2.3 的 `get_app_state` 在当前适配中没有提供可安全绑定的结构化元素列表。因而通用 planner 不能可靠地产生元素索引：点击/导航能力受限，`type_text`/`set_value` 也会因缺少可核验的焦点元素而保守失败。它不是默认 UIA driver 的等价替换。
-
-## 旧 `legacy_codex_cli`
-
-0.2 的 `CodexComputerController` 只保留为显式兼容后端：
-
-```yaml
-computer_control:
-  backend: legacy_codex_cli
-  allow_codex_cli_host_read: true
-  allow_legacy_codex_computer_use: true
-```
-
-它依赖 Codex thread 和 Computer Use plugin，并把同一 agent 的 `VERIFIED_COMPLETION` 状态作为协议结果；没有 0.4 的本地动作级 verifier，**不能作为可信验收路径，也不会自动回退到它**。新安装不要使用。`codex -p` 是 profile 参数，不是 Claude 式 prompt 参数；Claude 的非交互参数才是 `claude -p`。
-
-## 默认隐私与安全边界
-
-- 原始音频始终不由该功能落盘；转写默认不落盘，只有显式设置 `privacy.save_transcripts: true` 才写入独立的本机原文日志；
-- 云 planner、电脑控制、屏幕上下文许可和真实执行默认关闭；
-- 不允许任意 shell、PowerShell、Run 对话框或自定义脚本进入桌面动作 Schema；
-- `strict`/`personal_trusted` 仍只向云 planner 暴露裁剪后的控件子集；`local_unrestricted` 会发送所有 fresh 可见顶层窗口的标题/进程摘要，并在观察后发送真实窗口标题和可寻址 UIA 上下文，Codex 还可接收选中窗口截图。截图和窗口标题可能包含敏感信息；首次验收应关闭无关窗口并使用非敏感账户；
-- 上述数据范围只描述 HandsFreePC 主动组装的输入；Codex/Claude CLI 及其提供商仍可能处理账户、网络、CLI/OS/runtime、临时工作目录和诊断/遥测等自身元数据，项目开关不能把这层变成零元数据；
-- 确定性 `OPEN_PATH` 会要求后置条件先为 false、打开后为 true。Explorer 目录通过 Shell.Application 返回的规范化路径精确验证；只要前台仍是该 Explorer 窗口且目录已精确变为目标，它可以复用同一 HWND。普通文件则仍要求新前台 HWND，且标题包含精确文件名，只是 best-effort；同名文件、不显示文件名或复用同一窗口的文件查看器仍需人工检查；
-- 常开麦克风仍会在内存中处理房间声音，包括儿童、访客和远程通话；请遵守告知、同意和当地法律；
-- 随机四位口令在本次进程运行期内不复用，降低固定录音重放风险；但它不是持久凭证，没有说话人识别，重启后也不保证绝对不复用，更不能抵御旁人、扬声器或实时转述/重放听到本轮口令后代说；高风险动作必须有人看屏幕监督；
-- `silent`、结束会话或急停都不等于关闭麦克风；完全停止采集需退出进程或关闭 Windows 麦克风权限；
-- 本项目不管理 Codex/Claude 的登录缓存、提供商留存或账户数据控制。
-
-详见 [PRIVACY.md](PRIVACY.md)、[SECURITY.md](SECURITY.md)、[故障排查](docs/TROUBLESHOOTING.md) 和 [第三方许可说明](THIRD_PARTY_NOTICES.md)。
-
-## 开发测试
+## 不用麦克风试一条
 
 ```powershell
-./.venv/Scripts/python.exe -m pytest -q -m "not live" --basetemp ./.pytest-tmp/unit
-./.venv/Scripts/python.exe -m ruff check handsfree_pc tests
+.venv\Scripts\python.exe -m handsfree_pc --config config.local.yaml exec "打开下载文件夹"
 ```
 
-带 `@pytest.mark.live` 的测试会打开窗口或移动焦点，必须显式运行。自动化通过不能替代目标应用的人工受控验收。
+和语音路径完全相同的前言、超时和结果解析；stderr 上能看到 Kimi 每一步调用的工具，stdout 是 JSON 结果（成功与否、Kimi 的一句话说明、最终截图路径）。
 
----
+## gui-control 技能
 
-**English summary:** HandsFreePC 0.4.0 keeps continuous local speech input, independent offline English-Vosk `over` detection, and FIFO execution, but replaces model-owned mouse/keyboard control with an owned Windows UIA/Win32 driver. Claude CLI is the default strict, text-only step planner. Codex CLI is an explicit best-effort alternative that requires host-read consent and can receive the selected-window screenshot in `local_unrestricted`. Every matched window retains a complete exact-window visual viewport while semantic UIA controls remain preferred; PaddleOCR regions are optional. Oversized frames are proportionally reduced to a bounded planner canvas and returned point coordinates are mapped to original capture pixels before local rebinding. Exactly one action runs per step, followed by a fresh screenshot, replan, and verification. Rendered typing is single-use and requires exact `GetGUIThreadInfo` focus plus a visible system caret bound to the clicked field; it can type either an exact query/filter or an explicitly requested unsent draft/message/prompt. A coordinate-only `VisualViewport` never exposes `PRESS_KEY`, including Enter/Return, because caret/focus and a top coordinate cannot prove SearchBox rather than a composer. A visual query waits for immediate results and clicks one from a fresh screenshot; only a semantic UIA SearchBox/AddressBar may submit with Enter/Return. The parser never rewrites a click into Enter. A related WeChat foreground window such as `WeChatAppEx` may continue only after exact same-process/process-tree rebinding. Recognized send/delete/install/upload/share/close actions still require confirmation. Terminal/Run/UAC/authentication/password/credential/payment/privacy surfaces, reusable unbound coordinates, and arbitrary shell remain hard boundaries.
+运行时交给 Kimi 的前言只说「用 gui-control 技能的方法做」，具体怎么做写在你的技能里。一个能用的技能至少包含：
+
+- 环境：一个装了 `pyautogui`、`pyperclip` 的 venv，和几个小脚本（枚举窗口、用 AttachThreadInput 把窗口置顶后截图、粘贴文字）。
+- 套路：截图 → 用 ReadMediaFile 看图算坐标（注意模型看到的是降采样图，要按比例乘回去）→ 点击/按键 → 每步截图核对。
+- 中文必须走剪贴板粘贴；文件用 `Set-Clipboard -Path` 再 Ctrl+V；`pyperclip.copy` 会覆盖剪贴板里的文件，顺序要对。
+- 各应用的约定：微信 4.x 的搜索框和「文件传输助手」；Codex 在 ChatGPT 桌面端里、搜索用 Ctrl+K、输入框紧挨模型选择器；Claude 桌面端有 Chat and Cowork / Code 两个页签，没特别说明用 Code。
+- 意图定位：转写文本只是线索，去对真实清单做模糊匹配；「最新的」按修改时间取第一；后面补充的条件（「不要发送」）推翻前面的。
+- 结尾两行固定格式，运行时靠它判断成败：`RESULT: <成功|失败> - <一句话>` 和 `SCREENSHOT: <路径>`。
+
+技能里可以引用你自己的项目地图（例如一份按项目整理的目录索引），Kimi 会先查索引再按修改时间找文件，所以「打开 g 盘那个数据库文件夹」这种缩写也能定位。
+
+## 日志与排查
+
+- 事件日志：`%LOCALAPPDATA%\HandsFreePC\logs\handsfreepc.jsonl`，固定字段，不含指令原文、路径或屏幕内容。`handsfreepc logs --tail 50`、`handsfreepc diagnose-last`。
+- 自启动的标准输出：`%LOCALAPPDATA%\HandsFreePC\logs\run.log`。
+- 识别原文（需 `privacy.save_transcripts: true`）：`handsfreepc transcripts --tail 20`。
+- Kimi 每次运行的工具调用序列保存在进程内的 `KimiRun.tool_log`，`exec` 会把工具名打印出来。
+
+常见问题见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)，模块划分见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，测试方法见 [docs/TESTING.md](docs/TESTING.md)。
+
+## 开发
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q -m "not live"
+.venv\Scripts\python.exe -m ruff check handsfree_pc tests
+```
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。语音模型的许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

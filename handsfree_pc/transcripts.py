@@ -161,11 +161,7 @@ def _validated_transcript(value: object) -> dict[str, Any] | None:
         event["session_id"] = session_id
     for key, minimum in (("segment_index", 0), ("segment_count", 1)):
         candidate = value.get(key)
-        if (
-            isinstance(candidate, int)
-            and not isinstance(candidate, bool)
-            and candidate >= minimum
-        ):
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= minimum:
             event[key] = candidate
     transcribed = value.get("transcribed")
     if isinstance(transcribed, bool):

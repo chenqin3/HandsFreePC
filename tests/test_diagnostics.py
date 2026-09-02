@@ -28,7 +28,7 @@ def test_diagnostics_uses_bounded_rotating_jsonl_schema(tmp_path) -> None:
     diagnostics = Diagnostics(path)
     try:
         event = diagnostics.event(
-            stage="observe_driver",
+            stage="kimi_agent",
             error_code="UIA_READ_FAILED",
             safe_message="The UI Automation observation failed before an action",
             session_id="session-1",
@@ -47,7 +47,7 @@ def test_diagnostics_uses_bounded_rotating_jsonl_schema(tmp_path) -> None:
 
     stored = json.loads(path.read_text(encoding="utf-8"))
     assert stored == event
-    assert stored["stage"] == "observe_driver"
+    assert stored["stage"] == "kimi_agent"
     assert stored["error_code"] == "UIA_READ_FAILED"
     assert stored["app"] == "claude"
     assert set(stored) == {
@@ -92,7 +92,7 @@ def test_diagnostics_rejects_arbitrary_prompt_or_uia_payload_fields(tmp_path) ->
             )
         with pytest.raises(TypeError):
             diagnostics.event(
-                stage="observe_driver",
+                stage="kimi_agent",
                 error_code="OBSERVE_FAILED",
                 safe_message="Observation failed",
                 uia_text="private UIA body",
@@ -143,7 +143,7 @@ def test_diagnose_last_prefers_newest_warning_or_error(tmp_path) -> None:
             level="info",
         )
         diagnostics.event(
-            stage="verify_action",
+            stage="kimi_agent",
             error_code="POSTCONDITION_FAILED",
             safe_message="The action postcondition was not established",
         )
@@ -159,48 +159,39 @@ def test_diagnose_last_prefers_newest_warning_or_error(tmp_path) -> None:
     event = diagnose_last_event(path)
 
     assert event is not None
-    assert event["stage"] == "verify_action"
+    assert event["stage"] == "kimi_agent"
     assert event["error_code"] == "POSTCONDITION_FAILED"
 
 
-@pytest.mark.parametrize(
-    ("message", "stage", "error_code"),
-    [
-        (
-            "FAILURE: 桌面观察失败：WindowsUiaDriverError: private UI text",
-            "observe_driver",
-            "DESKTOP_OBSERVE_FAILED",
-        ),
-        (
-            "FAILURE: 本地安全策略阻止读取该界面：credential-like private value",
-            "observe_safety",
-            "OBSERVATION_SAFETY_BLOCKED",
-        ),
-        (
-            "FAILURE: 动作后本地验收失败：private target label",
-            "verify_action",
-            "ACTION_VERIFICATION_FAILED",
-        ),
-    ],
-)
-def test_control_failure_classification_never_copies_legacy_message(
-    message, stage, error_code
-) -> None:
-    status = classify_control_failure(message)
+def test_unstructured_control_failure_never_copies_the_raw_message() -> None:
+    private = "private C:\\Users\\someone\\secret.txt sk-proj-abcdefghijklmnopqrstuvwxyz"
+    status = classify_control_failure(f"FAILURE: {private}")
 
-    assert status.stage == stage
-    assert status.error_code == error_code
+    assert status.stage == "runtime"
+    assert status.error_code == "CONTROL_COMMAND_FAILED"
     assert "private" not in status.safe_message
+    assert "sk-proj" not in status.safe_message
 
 
 def test_control_failure_prefers_explicit_bounded_status() -> None:
     status = classify_control_failure(
         "legacy private content",
-        stage="reobserve",
-        error_code="FRESH_OBSERVATION_FAILED",
-        safe_message="The target app could not be refreshed after the action",
+        stage="kimi_agent",
+        error_code="KIMI_TIMEOUT",
+        safe_message="Kimi did not finish within the time limit",
     )
 
-    assert status.stage == "reobserve"
-    assert status.error_code == "FRESH_OBSERVATION_FAILED"
-    assert status.safe_message == "The target app could not be refreshed after the action"
+    assert status.stage == "kimi_agent"
+    assert status.error_code == "KIMI_TIMEOUT"
+    assert status.safe_message == "Kimi did not finish within the time limit"
+
+
+def test_unknown_stage_or_code_falls_back_to_runtime() -> None:
+    status = classify_control_failure(
+        "x", stage="observe_driver", error_code="UIA_READ_FAILED", safe_message="old"
+    )
+    assert status.stage == "runtime"
+    assert status.error_code == "CONTROL_COMMAND_FAILED"
+    bad_code = classify_control_failure("x", stage="kimi_agent", error_code=None)
+    assert bad_code.error_code == "CONTROL_COMMAND_FAILED"
+    assert bad_code.stage == "kimi_agent"

@@ -1,7 +1,6 @@
-"""Kimi Code CLI as the desktop executor (``computer_control.engine: kimi_agent``).
+"""Kimi Code CLI as the desktop executor.
 
-Instead of driving Windows UI Automation ourselves, each spoken command is
-handed to the Kimi Code agent in non-interactive prompt mode. Kimi loads the
+Each spoken command is handed to the Kimi Code agent in non-interactive prompt mode. Kimi loads the
 user's ``gui-control`` skill and completes the task the way a person would:
 screenshot, look, click/paste with pyautogui, screenshot again to verify. The
 agent reports a one-line verdict that this controller turns into the queue
@@ -26,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..computer_control import ComputerControlResult
+from .control import ControlResult
 
 DEFAULT_PREAMBLE = """你是 HandsFreePC 的桌面执行代理。用户通过语音下达指令，转写文本可能含糊、
 中英混杂、有口误；先按 gui-control 技能里的"意图定位"原则，把转写当线索去对真实清单
@@ -215,9 +214,9 @@ class KimiAgentController:
         run: KimiRun | None = None,
         cancelled: bool = False,
         timed_out: bool = False,
-    ) -> ComputerControlResult:
+    ) -> ControlResult:
         self._trace(error_code=error_code, safe_message=message, level="error")
-        return ComputerControlResult(
+        return ControlResult(
             False,
             f"FAILURE: {message}",
             session_id=self.session_id,
@@ -257,7 +256,7 @@ class KimiAgentController:
         instruction: str,
         *,
         cancel_event: threading.Event | None = None,
-    ) -> ComputerControlResult:
+    ) -> ControlResult:
         if not isinstance(instruction, str) or not instruction.strip():
             return self._failure("电脑控制指令为空", error_code="EMPTY_INSTRUCTION")
         if len(instruction) > 8000:
@@ -348,9 +347,7 @@ class KimiAgentController:
         if run.session_id:
             self._kimi_session = run.session_id
         if cancelled:
-            return self._failure(
-                "桌面任务已取消", error_code="CANCELLED", run=run, cancelled=True
-            )
+            return self._failure("桌面任务已取消", error_code="CANCELLED", run=run, cancelled=True)
         if timed_out:
             return self._failure(
                 f"Kimi 超过 {int(self.timeout_seconds)} 秒仍未完成，已终止",
@@ -384,7 +381,7 @@ class KimiAgentController:
             error_code="KIMI_COMPLETED",
             safe_message=f"{note} (tool_calls={run.tool_calls})",
         )
-        return ComputerControlResult(
+        return ControlResult(
             True,
             note or "Kimi 已完成",
             session_id=self.session_id,
@@ -393,8 +390,6 @@ class KimiAgentController:
             error_code="KIMI_COMPLETED",
             safe_message=note or "Kimi 已完成",
         )
-
-    execute = run
 
     def cancel(self) -> bool:
         self._cancel.set()
@@ -413,4 +408,34 @@ class KimiAgentController:
         self.cancel()
 
 
-__all__ = ["DEFAULT_PREAMBLE", "KimiAgentController", "KimiRun", "parse_stream_line"]
+def build_kimi_controller(
+    settings: Any,
+    *,
+    diagnostics: object | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> KimiAgentController:
+    """Create the controller from the ``kimi`` configuration section."""
+
+    preamble = None
+    if settings.preamble_file is not None:
+        preamble = Path(settings.preamble_file).read_text(encoding="utf-8")
+    return KimiAgentController(
+        executable=settings.executable,
+        working_directory=settings.working_directory,
+        model=settings.model,
+        preamble=preamble,
+        skills_dir=settings.skills_dir,
+        timeout_seconds=settings.timeout_seconds,
+        resume_session=settings.resume_session,
+        diagnostics=diagnostics,
+        on_progress=on_progress,
+    )
+
+
+__all__ = [
+    "DEFAULT_PREAMBLE",
+    "KimiAgentController",
+    "KimiRun",
+    "build_kimi_controller",
+    "parse_stream_line",
+]

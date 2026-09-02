@@ -42,12 +42,12 @@ if ($DownloadModels) {
     if ($LASTEXITCODE -ne 0) { throw "Downloading speech models failed ($LASTEXITCODE)." }
 }
 
-$doctorArguments = @('-m', 'handsfree_pc', '--config', $configPath, 'doctor')
+$doctorArguments = @('-m', 'handsfree_pc', '--config', $configPath, 'doctor', '--check-kimi')
 if ($DownloadModels) { $doctorArguments += '--strict' }
 & $pythonPath @doctorArguments
 if ($LASTEXITCODE -ne 0) { throw "HandsFreePC doctor failed ($LASTEXITCODE)." }
 if ($DownloadModels) {
-    Write-Host 'HandsFreePC installation finished and the default runtime is ready.'
+    Write-Host 'HandsFreePC is installed and ready. Start it with scripts\run.ps1 or scripts\install_autostart.ps1.'
 } else {
-    Write-Host 'Package installation finished. Download models, then run doctor --strict before live use.'
+    Write-Host 'Package installed. Download models (scripts\download-models.ps1), then run doctor --strict.'
 }

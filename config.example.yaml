@@ -1,39 +1,44 @@
+# HandsFreePC configuration. Copy to config.local.yaml (git-ignored) and edit.
+# Every key is optional: missing keys keep these packaged defaults; unknown
+# sections are ignored.
+
+# Voice protocol. Say a wake phrase to start a session, end every command with a
+# prompt delimiter ("over"), an end phrase to stop taking commands, a stop phrase
+# to cancel everything at once. Every phrase here must also appear in
+# speech.wake.grammar (space-separated) so the offline detector can hear it.
 app:
   language: zh-CN
   wake_phrases:
-    - "开始语音操作"
+  - 开始语音操作
   end_session_phrases:
-    - "结束语音操作"
+  - 结束语音操作
   stop_phrases:
-    - "立即停止所有操作"
-    - "取消所有操作"
-    - "停止所有操作"
-    - "电脑停止"
+  - 立即停止所有操作
+  - 取消所有操作
+  - 停止所有操作
+  - 电脑停止
+  resume_phrases:
+  - 恢复语音操作
+  - 恢复监听
+  - 继续队列
+  - 恢复队列
   prompt_delimiters:
-    - over
-  control_prefixes:
-    - "电脑"
-  awake_timeout_seconds: 0
+  - over
   feedback_mode: overlay
-  # Release the microphone while another app (a meeting, a call) is capturing
-  # and resume automatically when it stops; names/paths here never count.
+  max_queue_size: 8
+  max_prompt_chars: 4000
+  failure_policy: continue
   auto_pause_when_microphone_busy: true
   microphone_guard_poll_seconds: 3.0
   microphone_guard_ignore: []
 
+# Nothing is written to disk unless you opt in.
 privacy:
-  save_audio: false
-  # Explicit opt-in: stores verbatim local ASR returns in a separate per-user JSONL journal.
   save_transcripts: false
-  redact_paths_in_logs: true
-  allow_cloud_planner: false
 
-diagnostics:
-  # Local exception/stage diagnostics for development. It never records audio,
-  # screenshots, the full UIA tree, or the full spoken command.
-  debug_log_enabled: false
-  debug_log_local_only: true
-
+# Local speech chain: Silero VAD, a Vosk grammar detector for the control phrases,
+# a Vosk English detector for "over", and SenseVoice or faster-whisper for the
+# command text. Paths are relative to this file.
 speech:
   sample_rate: 16000
   input_device: null
@@ -55,32 +60,24 @@ speech:
     backend: vosk
     model_path: models/vosk-model-small-cn-0.22
     grammar:
-      - "开始 语音 操作"
-      - "结束 语音 操作"
-      - "立即 停止 所有 操作"
-      - "取消 所有 操作"
-      - "停止 所有 操作"
-      - "电脑 停止"
-      - "恢复 语音 操作"
-      - "恢复 监听"
-      - "确认 执行"
-      - "取消 操作"
-      - "不要 执行"
-      - "继续 队列"
-      - "恢复 队列"
+    - 开始 语音 操作
+    - 结束 语音 操作
+    - 立即 停止 所有 操作
+    - 取消 所有 操作
+    - 停止 所有 操作
+    - 电脑 停止
+    - 恢复 语音 操作
+    - 恢复 监听
+    - 继续 队列
+    - 恢复 队列
     phrase_window_seconds: 5.0
-  # A separate English Vosk model listens for the short delimiter. It consumes
-  # the same microphone blocks as wake detection and ASR; it does not open a
-  # second microphone stream or save audio.
   delimiter:
     backend: vosk
     model_path: models/vosk-model-small-en-us-0.15
     grammar:
-      - over
+    - over
     phrase_window_seconds: 2.0
   command:
-    # SenseVoice is the fast CPU default. For higher-accuracy Chinese/English
-    # commands, install with -WithWhisper and change backend to faster-whisper.
     backend: sensevoice
     model_path: models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17
     model: large-v3-turbo
@@ -91,8 +88,8 @@ speech:
     device: auto
     compute_type: auto
     beam_size: 5
-    initial_prompt: "语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
-    hotwords: "Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
+    initial_prompt: 语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。
+    hotwords: Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over
   fallback:
     backend: none
     model: large-v3-turbo
@@ -100,305 +97,16 @@ speech:
     compute_type: auto
     language: zh
     beam_size: 5
-    initial_prompt: "语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。"
-    hotwords: "Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over"
+    initial_prompt: 语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。
+    hotwords: Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over
 
-planner:
-  # Legacy one-shot VoiceRuntime fallback only. Cloud output is locally restricted
-  # to affirmatively and exactly authorized app UI navigation; it cannot choose
-  # feedback/pause/resume/wait/path/text/send actions.
-  enabled: false
-  backend: claude
-  timeout_seconds: 90
+# The executor. Every command is handed to Kimi Code CLI in prompt mode; Kimi
+# drives the desktop with its gui-control skill.
+kimi:
+  executable: kimi
+  working_directory: null
   model: null
-  codex_executable: codex
-  claude_executable: claude
-
-computer_control:
-  enabled: false
-  # proof_v1 preserves the existing proof-oriented controller. assistive_v1 is
-  # the opt-in task-goal controller. kimi_agent hands every spoken command to
-  # Kimi Code CLI (`kimi -p`), which drives the desktop with its gui-control
-  # skill (screenshot -> look -> pyautogui -> verify); it needs no UIA driver
-  # and requires privacy.allow_cloud_planner: true. Keep the public default on
-  # proof_v1.
-  engine: proof_v1
-  # kimi_agent settings (ignored by the other engines)
-  kimi_executable: kimi
-  # Working directory for the agent; null means the user's home so the skill,
-  # WorkMap, and helper scripts are all in reach.
-  kimi_working_directory: null
-  kimi_model: null
-  kimi_skills_dir: null
-  # Optional file whose text replaces the built-in instruction preamble.
-  kimi_preamble_file: null
-  kimi_resume_session: false
-  backend: local_agent
-  driver: windows_uia
-  # strict requires each generic task to name exactly one configured app.
-  # local_unrestricted has no APP_SCOPE_REQUIRED gate: it exposes every freshly
-  # enumerated visible ordinary top-level window and refreshes that inventory
-  # between steps so the planner can infer low-risk cross-app navigation.
-  # If speech explicitly names an app/window/field, the corresponding user step
-  # still binds that exact target. Natural search sets the exact query, presses
-  # Enter/Return, and requires a fresh result transition; text entry alone is not
-  # search completion. Low-risk switching/navigation/toggle/generic safe dialogs
-  # do not confirm, but recognized send/delete/install/upload/share/close actions
-  # still do. Terminal/Run/UAC/auth/password/credential/payment/privacy targets,
-  # coordinates, and arbitrary shell remain blocked in every profile.
-  # Every generic planner action needs a locally checkable false-before/true-after
-  # condition. Deterministic native skills use action-specific local evidence.
-  # claude is the default strict planner. Other accepted values are
-  # codex_cli_best_effort (requires separate host-read consent) and none.
-  planner_backend: claude
-  # Public default. personal_trusted and the broader local_unrestricted profile
-  # belong only in an ignored config.local.yaml on a private, supervised machine.
-  safety_profile: strict
-  allow_screen_context_to_cloud: false
-  # Codex subscription CLI has no complete no-tools mode. This separate consent
-  # is required for any enabled Codex CLI planner or legacy Codex controller.
-  allow_codex_cli_host_read: false
-  # Legacy Codex Computer Use has broader tools and no 0.3 local action verifier.
-  allow_legacy_codex_computer_use: false
+  skills_dir: null
+  preamble_file: null
+  resume_session: false
   timeout_seconds: 600
-  # Deadline for one cold CLI planning step. This is independent of both the
-  # overall computer-control timeout above and legacy planner.timeout_seconds.
-  planner_step_timeout_seconds: 60
-  # Reasoning effort for one assistive planning step (Codex backend). A single
-  # UI decision rarely needs deep deliberation; null keeps the backend default.
-  planner_reasoning_effort: low
-  max_steps: 20
-  max_observation_chars: 24000
-  max_queue_size: 8
-  max_prompt_chars: 4000
-  failure_policy: pause
-  end_policy: drain
-  working_directory: runtime/computer-control
-  codex_executable: codex
-  claude_executable: claude
-  # Use a backend-supported fast model explicitly in private configuration
-  # (for example, gpt-5.6-luna for Codex or haiku for Claude).
-  model: null
-  # Apps omitted from this mapping default to confirm in assistive_v1.
-  send_policy:
-    claude: auto
-    codex: auto
-    wechat: confirm
-  open_computer_use_executable: open-computer-use
-  open_computer_use_args: [mcp]
-  allow_experimental_driver: false
-  allow_coordinate_actions: false
-
-# Optional exact-window visual context for selected apps. Every matched window
-# retains its complete screenshot viewport even when rich UIA controls exist;
-# semantic UIA controls remain preferred, while the screenshot is also available
-# to a configured visual planner and may leave the machine. PaddleOCR text regions
-# are a separate optional enhancement and are not required for screenshot planning.
-visual_ocr:
-  enabled: false
-  ocr_regions_enabled: false
-  endpoint: http://127.0.0.1:8766/layout-parsing
-  allow_remote_screen_ocr: false
-  # In an ignored local_unrestricted config, use ["*"] to retain an exact-window
-  # screenshot viewport for every freshly enumerated visible top-level window.
-  apps: [codex, wechat]
-  timeout_seconds: 60
-  max_image_bytes: 8388608
-  max_response_bytes: 2097152
-  max_items: 160
-  max_text_chars: 256
-  bbox_tolerance_pixels: 8
-
-# Optional read-only grounding over a local WorkMap export. Keep machine paths
-# and personal aliases in config.local.yaml; they are intentionally not public.
-workmap:
-  enabled: false
-  out_directory: null
-  aliases: {}
-
-execution:
-  dry_run: true
-  ambiguity_threshold: 0.78
-  max_search_results: 5
-  confirmation_timeout_seconds: 15
-  # This is only the spoken prefix. Runtime appends a new random four-digit
-  # one-time challenge within the current VoiceRuntime process; codes are not
-  # persisted across restarts, and the static prefix alone never authorizes.
-  confirmation_phrases:
-    - "确认执行"
-  cancellation_phrases:
-    - "取消操作"
-    - "不要执行"
-  blocked_keywords:
-    - "删除"
-    - "格式化"
-    - "付款"
-    - "转账"
-    - "输入密码"
-  path_aliases:
-    桌面: "%USERPROFILE%\\Desktop"
-    文档: "%USERPROFILE%\\Documents"
-    下载: "%USERPROFILE%\\Downloads"
-  search_roots: []
-
-# Canonical spoken modes map to exact, version-specific accessible labels.
-# Labels are tried in order; a fuzzy-only match is rejected.
-apps:
-  codex:
-    process_names: ["ChatGPT.exe", "codex.exe"]
-    executable: null
-    title_patterns: ["ChatGPT", "Codex"]
-    activation_hotkey: null
-    search_hotkey: null
-    native_voice_hotkey: null
-    voice_button_names: []
-    mode_names:
-      chat: ["Chat"]
-      code: ["Code"]
-    # Keep the semantic control plane small. Text/Document/Pane/Group are
-    # observed separately as non-clickable content for local freshness only.
-    include_control_types:
-      - "Button"
-      - "TabItem"
-      - "MenuItem"
-      - "ListItem"
-      - "TreeItem"
-      - "Edit"
-      - "ComboBox"
-      - "CheckBox"
-      - "RadioButton"
-      - "Dialog"
-      - "Window"
-    content_control_types: ["Text", "Document", "Pane", "Group"]
-    drop_long_content: true
-    max_control_name_chars: 500
-    max_content_chars: 1000
-    max_content_nodes: 80
-    composer_names:
-      - "Prompt"
-      - "Message"
-      - "Ask anything"
-      - "Type a message"
-      - "输入消息"
-      - "输入提示词"
-  claude:
-    process_names: ["claude.exe"]
-    executable: null
-    title_patterns: ["Claude"]
-    activation_hotkey: null
-    search_hotkey: null
-    native_voice_hotkey: null
-    voice_button_names: []
-    mode_names:
-      chat: ["Chat and Cowork", "Chat"]
-      cowork: ["Chat and Cowork", "Cowork"]
-      code: ["Code"]
-      design: ["Design"]
-    include_control_types:
-      - "Button"
-      - "TabItem"
-      - "MenuItem"
-      - "ListItem"
-      - "TreeItem"
-      - "Edit"
-      - "ComboBox"
-      - "CheckBox"
-      - "RadioButton"
-      - "Dialog"
-      - "Window"
-    content_control_types: ["Text", "Document", "Pane", "Group"]
-    drop_long_content: true
-    max_control_name_chars: 500
-    max_content_chars: 1000
-    max_content_nodes: 80
-    composer_names:
-      - "Prompt"
-      - "Message"
-      - "Ask Claude"
-      - "Type a message"
-      - "输入消息"
-      - "询问 Claude"
-  chrome:
-    process_names: ["chrome.exe"]
-    executable: null
-    title_patterns: ["Chrome"]
-    activation_hotkey: null
-    search_hotkey: null
-    native_voice_hotkey: null
-    voice_button_names: []
-    mode_names: {}
-    include_control_types:
-      - "Button"
-      - "TabItem"
-      - "MenuItem"
-      - "ListItem"
-      - "TreeItem"
-      - "Edit"
-      - "ComboBox"
-      - "CheckBox"
-      - "RadioButton"
-      - "Hyperlink"
-      - "Dialog"
-      - "Window"
-    content_control_types: ["Text", "Document", "Pane", "Group"]
-    drop_long_content: true
-    max_control_name_chars: 500
-    max_content_chars: 1000
-    max_content_nodes: 120
-    composer_names: ["Address and search bar", "Search"]
-  explorer:
-    process_names: ["explorer.exe"]
-    executable: null
-    title_patterns: ["File Explorer", "资源管理器", "此电脑"]
-    activation_hotkey: null
-    search_hotkey: null
-    native_voice_hotkey: null
-    voice_button_names: []
-    mode_names: {}
-    include_control_types:
-      - "Button"
-      - "TabItem"
-      - "MenuItem"
-      - "ListItem"
-      - "TreeItem"
-      - "Edit"
-      - "ComboBox"
-      - "CheckBox"
-      - "RadioButton"
-      - "DataItem"
-      - "Dialog"
-      - "Window"
-    content_control_types: ["Text", "Document", "Pane", "Group"]
-    drop_long_content: true
-    max_control_name_chars: 500
-    max_content_chars: 1000
-    max_content_nodes: 160
-    composer_names: ["Address", "Search"]
-  wechat:
-    process_names: ["Weixin.exe", "WeChat.exe"]
-    executable: null
-    title_patterns: ["微信", "WeChat"]
-    # WeChat's standard global shortcut restores a hidden/minimized main window.
-    activation_hotkey: "ctrl+alt+w"
-    search_hotkey: null
-    native_voice_hotkey: null
-    voice_button_names: []
-    mode_names: {}
-    include_control_types:
-      - "Button"
-      - "TabItem"
-      - "MenuItem"
-      - "ListItem"
-      - "TreeItem"
-      - "Edit"
-      - "ComboBox"
-      - "CheckBox"
-      - "RadioButton"
-      - "Dialog"
-      - "Window"
-    content_control_types: ["Text", "Document", "Pane", "Group"]
-    drop_long_content: true
-    max_control_name_chars: 500
-    max_content_chars: 1000
-    max_content_nodes: 120
-    composer_names: ["输入", "消息", "Type a message"]

@@ -6,9 +6,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-from handsfree_pc.desktop.kimi_agent import (
+from handsfree_pc.kimi_agent import (
     DEFAULT_PREAMBLE,
     KimiAgentController,
     KimiRun,
@@ -192,35 +190,25 @@ def test_missing_executable_is_reported_not_raised() -> None:
     assert result.error_code == "KIMI_NOT_AVAILABLE"
 
 
-def test_factory_builds_the_kimi_controller_without_a_driver(tmp_path: Path) -> None:
+def test_build_kimi_controller_reads_the_kimi_section(tmp_path: Path) -> None:
     from handsfree_pc.config import load_settings
-    from handsfree_pc.desktop.factory import build_computer_controller
+    from handsfree_pc.kimi_agent import build_kimi_controller
 
+    (tmp_path / "preamble.txt").write_text("自定义前言", encoding="utf-8")
     config = tmp_path / "config.yaml"
     config.write_text(
-        "privacy:\n  allow_cloud_planner: true\n"
-        "execution:\n  dry_run: false\n"
-        "computer_control:\n  enabled: true\n  engine: kimi_agent\n"
-        "  allow_screen_context_to_cloud: true\n"
-        "  kimi_executable: kimi-test\n  kimi_model: kimi-code/k3\n",
+        "kimi:\n  executable: kimi-test\n  model: kimi-code/k3\n  timeout_seconds: 42\n"
+        "  preamble_file: preamble.txt\n  working_directory: work\n  resume_session: true\n",
         encoding="utf-8",
     )
     settings = load_settings(config)
-    assert settings.computer_control.failure_policy == "continue"
 
-    controller = build_computer_controller(settings, executor=object())
+    controller = build_kimi_controller(settings.kimi, diagnostics=object())
 
-    assert isinstance(controller, KimiAgentController)
     assert controller.executable == "kimi-test"
     assert controller.model == "kimi-code/k3"
-
-
-def test_kimi_engine_requires_cloud_consent(tmp_path: Path) -> None:
-    from handsfree_pc.config import load_settings
-
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        "computer_control:\n  enabled: true\n  engine: kimi_agent\n", encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="allow_cloud_planner"):
-        load_settings(config)
+    assert controller.timeout_seconds == 42.0
+    assert controller.preamble == "自定义前言"
+    assert controller.working_directory == (tmp_path / "work").resolve()
+    assert controller.resume_session is True
+    assert controller.build_prompt("打开记事本") == "自定义前言\n用户指令：打开记事本"

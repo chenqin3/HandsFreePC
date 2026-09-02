@@ -1,6 +1,6 @@
-"""HandsFreePC: continuous voice control with a locally verified desktop agent."""
+"""HandsFreePC: always-on Chinese voice control that hands each command to Kimi Code CLI."""
 
-from .models import Action, ActionType, Plan
+from .models import FeedbackMode
 
-__all__ = ["Action", "ActionType", "Plan"]
-__version__ = "0.4.0"
+__all__ = ["FeedbackMode"]
+__version__ = "0.5.0"

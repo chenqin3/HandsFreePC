@@ -9,9 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def _relative_files(directory: str, pattern: str) -> set[str]:
     root = PROJECT_ROOT / directory
     return {
-        path.relative_to(PROJECT_ROOT).as_posix()
-        for path in root.rglob(pattern)
-        if path.is_file()
+        path.relative_to(PROJECT_ROOT).as_posix() for path in root.rglob(pattern) if path.is_file()
     }
 
 
@@ -50,13 +48,9 @@ def test_sdist_contains_public_install_assets(tmp_path: Path) -> None:
         "SECURITY.md",
         "THIRD_PARTY_NOTICES.md",
         "config.example.yaml",
-        "handsfree_pc/schemas/desktop_step.schema.json",
-        "handsfree_pc/schemas/plan.schema.json",
     }
     required |= _relative_files("docs", "*.md")
-    required |= _relative_files("examples", "*.txt")
     required |= _relative_files("scripts", "*.ps1")
-    required |= _relative_files("tests/fixtures", "*.json")
 
     assert required <= packaged, f"missing from sdist: {sorted(required - packaged)}"
     assert "config.local.yaml" not in packaged

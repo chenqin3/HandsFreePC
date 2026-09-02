@@ -33,11 +33,6 @@ class WorkerState(StrEnum):
     STOPPED = "stopped"
 
 
-class CommandKind(StrEnum):
-    TASK = "task"
-    CONFIRM = "confirm"
-
-
 @dataclass(frozen=True, slots=True)
 class QueuedCommand:
     """An immutable prompt accepted by a voice session."""
@@ -45,8 +40,6 @@ class QueuedCommand:
     text: str
     sequence: int = 0
     session_id: str | None = None
-    kind: CommandKind = CommandKind.TASK
-    confirmation_id: str | None = None
     command_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     enqueued_at: float = field(default_factory=time.monotonic)
 
@@ -59,13 +52,6 @@ class QueuedCommand:
             raise ValueError("Queued command sequence cannot be negative")
         if self.session_id is not None and not isinstance(self.session_id, str):
             raise ValueError("Queued command session_id must be a string or null")
-        if not isinstance(self.kind, CommandKind):
-            raise ValueError("Queued command kind is invalid")
-        if self.kind == CommandKind.CONFIRM:
-            if not isinstance(self.confirmation_id, str) or not self.confirmation_id:
-                raise ValueError("Confirmation commands require a confirmation_id")
-        elif self.confirmation_id is not None:
-            raise ValueError("Task commands cannot carry a confirmation_id")
         if not isinstance(self.command_id, str) or not self.command_id:
             raise ValueError("Queued command command_id must be a non-empty string")
 
@@ -83,8 +69,6 @@ class JobOutcome:
     error_code: str | None = None
     safe_message: str | None = None
     exception_type: str | None = None
-    app: str | None = None
-    generation: int | None = None
     started_at: float | None = None
     completed_at: float = field(default_factory=time.monotonic)
 
@@ -217,7 +201,6 @@ class CommandWorker:
         handler: CommandHandler,
         *,
         max_queue_size: int = 20,
-        max_control_queue_size: int = 4,
         failure_policy: str = "pause",
         on_outcome: OutcomeCallback | None = None,
         on_state_change: StateCallback | None = None,
@@ -229,17 +212,11 @@ class CommandWorker:
             raise ValueError("max_queue_size must be an integer")
         if max_queue_size <= 0:
             raise ValueError("max_queue_size must be positive")
-        if isinstance(max_control_queue_size, bool) or not isinstance(max_control_queue_size, int):
-            raise ValueError("max_control_queue_size must be an integer")
-        if max_control_queue_size <= 0:
-            raise ValueError("max_control_queue_size must be positive")
         if failure_policy not in {"pause", "continue"}:
             raise ValueError("failure_policy must be pause or continue")
         self._handler = handler
         self._queue: deque[QueuedCommand] = deque()
-        self._control_queue: deque[QueuedCommand] = deque()
         self._max_queue_size = max_queue_size
-        self._max_control_queue_size = max_control_queue_size
         self._failure_policy = failure_policy
         self._on_outcome = on_outcome
         self._on_state_change = on_state_change
@@ -268,12 +245,7 @@ class CommandWorker:
     @property
     def pending_count(self) -> int:
         with self._condition:
-            return len(self._control_queue) + len(self._queue)
-
-    @property
-    def control_pending_count(self) -> int:
-        with self._condition:
-            return len(self._control_queue)
+            return len(self._queue)
 
     @property
     def unfinished_count(self) -> int:
@@ -303,64 +275,15 @@ class CommandWorker:
     ) -> bool:
         """Queue a command, returning ``False`` instead of silently dropping it."""
 
-        return self._enqueue(
-            command,
-            control=False,
-            block=block,
-            timeout=timeout,
-        )
-
-    def enqueue_control(
-        self,
-        command: QueuedCommand,
-        *,
-        block: bool = False,
-        timeout: float | None = None,
-    ) -> bool:
-        """Queue a control command ahead of ordinary work.
-
-        Control commands remain FIFO relative to other controls.  They may be
-        accepted while the worker is paused; after ``resume`` they run before
-        previously queued ordinary commands.
-        """
-
-        return self._enqueue(
-            command,
-            control=True,
-            block=block,
-            timeout=timeout,
-        )
-
-    def submit(
-        self,
-        command: QueuedCommand,
-        *,
-        block: bool = False,
-        timeout: float | None = None,
-    ) -> bool:
-        """Backward-compatible alias for :meth:`enqueue`."""
-
-        return self.enqueue(command, block=block, timeout=timeout)
-
-    def _enqueue(
-        self,
-        command: QueuedCommand,
-        *,
-        control: bool,
-        block: bool,
-        timeout: float | None,
-    ) -> bool:
         if not isinstance(command, QueuedCommand):
             raise ValueError("enqueue requires a QueuedCommand")
         if block and timeout is None:
             raise ValueError("A blocking enqueue requires a finite timeout")
         if timeout is not None and timeout < 0:
             raise ValueError("timeout cannot be negative")
-        target = self._control_queue if control else self._queue
-        capacity = self._max_control_queue_size if control else self._max_queue_size
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
-            while len(target) >= capacity:
+            while len(self._queue) >= self._max_queue_size:
                 if not self._accepting or self._state in {
                     WorkerState.STOPPING,
                     WorkerState.STOPPED,
@@ -378,7 +301,7 @@ class CommandWorker:
                 WorkerState.STOPPED,
             }:
                 return False
-            target.append(command)
+            self._queue.append(command)
             self._unfinished += 1
             self._condition.notify_all()
             return True
@@ -419,8 +342,7 @@ class CommandWorker:
         self, *, reason: str = "Cancelled before execution"
     ) -> tuple[QueuedCommand, ...]:
         with self._condition:
-            cancelled = [*self._control_queue, *self._queue]
-            self._control_queue.clear()
+            cancelled = list(self._queue)
             self._queue.clear()
             self._unfinished -= len(cancelled)
             if self._unfinished < 0:  # defensive invariant; should never be reached
@@ -464,8 +386,7 @@ class CommandWorker:
             state_before_start = self._state == WorkerState.NEW
             self._accepting = False
             if cancel_pending or state_before_start:
-                cancelled = [*self._control_queue, *self._queue]
-                self._control_queue.clear()
+                cancelled = list(self._queue)
                 self._queue.clear()
                 self._unfinished -= len(cancelled)
                 if self._active_cancel_event is not None:
@@ -512,9 +433,6 @@ class CommandWorker:
                         if not self._resume_event.is_set():
                             self._condition.wait()
                             continue
-                        if self._control_queue:
-                            command = self._control_queue.popleft()
-                            break
                         if self._queue:
                             command = self._queue.popleft()
                             break
@@ -534,11 +452,7 @@ class CommandWorker:
                 pause_after_failure = bool(
                     not outcome.success
                     and not outcome.cancelled
-                    and (
-                        self._failure_policy == "pause"
-                        or outcome.error_type in {"NeedsConfirmation", "HardBlock"}
-                        or outcome.error_code == "ASSISTIVE_HARD_BLOCK"
-                    )
+                    and self._failure_policy == "pause"
                 )
                 with self._condition:
                     self._active_command = None
