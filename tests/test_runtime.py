@@ -1018,3 +1018,86 @@ def test_stop_closes_controller_and_journal(settings, tmp_path: Path) -> None:
     assert runtime.session_state == SessionState.STOPPED
     assert controller.closed
     assert journal.closed is False  # an injected journal stays owned by the caller
+
+
+class _WakeSpeech:
+    """A speech session whose spotter always fires and whose transcriber is scripted."""
+
+    class Source:
+        @staticmethod
+        def drain():
+            pass
+
+    source = Source()
+    last_marker_phrase = None
+    last_marker_events = ()
+    transcripts: list[str] = []
+    runtime = None
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        pass
+
+    def wait_for_phrase(self, **_kwargs):
+        return "开始语音操作", object()
+
+    def listen_utterance(self, **_kwargs):
+        self.runtime.stop_event.set()
+        raise runtime_module.AudioError("No complete utterance detected: test stop")
+
+    def transcribe(self, _audio):
+        if not self.transcripts:
+            self.runtime.stop_event.set()
+            return ""
+        return self.transcripts.pop(0)
+
+
+def test_strict_wake_needs_the_transcript_to_start_with_the_phrase(settings, monkeypatch) -> None:
+    diagnostics = FakeDiagnostics()
+    runtime, controller, _feedback = build_runtime(settings, diagnostics=diagnostics)
+    _WakeSpeech.runtime = runtime
+    _WakeSpeech.transcripts = ["我们今天开始语音操作吧，先聊聊别的", "开始语音操作 打开记事本 over"]
+    monkeypatch.setattr(runtime_module, "LocalSpeechSession", _WakeSpeech)
+    try:
+        runtime.run_microphone()
+
+        assert runtime.command_worker.drain(timeout=2)
+        assert controller.calls == ["打开记事本"]
+        assert runtime.session_state == SessionState.ACTIVE
+        codes = [event["error_code"] for event in diagnostics.events]
+        assert codes.count("CONTROL_PHRASE_UNCONFIRMED") == 1
+        assert codes.count("VOICE_SESSION_STARTED") == 1
+    finally:
+        runtime.stop()
+
+
+def test_lenient_wake_keeps_the_spotter_hit_when_the_transcript_is_unrelated(
+    settings, monkeypatch
+) -> None:
+    settings.app.strict_wake_phrase = False
+    runtime, _controller, _feedback = build_runtime(settings)
+    _WakeSpeech.runtime = runtime
+    _WakeSpeech.transcripts = ["包子。"]
+    monkeypatch.setattr(runtime_module, "LocalSpeechSession", _WakeSpeech)
+    try:
+        runtime.run_microphone()
+        assert runtime.session_state == SessionState.ACTIVE
+    finally:
+        runtime.stop()
+
+
+def test_confirm_detected_phrase_distinguishes_similar_control_phrases(settings) -> None:
+    runtime, _controller, _feedback = build_runtime(settings)
+    try:
+        assert runtime._confirm_detected_phrase("开始语音操作", "接触语音操作") is None
+        assert runtime._confirm_detected_phrase("结束语音操作", "接触语音操作") is None
+        assert runtime._confirm_detected_phrase("结束语音操作", "结束语音操作。") == "结束语音操作"
+        assert runtime._confirm_detected_phrase("电脑停止", "电脑停止。") == "电脑停止"
+        assert runtime._confirm_detected_phrase("开始语音操作", "包子。") is None
+    finally:
+        runtime.stop()

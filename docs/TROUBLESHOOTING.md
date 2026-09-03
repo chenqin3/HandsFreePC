@@ -15,6 +15,18 @@
 - 自定义了控制词却没加进 `speech.wake.grammar`（按「字 词 之间 加 空格」的形式）。
 - 屏幕上出现过「X 正在使用麦克风，已暂停监听」：别的程序还占着麦克风；等它结束，或把它加进 `app.microphone_guard_ignore`。
 
+## 聊天时误触发了「开始语音操作」
+
+- 默认 `app.strict_wake_phrase: true`：词表检测器听到唤醒词后，还要由正文转写模型确认这句话以唤醒词开头，否则丢弃（事件日志里是 `CONTROL_PHRASE_UNCONFIRMED`）。如果仍误触发，看 `transcripts --tail` 里被确认的那句是什么，通常是真的说了这几个字。
+- 可以把 `speech.wake.phrase_window_seconds` 再调小（默认 3 秒），词表检测器只把这个窗口内的词拼在一起。
+- 也可以换一个更不常说的唤醒词，记得同时改 `speech.wake.grammar`。
+
+## 说了唤醒词却不触发
+
+- 严格模式要求唤醒词在句首：前面别带"嗯""那个"之类的话，说完停一下。
+- 看 `transcripts --tail`：如果转写把唤醒词听成了别的字，把唤醒词加进 `speech.command.hotwords` 和 `initial_prompt`（默认已包含）。
+- 临时放宽：`app.strict_wake_phrase: false`，词表检测器一听到就触发。
+
 ## `over` 经常漏
 
 - `doctor` 里 `models.delimiter.ready` 必须为 true（英文 Vosk 小模型）。

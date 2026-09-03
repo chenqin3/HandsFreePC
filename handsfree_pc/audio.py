@@ -15,6 +15,11 @@ from typing import Any
 from .config import SpeechSettings
 from .normalize import compact_text, phrase_in_text
 
+# The ring buffer keeps this much audio so the wake transcript can start just
+# before the detected phrase instead of at its tail.
+_WAKE_HISTORY_SECONDS = 4.0
+_WAKE_HISTORY_MARGIN_SECONDS = 0.25
+
 
 class AudioError(RuntimeError):
     pass
@@ -121,12 +126,19 @@ class MicrophoneSource:
         device: int | str | None = None,
         block_seconds: float = 0.1,
         pre_roll_seconds: float = 1.2,
+        history_seconds: float | None = None,
     ) -> None:
         self.sample_rate = sample_rate
         self.device = device
         self.block_size = max(160, int(sample_rate * block_seconds))
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=100)
-        self._ring: deque[Any] = deque(maxlen=max(1, math.ceil(pre_roll_seconds / block_seconds)))
+        # The ring always holds the pre-roll; a longer history lets the wake path
+        # hand the transcriber the whole detected phrase, not just its tail.
+        self.pre_roll_blocks = max(1, math.ceil(pre_roll_seconds / block_seconds))
+        history_blocks = max(
+            self.pre_roll_blocks, math.ceil((history_seconds or 0.0) / block_seconds)
+        )
+        self._ring: deque[Any] = deque(maxlen=history_blocks)
         self._buffer_lock = threading.Lock()
         self._stream: Any = None
         self.dropped_blocks = 0
@@ -181,9 +193,15 @@ class MicrophoneSource:
         except queue.Empty as exc:
             raise AudioError("No microphone audio arrived; check the input device") from exc
 
-    def pre_roll(self) -> list[Any]:
+    def pre_roll(self, *, samples: int | None = None) -> list[Any]:
+        """The newest audio: the configured pre-roll, or at least ``samples`` samples."""
+
         with self._buffer_lock:
-            return list(self._ring)
+            blocks = list(self._ring)
+        wanted = self.pre_roll_blocks
+        if samples is not None:
+            wanted = max(wanted, math.ceil(max(0, int(samples)) / self.block_size))
+        return blocks[-wanted:]
 
     def drain(self) -> None:
         with self._buffer_lock:
@@ -733,6 +751,7 @@ class LocalSpeechSession:
             sample_rate=settings.sample_rate,
             device=settings.input_device,
             pre_roll_seconds=settings.pre_roll_seconds,
+            history_seconds=_WAKE_HISTORY_SECONDS,
         )
         wake_path = _resolve_model_path(str(settings.wake["model_path"]), base_dir)
         self.wake = VoskWakeDetector(
@@ -828,14 +847,38 @@ class LocalSpeechSession:
                 if feedback_event is not None and feedback_event.is_set():
                     raise FeedbackPending("Spoken feedback is pending")
                 self.endpoint.observe_noise(block)
-                if matched := self.wake.accept(block):
-                    audio = self.endpoint.record(self.source.pre_roll())
-                    return matched, audio
+                detection = self._detect_control_phrase(block)
+                if detection is None:
+                    continue
+                matched, history = detection
+                pre_roll = (
+                    self.source.pre_roll(samples=history)
+                    if history is not None
+                    else self.source.pre_roll()
+                )
+                audio = self.endpoint.record(pre_roll)
+                return matched, audio
             raise AudioError("Speech session stopped")
         except AudioError:
             raise
         except Exception as exc:
             raise AudioError("Wake phrase or endpoint processing failed") from exc
+
+    def _detect_control_phrase(self, block: Any) -> tuple[str, int | None] | None:
+        """Run the spotter; also report how far back the phrase started, in samples."""
+
+        accept_detection = getattr(self.wake, "accept_detection", None)
+        if not callable(accept_detection):
+            matched = self.wake.accept(block)
+            return (matched, None) if matched else None
+        detection = accept_detection(block)
+        if detection is None:
+            return None
+        samples_seen = getattr(self.wake, "samples_seen", None)
+        if not isinstance(samples_seen, int):
+            return detection.phrase, None
+        margin = int(_WAKE_HISTORY_MARGIN_SECONDS * self.settings.sample_rate)
+        return detection.phrase, max(0, samples_seen - detection.start_sample) + margin
 
     def listen_utterance(
         self,

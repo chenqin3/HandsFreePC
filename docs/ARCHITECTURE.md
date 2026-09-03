@@ -20,7 +20,7 @@ normalize.py       文本归一化与控制词匹配
 
 ## 线程
 
-- **麦克风线程**（`VoiceRuntime.run_microphone`）：唯一持有麦克风的线程。待命时等控制词；会话中听一句话，按 `over` 的样本边界切段并转写；语音播报只在这条线程的话语边界上播放，避免打断用户。
+- **麦克风线程**（`VoiceRuntime.run_microphone`）：唯一持有麦克风的线程。待命时等控制词，词表检测器一命中就从该词的起点（Vosk 词时间戳，环形缓冲保留 4 秒）录到句末交给正文转写，默认要求转写以同一控制词开头才算数（`strict_wake_phrase`）；会话中听一句话，按 `over` 的样本边界切段并转写；语音播报只在这条线程的话语边界上播放，避免打断用户。
 - **命令线程**（`CommandWorker`）：严格 FIFO，一次只跑一条；把 `QueuedCommand` 交给 `KimiAgentController.run`，结果回到 `VoiceRuntime._on_control_outcome`。
 - **提示框线程**（`Overlay`）：tkinter 窗口，不抢焦点、鼠标穿透。
 

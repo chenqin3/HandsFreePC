@@ -24,6 +24,10 @@ def test_defaults(tmp_path: Path) -> None:
     assert settings.app.auto_pause_when_microphone_busy is True
     assert settings.app.microphone_guard_poll_seconds == 3.0
     assert settings.app.microphone_guard_ignore == []
+    assert settings.app.strict_wake_phrase is True
+    assert settings.speech.wake["phrase_window_seconds"] == 3.0
+    assert "开始语音操作" in settings.speech.command["initial_prompt"]
+    assert "开始语音操作" in settings.speech.command["hotwords"]
     assert settings.kimi.executable == "kimi"
     assert settings.kimi.working_directory is None
     assert settings.kimi.model is None
@@ -95,6 +99,7 @@ def test_missing_delimiter_section_uses_defaults(tmp_path: Path) -> None:
     [
         ("privacy", "save_transcripts"),
         ("app", "auto_pause_when_microphone_busy"),
+        ("app", "strict_wake_phrase"),
         ("kimi", "resume_session"),
         ("speech.command", "use_itn"),
     ],

@@ -25,7 +25,7 @@ from .diagnostics import classify_control_failure, stage_display_name
 from .feedback import FeedbackController
 from .mic_guard import MicrophoneGuard
 from .models import FeedbackMode
-from .normalize import compact_text, phrase_equals, wake_suffix
+from .normalize import compact_text, confirm_control_phrase, phrase_equals, wake_suffix
 from .session import (
     CommandWorker,
     JobOutcome,
@@ -804,6 +804,26 @@ class VoiceRuntime:
         self.stop_event.wait(guard.poll_seconds)
         return True
 
+    def _confirm_detected_phrase(self, matched: str, transcript: str) -> str | None:
+        """Decide what the spotter's phrase becomes once the accurate transcriber has spoken.
+
+        Strict (default): the transcript must start with the phrase, so chatter that
+        merely resembled it, negations and quotations never open a session.  Lenient:
+        keep the spotter's word even when the transcript disagrees.
+        """
+
+        if not self.settings.app.strict_wake_phrase:
+            return _merge_control_phrase_transcript(matched, transcript) or matched
+        confirmed = confirm_control_phrase(transcript, matched)
+        if confirmed is None:
+            self._record_diagnostic(
+                stage="runtime",
+                error_code="CONTROL_PHRASE_UNCONFIRMED",
+                safe_message="The spotter heard a control phrase the transcript did not confirm",
+                level="info",
+            )
+        return confirmed
+
     def run_microphone(self) -> None:
         """Listen until ``stop`` is called."""
 
@@ -863,8 +883,10 @@ class VoiceRuntime:
                         safe_message="A configured local wake or control phrase was detected",
                         level="info",
                     )
-                    control_text = _merge_control_phrase_transcript(matched, transcript)
-                    self.handle_session_text(control_text or matched)
+                    control_text = self._confirm_detected_phrase(matched, transcript)
+                    if control_text is None:
+                        continue
+                    self.handle_session_text(control_text)
                 except ControlPhraseDetected as exc:
                     self.handle_session_text(exc.phrase)
                 except FeedbackPending:

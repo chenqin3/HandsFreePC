@@ -513,3 +513,53 @@ def test_vosk_final_result_flushes_a_marker_with_absolute_sample_boundaries(
     assert detector.samples_seen == 16000
     assert detector.last_detection == PhraseDetection("over", 1440, 9120)
     assert recognizer.reset_count == 1
+
+
+def test_microphone_pre_roll_returns_the_default_window_or_a_longer_history() -> None:
+    source = MicrophoneSource(pre_roll_seconds=1.2, block_seconds=0.1, history_seconds=4.0)
+    for index in range(40):
+        source._ring.append(np.full(source.block_size, index, dtype=np.float32))
+
+    assert [int(block[0]) for block in source.pre_roll()] == list(range(28, 40))
+    assert [int(block[0]) for block in source.pre_roll(samples=16000 * 2.5)] == list(range(15, 40))
+    assert len(source.pre_roll(samples=100)) == 12
+    assert len(source.pre_roll(samples=16000 * 60)) == 40
+
+
+def test_wait_for_phrase_reaches_back_to_the_start_of_the_detected_phrase() -> None:
+    requested = []
+
+    class Source:
+        block_size = 1600
+
+        def read(self):
+            return np.zeros(1600, dtype=np.float32)
+
+        def pre_roll(self, *, samples=None):
+            requested.append(samples)
+            return ["history"]
+
+    class Wake:
+        samples_seen = 160_000
+
+        def accept_detection(self, _block):
+            return PhraseDetection("开始语音操作", 130_000, 158_000)
+
+    class Endpoint:
+        def observe_noise(self, _block):
+            pass
+
+        def record(self, pre_roll):
+            return ("recorded", pre_roll)
+
+    session = object.__new__(LocalSpeechSession)
+    session.settings = type("Settings", (), {"sample_rate": 16000})()
+    session.source = Source()
+    session.wake = Wake()
+    session.endpoint = Endpoint()
+
+    matched, audio = session.wait_for_phrase()
+
+    assert matched == "开始语音操作"
+    assert audio == ("recorded", ["history"])
+    assert requested == [160_000 - 130_000 + 4000]

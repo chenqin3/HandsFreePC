@@ -1,6 +1,11 @@
 import pytest
 
-from handsfree_pc.normalize import compact_text, parse_ordinal, wake_suffix
+from handsfree_pc.normalize import (
+    compact_text,
+    confirm_control_phrase,
+    parse_ordinal,
+    wake_suffix,
+)
 
 
 def test_compact_text_normalizes_punctuation_and_width() -> None:
@@ -62,3 +67,50 @@ def test_wake_suffix_rejects_negation_quotation_and_reported_speech(
 def test_parse_ordinal() -> None:
     assert parse_ordinal("打开第二个") == 2
     assert parse_ordinal("选第3个") == 3
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        ("开始语音操作", "开始语音操作"),
+        ("  开始语音操作。  ", "开始语音操作"),
+        ("开始语音操作 打开记事本 over", "开始语音操作 打开记事本 over"),
+        ("开始语音操作，打开 C:\\My Folder over", "开始语音操作 打开 C:\\My Folder over"),
+        ("开始语音操做 打开微信", "开始语音操作 打开微信"),  # one ASR slip
+        ("开始语音操 打开微信", "开始语音操作 打开微信"),  # one dropped character
+        ("嗯开始语音操作", "开始语音操作"),  # one stray leading character
+    ],
+)
+def test_confirm_control_phrase_accepts_the_phrase_at_the_start(transcript, expected) -> None:
+    assert confirm_control_phrase(transcript, "开始语音操作") == expected
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "",
+        "包子。",
+        "我们今天开始语音操作吧",
+        "他说开始语音操作",
+        "不开始语音操作",
+        "“开始语音操作”",
+        "开始语音操作”这句话",
+        "开始语音",
+        "操作 打开记事本",
+        "接触语音操作",
+    ],
+)
+def test_confirm_control_phrase_rejects_chatter_negation_quotation_and_hallucination(
+    transcript,
+) -> None:
+    assert confirm_control_phrase(transcript, "开始语音操作") is None
+
+
+def test_confirm_control_phrase_allows_one_edit_only() -> None:
+    assert confirm_control_phrase("接触语音操作", "结束语音操作") is None  # two substitutions
+    assert confirm_control_phrase("开始语音操作是什么意思", "开始语音操作") == (
+        "开始语音操作 是什么意思"
+    )
+    assert confirm_control_phrase("电脑停止", "电脑停止") == "电脑停止"
+    assert confirm_control_phrase("电脑停之", "电脑停止") == "电脑停止"
+    assert confirm_control_phrase("电脑挺好", "电脑停止") is None

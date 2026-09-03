@@ -24,6 +24,7 @@ app:
   - 恢复队列
   prompt_delimiters:
   - over
+  strict_wake_phrase: true
   feedback_mode: overlay
   max_queue_size: 8
   max_prompt_chars: 4000
@@ -70,7 +71,7 @@ speech:
     - 恢复 监听
     - 继续 队列
     - 恢复 队列
-    phrase_window_seconds: 5.0
+    phrase_window_seconds: 3.0
   delimiter:
     backend: vosk
     model_path: models/vosk-model-small-en-us-0.15
@@ -88,8 +89,8 @@ speech:
     device: auto
     compute_type: auto
     beam_size: 5
-    initial_prompt: 语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。
-    hotwords: Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over
+    initial_prompt: 语音控制命令可能包含 开始语音操作、结束语音操作、Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。
+    hotwords: 开始语音操作 结束语音操作 Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over
   fallback:
     backend: none
     model: large-v3-turbo
@@ -97,8 +98,8 @@ speech:
     compute_type: auto
     language: zh
     beam_size: 5
-    initial_prompt: 语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。
-    hotwords: Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over
+    initial_prompt: 语音控制命令可能包含 开始语音操作、结束语音操作、Claude、Codex、ChatGPT、Chrome、资源管理器、微信、Chat and Cowork、Design 和 over。
+    hotwords: 开始语音操作 结束语音操作 Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat Chat and Cowork Design over
 
 # The executor. Every command is handed to Kimi Code CLI in prompt mode; Kimi
 # drives the desktop with its gui-control skill.

@@ -51,6 +51,7 @@ app:
   stop_phrases: ["立即停止所有操作", "取消所有操作", "停止所有操作", "电脑停止"]
   resume_phrases: ["恢复语音操作", "恢复监听", "继续队列", "恢复队列"]
   prompt_delimiters: ["over"]
+  strict_wake_phrase: true      # 唤醒词必须被正文转写确认、且在句首；聊天不会误触发
   feedback_mode: overlay        # overlay | voice | both | silent
   failure_policy: continue      # 一条失败后，后面的继续（continue）还是等你说「继续队列」（pause）
   max_queue_size: 8
@@ -96,7 +97,7 @@ pwsh scripts/install_autostart.ps1 -StartNow
 
 | 说什么 | 发生什么 |
 |---|---|
-| 开始语音操作 | 进入会话，开始接收指令。也可以一口气说「开始语音操作 打开微信 over」 |
+| 开始语音操作 | 进入会话，开始接收指令。也可以一口气说「开始语音操作 打开微信 over」。唤醒分两级：离线词表先听到，再由正文转写模型确认这句话确实以「开始语音操作」开头；聊天里带到这几个字（"我们开始语音操作吧"）、否定（"不要开始语音操作"）、转述和引用都不算 |
 | …… over | 一条指令结束，进入队列。over 由独立的英文离线模型检测，不依赖正文转写 |
 | 结束语音操作 | 不再接收新指令，已入队的继续做完；没说 over 的半条丢弃 |
 | 立即停止所有操作 / 电脑停止 | 立刻终止正在执行的 Kimi、清空队列 |

@@ -14,12 +14,12 @@ from .models import FeedbackMode
 from .normalize import compact_text
 
 _ASR_CONTEXT = (
-    "语音控制命令可能包含 Claude、Codex、ChatGPT、Chrome、资源管理器、微信、"
-    "Chat and Cowork、Design 和 over。"
+    "语音控制命令可能包含 开始语音操作、结束语音操作、Claude、Codex、ChatGPT、Chrome、"
+    "资源管理器、微信、Chat and Cowork、Design 和 over。"
 )
 _ASR_HOTWORDS = (
-    "Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 微信 WeChat "
-    "Chat and Cowork Design over"
+    "开始语音操作 结束语音操作 Claude Codex ChatGPT 聊天GPT Chrome 资源管理器 文件资源管理器 "
+    "微信 WeChat Chat and Cowork Design over"
 )
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -35,6 +35,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ],
         "resume_phrases": ["恢复语音操作", "恢复监听", "继续队列", "恢复队列"],
         "prompt_delimiters": ["over"],
+        # The keyword spotter is eager. With strict_wake_phrase the command
+        # transcriber must also hear the wake phrase at the start of what was
+        # said, so ordinary conversation does not open a session.
+        "strict_wake_phrase": True,
         "feedback_mode": "overlay",
         # How many spoken commands may wait for Kimi, and how long one may be.
         "max_queue_size": 8,
@@ -86,7 +90,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "继续 队列",
                 "恢复 队列",
             ],
-            "phrase_window_seconds": 5.0,
+            "phrase_window_seconds": 3.0,
         },
         "delimiter": {
             "backend": "vosk",
@@ -200,6 +204,7 @@ class AppSettings:
     resume_phrases: list[str]
     prompt_delimiters: list[str]
     feedback_mode: FeedbackMode
+    strict_wake_phrase: bool = True
     max_queue_size: int = 8
     max_prompt_chars: int = 4000
     failure_policy: str = "continue"
@@ -306,6 +311,7 @@ def load_settings(path: str | Path | None = None, *, allow_missing: bool = False
             resume_phrases=_require_string_list(app_raw, "resume_phrases", section="app"),
             prompt_delimiters=_require_string_list(app_raw, "prompt_delimiters", section="app"),
             feedback_mode=FeedbackMode(app_raw["feedback_mode"]),
+            strict_wake_phrase=_require_bool(app_raw, "strict_wake_phrase", section="app"),
             max_queue_size=int(_number(app_raw, "max_queue_size", section="app")),
             max_prompt_chars=int(_number(app_raw, "max_prompt_chars", section="app")),
             failure_policy=str(app_raw["failure_policy"]).lower(),
